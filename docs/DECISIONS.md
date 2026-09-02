@@ -388,3 +388,39 @@ compare.
 **Status:** direction, molten. Supersedes D13's framing as the *governing*
 metaphor while keeping D13's palette/material ideas. Prototype refinements in the
 visual pass.
+
+## D16 — Pivot: file explorer first, visualizer second
+
+**Decided (2026-09-02):** SECTOR becomes a **graphical file explorer first, and a
+visualizer second** — reversing D8's "not a file manager". After using the
+visualizer, the user wants day-to-day file browsing as the primary job, with the
+cityscape as a killer secondary *mode*. (AI integration stays permanently out,
+per D8.)
+
+**Layout model (chosen):** a **conventional explorer** — address bar + back/up,
+a folder-tree sidebar, and a central content area — with a **List / City toggle**.
+Explorer is home base; the cityscape is a lens you switch to for the current
+folder/drive.
+
+**The core architectural shift — snapshot → live:**
+- What we built is a *snapshot* tool: scan a whole drive once, hold the tree,
+  explore the frozen picture. Stays as the "City" mode (reusing scanner + arena
+  tree + treemap + cache).
+- An explorer is *live*: browse folder-by-folder, reading each folder's *current*
+  contents on demand (fast per-folder `read_dir`), and act on files. **Live
+  per-folder navigation becomes the primary spine.**
+
+**Scope reality + strategy (safest-first):** a file explorer is a much bigger,
+higher-stakes build than a read-only visualizer — destructive ops (delete, move,
+overwrite) must be bulletproof (Recycle Bin, confirmations, conflict + permission
+handling — the Windows specifics from D1). So we **grow the explorer incrementally
+on top of the working visualizer**, never destabilizing it:
+- **E1** live navigation + a file **list/details view** (read-only skeleton)
+- **E2** List / **City mode** toggle (wraps today's cityscape)
+- **E3** read-only actions: open, reveal, copy-path, properties
+- **E4** non-destructive edits: new folder, rename
+- **E5** destructive ops last, carefully: delete-to-Recycle-Bin, copy/move with
+  conflict handling, cut/paste
+
+**Supersedes:** D8's "not a file manager" non-goal (that door is now the main
+road). The README non-goal is updated accordingly. D8's *no-AI* rule still holds.

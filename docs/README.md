@@ -32,11 +32,11 @@ GPU-rendered look.
   or "ask about your files" agent. This is a firm, permanent exclusion — unlike
   the mpfiles project that inspired us, that direction is explicitly off the
   table.
-- **Not a file manager *yet*.** SECTOR *shows* the filesystem; it does not aim to
-  be a copy/move/rename/delete replacement for Explorer today. This is the one
-  non-goal we hold loosely: **file management is a candidate future direction**
-  (see ROADMAP parking lot), so we avoid architectural choices that would slam
-  that door.
+- ~~Not a file manager~~ **Now becoming a file explorer (D16, 2026-09-02).**
+  SECTOR is pivoting to a **graphical file explorer first, visualizer second** —
+  live folder navigation as the spine, the cityscape as a toggled "City" mode.
+  Grown incrementally, safest-first (read-only browsing → non-destructive edits →
+  destructive ops last, with Recycle Bin + confirmations). See DECISIONS D16.
 - **Not cross-platform.** Windows only. We optimize for Windows internals (the
   MFT) rather than a lowest-common-denominator portable scan.
 - **Not shell-integrated.** No Explorer context-menu entries, no thumbnail

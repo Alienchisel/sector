@@ -218,3 +218,29 @@ Deliberately *not* scheduled — captured so they don't distract us:
 - Saved scans, scan history, diff between two scans.
 - Filters (by type, age, size threshold).
 - Export (image / CSV).
+
+---
+
+## Phase E — File Explorer pivot (D16, 2026-09-02)
+
+SECTOR becomes a **file explorer first, visualizer second.** Conventional layout
+(address bar + back/up, folder-tree sidebar, content area) with a **List / City**
+toggle. Live per-folder navigation is the new spine; the cityscape (Steps 0–4)
+becomes the "City" mode. Built incrementally on the working visualizer,
+safest-first — destructive ops must be bulletproof (see D16, D1).
+
+- **E1 — Live navigation + list view  ☐** (read-only skeleton): browse folders
+  live (`read_dir` the current folder), a details list (name, size, type, date),
+  sortable; address bar, back/forward/up, folder-tree sidebar. *This is the new
+  default view.*
+- **E2 — List / City toggle  ☐**: switch the content area to the cityscape for
+  the current folder/drive (wraps today's scan+render+cache). Click a block →
+  navigate there.
+- **E3 — Read-only actions  ☐**: open (default app), reveal in Explorer, copy
+  path, properties.
+- **E4 — Non-destructive edits  ☐**: new folder, rename.
+- **E5 — Destructive ops (careful)  ☐**: delete → Recycle Bin, copy/move with
+  conflict handling, cut/paste — with confirmations and error handling.
+
+**E1a (data layer, OS-agnostic, testable on Linux): a single-directory live
+listing** (name, size, is_dir, modified) — the foundation before the UI shell.
