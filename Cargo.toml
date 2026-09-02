@@ -1,0 +1,13 @@
+# SECTOR — a fast, sleek Windows filesystem visualizer.
+# See docs/README.md, docs/ROADMAP.md, docs/DECISIONS.md.
+[workspace]
+resolver = "2"
+members = ["crates/sector-core", "crates/sector-scan", "crates/sector-app"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+
+# Slightly smaller/faster release builds; we tune this properly later.
+[profile.release]
+opt-level = 3

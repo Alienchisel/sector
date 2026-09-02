@@ -1,0 +1,12 @@
+# Keep build artifacts OFF the NAS-mounted source tree.
+#
+# WINDOWS: this config applies — builds go to a LOCAL disk (C:), not Y:\.
+#   Writing target/ over SMB would be agonizingly slow (tens of thousands of
+#   small files + locks). Add a Windows Defender exclusion on C:\rust-build.
+#
+# LINUX: the CARGO_TARGET_DIR env var (set in ~/.zshenv) OVERRIDES this, so
+#   Linux builds go to ~/.cargo-target on local ext4. The env-var-wins
+#   precedence is intentional: one shared source tree, two OSes, two local
+#   target dirs. See docs/DECISIONS.md (D9 build environment discussion).
+[build]
+target-dir = "C:/rust-build/sector"

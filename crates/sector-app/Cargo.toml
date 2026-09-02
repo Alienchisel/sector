@@ -1,0 +1,28 @@
+# sector-app — the native Windows GUI binary.
+# eframe/egui with the wgpu renderer (→ DirectX 12 on Windows), the exact
+# rendering path SECTOR's treemap will use, so Step 0 validates the real stack.
+[package]
+name = "sector-app"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "sector"
+path = "src/main.rs"
+
+[dependencies]
+# eframe re-exports egui as `eframe::egui`, so we don't depend on egui directly
+# (avoids any version skew between the two).
+#
+# We use eframe's DEFAULT features on purpose. In 0.36 the default renderer is
+# already wgpu (-> DirectX 12 on Windows), and the defaults also pull the Linux
+# winit backends (x11/wayland). Those Linux bits are inert on Windows, but they
+# let us `cargo check -p sector-app` on the Linux VM to catch API/type errors in
+# seconds instead of via a multi-minute Windows round-trip. Disabling defaults
+# (to drop glow) is what previously broke the Linux check — not worth it.
+eframe = { version = "0.36", features = ["persistence"] }
+env_logger = "0.11.11"
+serde = { version = "1", features = ["derive"] }
+sector-core = { path = "../sector-core" }
+sector-scan = { path = "../sector-scan" }
+dirs = "5"

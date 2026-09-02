@@ -1,0 +1,13 @@
+# Local build output (per machine — see .cargo/config.toml and ~/.zshenv).
+/target
+**/target
+
+# Rust
+*.pdb
+
+# DELIBERATELY NOT IGNORED: a "C:" directory.
+# If a bare `cargo` ever runs on Linux WITHOUT CARGO_TARGET_DIR set, cargo reads
+# the Windows target-dir "C:/rust-build/sector" as a *relative* path and creates
+# ./C:/rust-build/sector/ right here ON THE NAS, then builds over SMB. We want
+# that stray "C:" folder to show up LOUDLY in `git status`, not be hidden. So we
+# do NOT add it to this file. If you see one, the ambient override didn't fire.

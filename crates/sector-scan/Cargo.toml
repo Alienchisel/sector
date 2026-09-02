@@ -1,0 +1,14 @@
+# sector-scan — filesystem enumeration into a sector-core Tree.
+#
+# The concurrent directory walker (this file's `walk` module) is OS-agnostic
+# std::fs, so it builds and is benchmarkable on Linux — and is the real scan path
+# for mapped network drives / NAS (D7). Windows-only fast paths (MFT/USN, drive
+# routing) will be added later as cfg(windows) modules.
+[package]
+name = "sector-scan"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+sector-core = { path = "../sector-core" }
+crossbeam-channel = "0.5"

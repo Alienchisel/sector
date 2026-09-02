@@ -1,0 +1,1009 @@
+//! SECTOR — interactive treemap with a live "discovery" build (D12).
+//!
+//! The scan runs on a background thread and writes into a shared tree; the UI
+//! reads that same tree and renders the treemap *as it grows*, so a long NAS
+//! scan fills in before your eyes instead of leaving a blank panel. When the
+//! scan finishes it "crystallizes" into the final layout. Drill down by clicking
+//! a folder, navigate with the breadcrumb, hover for name/size.
+//!
+//! Anti-"boiling" measure (v1): during a scan the layout is recomputed at most
+//! every `RELAYOUT_THROTTLE`, so the map settles in visible steps rather than
+//! churning every frame. (Stable-order layout + tweening are a later refinement.)
+
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{channel, Receiver};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use eframe::egui;
+use egui::{Color32, Pos2, Rect, Sense, Shape, Stroke, Vec2};
+
+use sector_core::{
+    categorize, human_size, layout, layout_partial, CacheStats, FileCategory, LayoutOptions,
+    NodeId, NodeKind, Tile, Tree,
+};
+use sector_scan::{scan_into, Progress, ScanOptions, ScanStats};
+
+fn now_unix() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+/// Group digits with thousands separators: 278589 → "278,589".
+fn commas(n: u64) -> String {
+    let s = n.to_string();
+    let len = s.len();
+    let mut out = String::with_capacity(len + len / 3);
+    for (i, ch) in s.chars().enumerate() {
+        if i > 0 && (len - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    out
+}
+
+/// Join path components cleanly (trim any trailing separator on each, e.g. the
+/// drive root "Y:\\"), avoiding the doubled `\\` in displayed paths.
+fn joined_path(comps: &[&str]) -> String {
+    comps
+        .iter()
+        .map(|c| c.trim_end_matches(['\\', '/']))
+        .collect::<Vec<_>>()
+        .join(std::path::MAIN_SEPARATOR_STR)
+}
+
+/// The cache file path for a given scan root, or `None` if the cache dir is
+/// unavailable. Keyed by a hash of the (normalized) path.
+fn cache_path_for(root: &str) -> Option<PathBuf> {
+    use std::hash::{Hash, Hasher};
+    let dir = dirs::cache_dir()?.join("sector");
+    std::fs::create_dir_all(&dir).ok()?;
+    // Normalize so "Y:" and "Y:\" (and case) map to the same cache key. Appending
+    // the separator (rather than stripping it) keeps existing "X:\" caches valid.
+    let mut key = root.trim().to_lowercase();
+    if key.ends_with(':') {
+        key.push('\\');
+    }
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    key.hash(&mut h);
+    Some(dir.join(format!("{:016x}.bin", h.finish())))
+}
+
+/// Rough "N ago" from a file-modified time.
+fn humanize_age(modified: SystemTime) -> String {
+    let secs = SystemTime::now().duration_since(modified).map(|d| d.as_secs()).unwrap_or(0);
+    if secs < 90 {
+        "just now".to_string()
+    } else if secs < 5400 {
+        format!("{}m ago", secs / 60)
+    } else if secs < 129_600 {
+        format!("{}h ago", secs / 3600)
+    } else {
+        format!("{}d ago", secs / 86_400)
+    }
+}
+
+/// Max re-layout frequency while a scan is in progress.
+const RELAYOUT_THROTTLE: Duration = Duration::from_millis(600);
+/// Default worker threads. Higher helps cold SMB (lots of latency to hide);
+/// tunable in the UI so it can be benchmarked on the real NAS.
+const DEFAULT_THREADS: usize = 48;
+
+fn main() -> eframe::Result<()> {
+    env_logger::init();
+
+    let options = eframe::NativeOptions {
+        renderer: eframe::Renderer::Wgpu,
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([1200.0, 800.0])
+            .with_min_inner_size([640.0, 420.0])
+            .with_title(sector_core::APP_NAME),
+        ..Default::default()
+    };
+
+    eframe::run_native(
+        sector_core::APP_NAME,
+        options,
+        Box::new(|cc| {
+            // Dark theme so the bars match the night cityscape.
+            cc.egui_ctx.set_visuals(egui::Visuals::dark());
+            if let Some(rs) = &cc.wgpu_render_state {
+                let info = rs.adapter.get_info();
+                eprintln!(
+                    "[sector] wgpu backend={:?}  adapter=\"{}\"  type={:?}",
+                    info.backend, info.name, info.device_type
+                );
+            }
+            let mut app = SectorApp::default();
+            // Restore persisted settings from a previous launch.
+            if let Some(s) = cc.storage.and_then(|st| eframe::get_value::<Settings>(st, "settings")) {
+                app.replay_secs = s.replay_secs.clamp(0.5, 60.0);
+                app.threads = s.threads.clamp(1, 256);
+                app.anim_mode = if s.replay_mode { AnimMode::Replay } else { AnimMode::Reveal };
+                app.path_input = s.path_input;
+            }
+            Ok(Box::new(app))
+        }),
+    )
+}
+
+/// The scan lifecycle. `Running` covers both in-progress and finished — the tree
+/// is shared throughout; `stats` becomes `Some` when the scan thread completes.
+enum ScanState {
+    Idle,
+    Running {
+        tree: Arc<Mutex<Tree>>,
+        progress: Arc<Progress>,
+        cancel: Arc<AtomicBool>,
+        stats_rx: Receiver<ScanStats>,
+        stats: Option<ScanStats>,
+        started: Instant,
+    },
+}
+
+struct SectorApp {
+    path_input: String,
+    /// Worker threads to use for the next scan (tunable — see DEFAULT_THREADS).
+    threads: usize,
+    scan: ScanState,
+    /// Current drill-down root (navigates via the tree's parent chain).
+    root: NodeId,
+    opts: LayoutOptions,
+
+    // Cached layout tiles + the derived cityscape + the state they're for.
+    tiles: Vec<Tile>,
+    scape: Scape,
+    last_layout: Instant,
+    last_root: NodeId,
+    last_size: Vec2,
+    /// Force one re-layout when a scan finishes (the "crystallize" moment).
+    crystallize: bool,
+    /// When set, the city is animating its build (e.g. after a cache load).
+    reveal_start: Option<Instant>,
+    anim_mode: AnimMode,
+    /// Replay duration in seconds (live-adjustable).
+    replay_secs: f32,
+    /// Dominant content category per node (by bytes), computed once a scan
+    /// completes. `None` while scanning (folders stay neutral until then).
+    dominant: Option<Vec<FileCategory>>,
+    /// The (path, is_dir) a right-click context menu currently targets.
+    menu_target: Option<(PathBuf, bool)>,
+    /// A finished scan's tree queued to write to cache off the UI thread.
+    pending_save: Option<(Arc<Mutex<Tree>>, PathBuf, CacheStats)>,
+}
+
+impl Default for SectorApp {
+    fn default() -> Self {
+        SectorApp {
+            path_input: "C:\\".to_string(),
+            threads: DEFAULT_THREADS,
+            scan: ScanState::Idle,
+            root: Tree::ROOT,
+            // Blend "dark-but-breathing" density (D15): a touch more street
+            // spacing than full-Kowloon, taller towers than dusk.
+            opts: LayoutOptions { max_depth: 16, min_tile: 7.0, padding: 1.2 },
+            tiles: Vec::new(),
+            scape: Scape::default(),
+            last_layout: Instant::now(),
+            last_root: Tree::ROOT,
+            last_size: Vec2::ZERO,
+            crystallize: false,
+            reveal_start: None,
+            anim_mode: AnimMode::Reveal,
+            replay_secs: REPLAY_SECS,
+            dominant: None,
+            menu_target: None,
+            pending_save: None,
+        }
+    }
+}
+
+/// How long the "rise" reveal takes after a cache load.
+const REVEAL_SECS: f32 = 1.1;
+/// How long the "replay" (structure-evolving) animation takes.
+const REPLAY_SECS: f32 = 5.0;
+/// Min interval between replay re-layout steps (creates visible stepping + caps cost).
+const REPLAY_STEP: Duration = Duration::from_millis(110);
+
+/// Cache-load animation style.
+#[derive(Clone, Copy, PartialEq)]
+enum AnimMode {
+    /// Final layout; blocks appear in discovery order and rise in place (smooth).
+    Reveal,
+    /// Replay the scan: the tree grows and re-lays-out, so structure evolves.
+    Replay,
+}
+
+/// Persisted UI settings (via eframe storage), remembered across launches.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Settings {
+    replay_secs: f32,
+    threads: usize,
+    replay_mode: bool,
+    path_input: String,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Settings {
+            replay_secs: REPLAY_SECS,
+            threads: DEFAULT_THREADS,
+            replay_mode: false,
+            path_input: "C:\\".to_string(),
+        }
+    }
+}
+
+// "Dark-but-breathing" cityscape palette (D15).
+const BG: Color32 = Color32::from_rgb(0x0c, 0x0f, 0x17); // night sky
+const PLINTH_TOP: Color32 = Color32::from_rgb(0x1c, 0x21, 0x2a);
+const PLINTH_R: Color32 = Color32::from_rgb(0x12, 0x15, 0x1b);
+const PLINTH_F: Color32 = Color32::from_rgb(0x0d, 0x10, 0x14);
+const BORDER: Color32 = Color32::from_rgb(0x08, 0x0a, 0x0d); // near-black block edges
+const DIR_COLOR: Color32 = Color32::from_rgb(0x22, 0x27, 0x30); // folders (during scan)
+/// Semi-transparent black for ground shadows.
+const SHADOW: Color32 = Color32::from_rgba_premultiplied(0, 0, 0, 100);
+// Face shading: top slightly boosted (neon glow in the gloom), sides deep.
+const F_TOP: f32 = 1.12;
+const F_RIGHT: f32 = 0.5;
+const F_FRONT: f32 = 0.34;
+
+/// Color for a file category. Muted-but-distinct, tuned for the dark ground.
+fn category_color(cat: FileCategory) -> Color32 {
+    match cat {
+        FileCategory::Video => Color32::from_rgb(0xcf, 0x8a, 0x3e),    // amber
+        FileCategory::Image => Color32::from_rgb(0x4f, 0xa8, 0x8f),    // teal
+        FileCategory::Audio => Color32::from_rgb(0x9a, 0x7c, 0xc4),    // violet
+        FileCategory::Archive => Color32::from_rgb(0x5b, 0x86, 0xb4),  // steel blue
+        FileCategory::Document => Color32::from_rgb(0xb2, 0xba, 0xc6), // paper
+        FileCategory::Code => Color32::from_rgb(0x9f, 0xb1, 0x55),     // olive
+        FileCategory::System => Color32::from_rgb(0xb0, 0x5a, 0x4e),   // rust red
+        FileCategory::Other => Color32::from_rgb(0x6a, 0x72, 0x80),    // neutral grey
+    }
+}
+
+impl SectorApp {
+    fn start_scan(&mut self) {
+        // Stop any scan already running.
+        if let ScanState::Running { cancel, .. } = &self.scan {
+            cancel.store(true, Ordering::Relaxed);
+        }
+
+        let path = PathBuf::from(self.path_input.trim());
+        let tree = Arc::new(Mutex::new(Tree::new(path.to_string_lossy().into_owned())));
+        let progress = Arc::new(Progress::default());
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = channel();
+
+        let (t2, p2, c2) = (Arc::clone(&tree), Arc::clone(&progress), Arc::clone(&cancel));
+        let threads = self.threads.max(1);
+        std::thread::spawn(move || {
+            let opts = ScanOptions { threads };
+            let stats = scan_into(&path, &t2, &opts, &c2, Some(p2.as_ref()));
+            let _ = tx.send(stats); // ignore if the app closed
+        });
+
+        self.root = Tree::ROOT;
+        self.tiles.clear();
+        self.scape = Scape::default();
+        self.crystallize = false;
+        self.dominant = None;
+        self.menu_target = None;
+        self.scan = ScanState::Running {
+            tree,
+            progress,
+            cancel,
+            stats_rx: rx,
+            stats: None,
+            started: Instant::now(),
+        };
+    }
+
+    /// Load a previously-cached scan for the current path — instant, no walk.
+    fn load_cached(&mut self) {
+        let Some(cp) = cache_path_for(&self.path_input) else {
+            eprintln!("[sector] load_cached: no cache dir");
+            return;
+        };
+        let bytes = match std::fs::read(&cp) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("[sector] load_cached: read {} failed: {e}", cp.display());
+                return;
+            }
+        };
+        eprintln!("[sector] load_cached: read {} bytes from {}", bytes.len(), cp.display());
+        let Some((tree, cs)) = Tree::from_cache_bytes(&bytes) else {
+            eprintln!("[sector] load_cached: DESERIALIZE FAILED");
+            return;
+        };
+        eprintln!("[sector] load_cached: OK — {} nodes, {} files", tree.len(), cs.files);
+        let tree = Arc::new(Mutex::new(tree));
+        self.dominant = Some(tree.lock().expect("tree").dominant_categories());
+        let stats = ScanStats {
+            dirs: cs.dirs,
+            files: cs.files,
+            bytes: cs.bytes,
+            errors: 0,
+            elapsed: Duration::ZERO,
+            cancelled: false,
+        };
+        self.root = Tree::ROOT;
+        self.scape = Scape::default();
+        self.crystallize = true;
+        self.reveal_start = Some(Instant::now()); // animate the city rising
+        self.menu_target = None;
+        // No scanner thread; the dead channel is never polled because `stats`
+        // is already `Some`.
+        let (_tx, rx) = channel();
+        self.scan = ScanState::Running {
+            tree,
+            progress: Arc::new(Progress::default()),
+            cancel: Arc::new(AtomicBool::new(false)),
+            stats_rx: rx,
+            stats: Some(stats),
+            started: Instant::now(),
+        };
+    }
+
+    /// Ancestors of `root`, from the tree root down to `root` (for the breadcrumb).
+    fn breadcrumb(tree: &Tree, root: NodeId) -> Vec<NodeId> {
+        let mut chain = vec![root];
+        let mut cur = root;
+        loop {
+            let parent = tree.node(cur).parent;
+            if parent == cur {
+                break;
+            }
+            chain.push(parent);
+            cur = parent;
+        }
+        chain.reverse();
+        chain
+    }
+}
+
+/// One extruded block (a leaf tile), pre-projected to screen space.
+struct IsoBlock {
+    node: NodeId,
+    top: [Pos2; 4],
+    right: [Pos2; 4],
+    front: [Pos2; 4],
+    shadow: [Pos2; 4],
+    color: Color32,
+}
+
+/// The whole scene: a ground plinth plus the blocks, all pre-projected.
+struct Scape {
+    plinth_top: [Pos2; 4],
+    plinth_right: [Pos2; 4],
+    plinth_front: [Pos2; 4],
+    blocks: Vec<IsoBlock>,
+}
+
+impl Default for Scape {
+    fn default() -> Self {
+        let z = [Pos2::ZERO; 4];
+        Scape { plinth_top: z, plinth_right: z, plinth_front: z, blocks: Vec::new() }
+    }
+}
+
+// Dimetric projection: x→right, y→left, z→up.
+const ISO_AX: f64 = 0.5;
+const ISO_AY: f64 = 0.25;
+const PLANE: f64 = 1000.0; // ground-plane size the treemap is laid out on
+const PLINTH_TH: f64 = 26.0;
+const SHADOW_EXPAND: f64 = 2.5;
+const SHADOW_OFF: f64 = 0.4;
+
+fn iso(x: f64, y: f64, z: f64) -> (f64, f64) {
+    ((x - y) * ISO_AX, (x + y) * ISO_AY - z)
+}
+
+fn shade(c: Color32, f: f32) -> Color32 {
+    let m = |v: u8| (v as f32 * f).clamp(0.0, 255.0) as u8;
+    Color32::from_rgb(m(c.r()), m(c.g()), m(c.b()))
+}
+
+/// Point-in-convex-quad test (screen space).
+fn point_in_quad(p: Pos2, q: &[Pos2; 4]) -> bool {
+    let mut sign = 0.0f32;
+    for i in 0..4 {
+        let a = q[i];
+        let b = q[(i + 1) % 4];
+        let cross = (b.x - a.x) * (p.y - a.y) - (b.y - a.y) * (p.x - a.x);
+        if cross.abs() > f32::EPSILON {
+            if sign == 0.0 {
+                sign = cross.signum();
+            } else if cross.signum() != sign {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// A block is hit if the cursor is over ANY of its visible faces (top or the two
+/// sides) — so tall slender towers select from their bulk, not just the tiny top.
+fn point_in_block(p: Pos2, b: &IsoBlock) -> bool {
+    point_in_quad(p, &b.top) || point_in_quad(p, &b.right) || point_in_quad(p, &b.front)
+}
+
+/// Turn layout tiles into a projected cityscape: keep leaf tiles, extrude each by
+/// its file count, add a ground plinth + per-block ground shadow, fit to `panel`,
+/// sort back-to-front for correct painter's-order occlusion.
+#[allow(clippy::too_many_arguments)]
+fn build_scape(
+    tree: &Tree,
+    tiles: &[Tile],
+    dominant: Option<&[FileCategory]>,
+    panel: Rect,
+    reveal: f32,
+    // Optional per-node file counts (for replay's partial state); falls back to
+    // the tree's final counts when `None`.
+    file_counts: Option<&[u64]>,
+) -> Scape {
+    use std::collections::HashSet;
+    let rendered: HashSet<usize> = tiles.iter().map(|t| t.node.index()).collect();
+    let mut leaves: Vec<&Tile> = tiles
+        .iter()
+        .filter(|t| {
+            t.depth > 0
+                && tree
+                    .children(t.node)
+                    .iter()
+                    .all(|c| !rendered.contains(&c.index()))
+        })
+        .collect();
+    if leaves.is_empty() {
+        return Scape::default();
+    }
+
+    // Height ∝ log(file count): files stay flat chips, folders of many files rise
+    // into towers — a second signal independent of area (= bytes).
+    let fc = |t: &Tile| match file_counts {
+        Some(c) => c[t.node.index()],
+        None => tree.node(t.node).file_count,
+    };
+    let max_fc = leaves.iter().map(|t| fc(t)).max().unwrap_or(1).max(1);
+    let ln_max = ((max_fc + 1) as f64).ln().max(1.0);
+    // Height from file count, but FLATTENED for sliver footprints so a thin tile
+    // (inevitable when one folder dominates a drive) can't extrude into a tall
+    // "wall". Square-ish footprints (towers) keep full height.
+    let height = |t: &Tile| {
+        let base = 4.0 + 72.0 * (((fc(t) + 1) as f64).ln() / ln_max);
+        let (w, h) = (t.rect.w.max(0.01) as f64, t.rect.h.max(0.01) as f64);
+        let aspect = w.max(h) / w.min(h);
+        if aspect > 4.0 {
+            base * (4.0 / aspect).max(0.08)
+        } else {
+            base
+        }
+    };
+
+    // Fit: project every corner (blocks + plinth) to find bounds, then center.
+    let (mut minx, mut miny, mut maxx, mut maxy) = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
+    let mut ext = |x: f64, y: f64, z: f64| {
+        let (sx, sy) = iso(x, y, z);
+        minx = minx.min(sx);
+        maxx = maxx.max(sx);
+        miny = miny.min(sy);
+        maxy = maxy.max(sy);
+    };
+    for t in &leaves {
+        let (x, y, w, h) = (t.rect.x as f64, t.rect.y as f64, t.rect.w as f64, t.rect.h as f64);
+        let hz = height(t);
+        ext(x, y, hz);
+        ext(x + w, y + h, hz);
+        ext(x + w, y + h, 0.0);
+    }
+    for &(cx, cy) in &[(0.0, 0.0), (PLANE, PLANE), (PLANE, 0.0), (0.0, PLANE)] {
+        ext(cx, cy, 0.0);
+        ext(cx, cy, -PLINTH_TH);
+    }
+
+    let pw = (maxx - minx).max(1.0);
+    let ph = (maxy - miny).max(1.0);
+    let s = ((panel.width() as f64 * 0.96) / pw).min((panel.height() as f64 * 0.96) / ph);
+    let ox = panel.center().x as f64 - (minx + maxx) / 2.0 * s;
+    let oy = panel.center().y as f64 - (miny + maxy) / 2.0 * s;
+    let tr = |wx: f64, wy: f64, wz: f64| -> Pos2 {
+        let (sx, sy) = iso(wx, wy, wz);
+        Pos2::new((sx * s + ox) as f32, (sy * s + oy) as f32)
+    };
+
+    let plinth_top = [tr(0.0, 0.0, 0.0), tr(PLANE, 0.0, 0.0), tr(PLANE, PLANE, 0.0), tr(0.0, PLANE, 0.0)];
+    let plinth_right = [tr(PLANE, 0.0, 0.0), tr(PLANE, PLANE, 0.0), tr(PLANE, PLANE, -PLINTH_TH), tr(PLANE, 0.0, -PLINTH_TH)];
+    let plinth_front = [tr(0.0, PLANE, 0.0), tr(PLANE, PLANE, 0.0), tr(PLANE, PLANE, -PLINTH_TH), tr(0.0, PLANE, -PLINTH_TH)];
+
+    // Back-to-front: far (small x+y) first.
+    leaves.sort_by(|a, b| (a.rect.x + a.rect.y).partial_cmp(&(b.rect.x + b.rect.y)).unwrap());
+
+    let blocks = leaves
+        .iter()
+        .filter_map(|t| {
+            let (x, y, w, h) = (t.rect.x as f64, t.rect.y as f64, t.rect.w as f64, t.rect.h as f64);
+            // Discovery reveal: blocks appear in the order they were found (arena
+            // index = scan order), each rising in its final spot — the closest
+            // honest representation of "added one at a time" from a cached tree.
+            let hz = if reveal >= 1.0 {
+                height(t)
+            } else {
+                let p = (t.node.index() as f64 / tree.len().max(1) as f64).clamp(0.0, 1.0);
+                let lead = 0.85; // wide front so several appear at once
+                let local = (reveal as f64 * (1.0 + lead) - p * lead).clamp(0.0, 1.0);
+                if local <= 0.0 {
+                    return None; // not discovered yet — don't draw it at all
+                }
+                let ease = 1.0 - (1.0 - local).powi(3); // easeOutCubic
+                height(t) * ease
+            };
+            let color = match dominant {
+                Some(dom) => category_color(dom[t.node.index()]),
+                None => {
+                    let node = tree.node(t.node);
+                    if node.kind == NodeKind::Dir {
+                        DIR_COLOR
+                    } else {
+                        category_color(categorize(&node.name))
+                    }
+                }
+            };
+            // Ground shadow: footprint expanded and offset by height (tall→long).
+            let (e, off) = (SHADOW_EXPAND, hz * SHADOW_OFF);
+            Some(IsoBlock {
+                node: t.node,
+                top: [tr(x, y, hz), tr(x + w, y, hz), tr(x + w, y + h, hz), tr(x, y + h, hz)],
+                right: [tr(x + w, y, 0.0), tr(x + w, y + h, 0.0), tr(x + w, y + h, hz), tr(x + w, y, hz)],
+                front: [tr(x, y + h, 0.0), tr(x + w, y + h, 0.0), tr(x + w, y + h, hz), tr(x, y + h, hz)],
+                shadow: [
+                    tr(x - e + off, y - e + off, 0.0),
+                    tr(x + w + e + off, y - e + off, 0.0),
+                    tr(x + w + e + off, y + h + e + off, 0.0),
+                    tr(x - e + off, y + h + e + off, 0.0),
+                ],
+                color,
+            })
+        })
+        .collect();
+
+    Scape { plinth_top, plinth_right, plinth_front, blocks }
+}
+
+/// Open a path's location in Windows Explorer (files get selected; folders open).
+#[cfg(target_os = "windows")]
+fn reveal_in_explorer(path: &std::path::Path, is_dir: bool) {
+    use std::ffi::OsString;
+    let arg = if is_dir {
+        path.as_os_str().to_os_string()
+    } else {
+        let mut s = OsString::from("/select,");
+        s.push(path.as_os_str());
+        s
+    };
+    let _ = std::process::Command::new("explorer").arg(arg).spawn();
+}
+#[cfg(not(target_os = "windows"))]
+fn reveal_in_explorer(_path: &std::path::Path, _is_dir: bool) {}
+
+/// Hand-drawn tooltip near the cursor. egui's widget tooltip anchors to the
+/// widget rect — our widget is the whole panel, so it would land in the corner;
+/// we draw our own at the pointer instead.
+fn draw_tooltip(painter: &egui::Painter, area: Rect, at: Pos2, line1: &str, line2: &str) {
+    let c1 = Color32::from_gray(225);
+    let c2 = Color32::from_gray(180);
+    let g1 = painter.layout_no_wrap(line1.to_owned(), egui::FontId::monospace(12.0), c1);
+    let g2 = painter.layout_no_wrap(line2.to_owned(), egui::FontId::proportional(12.0), c2);
+    let (s1, s2) = (g1.size(), g2.size());
+    let pad = Vec2::new(8.0, 6.0);
+    let box_size = Vec2::new(s1.x.max(s2.x), s1.y + s2.y + 2.0) + pad * 2.0;
+    let mut o = at + Vec2::new(16.0, 18.0);
+    if o.x + box_size.x > area.right() {
+        o.x = (at.x - box_size.x - 12.0).max(area.left());
+    }
+    if o.y + box_size.y > area.bottom() {
+        o.y = (at.y - box_size.y - 12.0).max(area.top());
+    }
+    let bg = Rect::from_min_size(o, box_size);
+    painter.rect_filled(bg, 4.0_f32, Color32::from_rgba_premultiplied(16, 18, 24, 242));
+    painter.galley(bg.min + pad, g1, c1);
+    painter.galley(bg.min + pad + Vec2::new(0.0, s1.y + 2.0), g2, c2);
+}
+
+impl eframe::App for SectorApp {
+    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        let s = Settings {
+            replay_secs: self.replay_secs,
+            threads: self.threads,
+            replay_mode: self.anim_mode == AnimMode::Replay,
+            path_input: self.path_input.clone(),
+        };
+        eframe::set_value(storage, "settings", &s);
+    }
+
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
+
+        // Poll the background scan for completion.
+        let mut just_finished = false;
+        if let ScanState::Running { stats_rx, stats, .. } = &mut self.scan {
+            if stats.is_none() {
+                match stats_rx.try_recv() {
+                    Ok(s) => {
+                        *stats = Some(s);
+                        just_finished = true;
+                    }
+                    Err(_) => ctx.request_repaint(), // keep progress + live build ticking
+                }
+            }
+        }
+        if just_finished {
+            self.crystallize = true;
+            // Compute dominant content category per node now (one O(n) pass on
+            // the finished tree) so folders can be colored by what they contain.
+            if let ScanState::Running { tree, stats, .. } = &self.scan {
+                let t = tree.lock().expect("tree");
+                self.dominant = Some(t.dominant_categories());
+                let root_name = t.node(Tree::ROOT).name.to_string();
+                drop(t);
+                // Queue the cache write to run OFF the UI thread (spawned at the
+                // end of this frame so the crystallize re-layout gets the lock
+                // first). Skip cancelled/partial scans.
+                if let Some(st) = stats {
+                    if !st.cancelled {
+                        if let Some(cp) = cache_path_for(&root_name) {
+                            let cs = CacheStats {
+                                dirs: st.dirs,
+                                files: st.files,
+                                bytes: st.bytes,
+                                saved_unix: now_unix(),
+                            };
+                            self.pending_save = Some((Arc::clone(tree), cp, cs));
+                        } else {
+                            eprintln!("[sector] cache: no cache dir available");
+                        }
+                    }
+                }
+            }
+        }
+
+        // ---- Top bar --------------------------------------------------------
+        egui::Panel::top("bar").show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.strong(sector_core::APP_NAME);
+                ui.separator();
+                let scanning = matches!(&self.scan, ScanState::Running { stats: None, .. });
+                ui.add_enabled_ui(!scanning, |ui| {
+                    ui.label("Path:");
+                    ui.text_edit_singleline(&mut self.path_input);
+                    if ui.button("Scan").clicked() {
+                        self.start_scan();
+                    }
+                    ui.add(
+                        egui::DragValue::new(&mut self.threads)
+                            .range(1..=256)
+                            .prefix("threads "),
+                    )
+                    .on_hover_text("Worker threads for the scan. Higher hides SMB latency on a cold NAS; benchmark on a subfolder to find the sweet spot.");
+
+                    ui.separator();
+                    ui.selectable_value(&mut self.anim_mode, AnimMode::Reveal, "Reveal")
+                        .on_hover_text("Cache-load animation: blocks rise into place in discovery order (smooth).");
+                    ui.selectable_value(&mut self.anim_mode, AnimMode::Replay, "Replay")
+                        .on_hover_text("Cache-load animation: replays the scan — the structure grows and re-lays-out (authentic, jumpier).");
+                    if self.anim_mode == AnimMode::Replay {
+                        ui.add(
+                            egui::Slider::new(&mut self.replay_secs, 1.0..=60.0)
+                                .suffix("s")
+                                .text("dur"),
+                        )
+                        .on_hover_text("Replay duration — drag to change the pace, then Load cached again.");
+                    }
+
+                    // Offer an instant load if a cache exists for this path.
+                    if let Some(cp) = cache_path_for(&self.path_input) {
+                        if let Ok(age) = std::fs::metadata(&cp).and_then(|m| m.modified()) {
+                            if ui
+                                .button(format!("⟳ Load cached · {}", humanize_age(age)))
+                                .on_hover_text("Reopen the last scan of this path instantly, without walking the filesystem.")
+                                .clicked()
+                            {
+                                self.load_cached();
+                            }
+                        }
+                    }
+                });
+                if let ScanState::Running { cancel, stats: None, .. } = &self.scan {
+                    if ui.button("Cancel").clicked() {
+                        cancel.store(true, Ordering::Relaxed);
+                    }
+                }
+            });
+
+            match &self.scan {
+                ScanState::Idle => {
+                    ui.label("Enter a path and press Scan (e.g. C:\\ or a NAS drive Y:\\).");
+                }
+                ScanState::Running {
+                    tree,
+                    progress,
+                    stats,
+                    started,
+                    ..
+                } => match stats {
+                    None => {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label(format!(
+                                "Scanning… {} dirs, {} files, {} ({:.1}s)",
+                                commas(progress.dirs.load(Ordering::Relaxed)),
+                                commas(progress.files.load(Ordering::Relaxed)),
+                                human_size(progress.bytes.load(Ordering::Relaxed)),
+                                started.elapsed().as_secs_f32()
+                            ));
+                        });
+                    }
+                    Some(st) => {
+                        let t = tree.lock().expect("tree");
+                        ui.horizontal_wrapped(|ui| {
+                            if self.root != Tree::ROOT && ui.button("⬆ Up").clicked() {
+                                self.root = t.node(self.root).parent;
+                            }
+                            for (i, id) in Self::breadcrumb(&t, self.root).into_iter().enumerate() {
+                                if i > 0 {
+                                    ui.label("›");
+                                }
+                                if ui.link(t.node(id).name.as_ref()).clicked() {
+                                    self.root = id;
+                                }
+                            }
+                            ui.separator();
+                            let mut note = String::new();
+                            if st.errors > 0 {
+                                note.push_str(&format!(" · {} unreadable", commas(st.errors)));
+                            }
+                            if st.cancelled {
+                                note.push_str(" · (cancelled)");
+                            }
+                            ui.weak(format!(
+                                "{} dirs · {} files · {} · {:.1}s{note}",
+                                commas(st.dirs),
+                                commas(st.files),
+                                human_size(st.bytes),
+                                st.elapsed.as_secs_f32(),
+                            ));
+                        });
+                    }
+                },
+            }
+        });
+
+        // ---- Legend ---------------------------------------------------------
+        egui::Panel::bottom("legend").show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.weak("Color = file type:");
+                for cat in FileCategory::ALL {
+                    ui.colored_label(category_color(cat), format!("■ {}", cat.label()));
+                }
+                ui.separator();
+                ui.weak("area = size · height = file count · hover for details · click to drill in");
+            });
+        });
+
+        // ---- Central: the treemap -------------------------------------------
+        egui::CentralPanel::default().show(ui, |ui| {
+            let ScanState::Running { tree, stats, .. } = &self.scan else {
+                ui.centered_and_justified(|ui| {
+                    ui.weak("No scan yet.");
+                });
+                return;
+            };
+            let scanning = stats.is_none();
+
+            // Explicit STABLE widget id (not allocate_painter's auto id), so the
+            // right-click context menu — which egui keys on this id — stays open
+            // across frames instead of flashing shut.
+            let area = ui.available_rect_before_wrap();
+            let response = ui.interact(area, egui::Id::new("sector_canvas"), Sense::click());
+            let painter = ui.painter_at(area);
+
+            // Backspace goes up a level (ignored while typing in the path box).
+            if self.root != Tree::ROOT
+                && ctx.memory(|m| m.focused()).is_none()
+                && ctx.input(|i| i.key_pressed(egui::Key::Backspace))
+            {
+                let t = tree.lock().expect("tree");
+                self.root = t.node(self.root).parent;
+            }
+
+            // (Re)build the cityscape when the view changed, on crystallize, or —
+            // while scanning — at most once per throttle interval.
+            // Cache-load animation progress (0..1). Replay runs longer.
+            let dur = if self.anim_mode == AnimMode::Replay {
+                self.replay_secs.max(0.2)
+            } else {
+                REVEAL_SECS
+            };
+            let reveal = self
+                .reveal_start
+                .map(|t| (t.elapsed().as_secs_f32() / dur).min(1.0))
+                .unwrap_or(1.0);
+            let revealing = self.reveal_start.is_some();
+            if revealing && reveal < 1.0 {
+                ctx.request_repaint();
+            }
+
+            let plane = sector_core::Rect::new(0.0, 0.0, PLANE as f32, PLANE as f32);
+
+            if revealing && reveal < 1.0 && self.anim_mode == AnimMode::Replay {
+                // REPLAY: throttled partial-layout steps — the tree "grows" and
+                // re-lays-out, so the structure visibly evolves (like a fast scan).
+                let restep = self.scape.blocks.is_empty()
+                    || self.last_size != area.size()
+                    || self.last_root != self.root
+                    || self.last_layout.elapsed() >= REPLAY_STEP;
+                if restep {
+                    let t = tree.lock().expect("tree");
+                    let k = (((reveal as f64) * t.len() as f64) as usize).max(1);
+                    let (sizes, counts) = t.partial_metrics(k);
+                    let tiles = layout_partial(&t, self.root, plane, &self.opts, k, &sizes);
+                    self.scape =
+                        build_scape(&t, &tiles, self.dominant.as_deref(), area, 1.0, Some(&counts));
+                    drop(t);
+                    self.last_layout = Instant::now();
+                    self.last_size = area.size();
+                    self.last_root = self.root;
+                }
+            } else {
+                // Normal build. In Reveal mode the per-block "rise" comes from the
+                // reveal factor; otherwise full height. When a Replay ends, this
+                // branch runs once at reveal==1.0 to draw the complete tree.
+                let rev = if revealing && self.anim_mode == AnimMode::Reveal { reveal } else { 1.0 };
+                let need = revealing
+                    || self.scape.blocks.is_empty()
+                    || self.last_root != self.root
+                    || self.last_size != area.size()
+                    || self.crystallize
+                    || (scanning && self.last_layout.elapsed() >= RELAYOUT_THROTTLE);
+                if need {
+                    let t = tree.lock().expect("tree");
+                    self.tiles = layout(&t, self.root, plane, &self.opts);
+                    self.scape =
+                        build_scape(&t, &self.tiles, self.dominant.as_deref(), area, rev, None);
+                    drop(t);
+                    self.last_layout = Instant::now();
+                    self.last_root = self.root;
+                    self.last_size = area.size();
+                    self.crystallize = false;
+                }
+            }
+            if reveal >= 1.0 {
+                self.reveal_start = None; // animation complete
+            }
+
+            // Night sky + ground plinth (behind the city).
+            painter.rect_filled(area, 0.0_f32, BG);
+            let edge = Stroke::new(0.5, BORDER);
+            painter.add(Shape::convex_polygon(self.scape.plinth_right.to_vec(), PLINTH_R, edge));
+            painter.add(Shape::convex_polygon(self.scape.plinth_front.to_vec(), PLINTH_F, edge));
+            painter.add(Shape::convex_polygon(self.scape.plinth_top.to_vec(), PLINTH_TOP, edge));
+
+            // Topmost (nearest) block under the cursor.
+            let hover_pos = response.hover_pos();
+            let hovered =
+                hover_pos.and_then(|p| self.scape.blocks.iter().rposition(|b| point_in_block(p, b)));
+
+            // Draw back-to-front: shadow, then the three shaded faces. Draw the
+            // hover highlight IN-ORDER (right after its block) so nearer buildings
+            // occlude it correctly instead of it floating over everything.
+            for (i, b) in self.scape.blocks.iter().enumerate() {
+                painter.add(Shape::convex_polygon(b.shadow.to_vec(), SHADOW, Stroke::NONE));
+                painter.add(Shape::convex_polygon(b.right.to_vec(), shade(b.color, F_RIGHT), edge));
+                painter.add(Shape::convex_polygon(b.front.to_vec(), shade(b.color, F_FRONT), edge));
+                painter.add(Shape::convex_polygon(b.top.to_vec(), shade(b.color, F_TOP), edge));
+                if Some(i) == hovered {
+                    // Halo outline: a dark stroke under a bright one, so the
+                    // highlight is visible on ANY block color (incl. orange-on-
+                    // orange video, or the light Document tiles).
+                    let dark = Stroke::new(3.2, Color32::from_black_alpha(190));
+                    let bright = Stroke::new(1.6, Color32::WHITE);
+                    let faces = [&b.right, &b.front, &b.top];
+                    for f in faces {
+                        painter.add(Shape::convex_polygon(f.to_vec(), Color32::TRANSPARENT, dark));
+                    }
+                    for f in faces {
+                        painter.add(Shape::convex_polygon(f.to_vec(), Color32::TRANSPARENT, bright));
+                    }
+                }
+            }
+
+            // Hovered block: tooltip (drawn at the cursor) + left-click to drill.
+            if let (Some(i), Some(p)) = (hovered, hover_pos) {
+                let node_id = self.scape.blocks[i].node;
+                let (path, size, kind_str, drillable) = {
+                    let t = tree.lock().expect("tree");
+                    let node = t.node(node_id);
+                    let is_dir = node.kind == NodeKind::Dir;
+                    let n_children = t.children(node_id).len();
+                    let kind_str = if is_dir {
+                        format!("{} items · {} files", commas(n_children as u64), commas(node.file_count))
+                    } else {
+                        categorize(&node.name).label().to_string()
+                    };
+                    (
+                        joined_path(&t.path_components(node_id)),
+                        node.subtree_size,
+                        kind_str,
+                        is_dir && n_children > 0,
+                    )
+                };
+                if !response.context_menu_opened() {
+                    let line2 = format!("{}  ·  {}", human_size(size), kind_str);
+                    draw_tooltip(&painter, area, p, &path, &line2);
+                }
+                if drillable {
+                    ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
+                }
+                if response.clicked() && drillable {
+                    self.root = node_id;
+                }
+            }
+
+            // Right-click a block → context menu → reveal its location in Explorer.
+            if response.secondary_clicked() {
+                self.menu_target = response.interact_pointer_pos().and_then(|p| {
+                    self.scape.blocks.iter().rev().find(|b| point_in_block(p, b)).map(|b| {
+                        let t = tree.lock().expect("tree");
+                        let is_dir = t.node(b.node).kind == NodeKind::Dir;
+                        let mut pb = PathBuf::new();
+                        for comp in t.path_components(b.node) {
+                            pb.push(comp);
+                        }
+                        (pb, is_dir)
+                    })
+                });
+            }
+            response.context_menu(|ui| match &self.menu_target {
+                Some((path, is_dir)) => {
+                    if ui.button("Reveal in Explorer").clicked() {
+                        reveal_in_explorer(path, *is_dir);
+                        ui.close();
+                    }
+                    if ui.button("Copy path").clicked() {
+                        ui.ctx().copy_text(path.to_string_lossy().into_owned());
+                        ui.close();
+                    }
+                }
+                None => {
+                    ui.label("Nothing here");
+                }
+            });
+
+            if scanning {
+                ctx.request_repaint();
+            }
+        });
+
+        // Kick off the queued cache write now that this frame's render (and its
+        // tree lock) is done, so serialization on the background thread doesn't
+        // block the crystallize re-layout.
+        if let Some((arc, cp, cs)) = self.pending_save.take() {
+            std::thread::spawn(move || {
+                let result = {
+                    let g = arc.lock().expect("tree");
+                    g.to_cache_bytes(cs)
+                };
+                match result {
+                    Ok(bytes) => match std::fs::write(&cp, &bytes) {
+                        Ok(()) => eprintln!("[sector] cache saved: {} ({} bytes)", cp.display(), bytes.len()),
+                        Err(e) => eprintln!("[sector] cache SAVE (write) FAILED: {e}"),
+                    },
+                    Err(e) => eprintln!("[sector] cache SAVE (serialize) FAILED: {e}"),
+                }
+            });
+        }
+    }
+}

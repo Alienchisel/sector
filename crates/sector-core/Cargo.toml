@@ -1,0 +1,11 @@
+# sector-core — OS-agnostic core: data model, treemap layout, formatting.
+# Pure logic, no GUI, no Windows APIs. Built & unit-tested on Linux for fast
+# feedback; also compiled into the app on Windows. See docs/DECISIONS.md D6.
+[package]
+name = "sector-core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+postcard = { version = "1", features = ["use-std"] }
