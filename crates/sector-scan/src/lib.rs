@@ -5,6 +5,8 @@
 //! path for mapped network drives / NAS (D7), whose bottleneck is SMB latency,
 //! not disk throughput. Windows-only fast paths (MFT/USN) come later.
 
+pub mod browse;
 pub mod walk;
 
+pub use browse::{list_dir, Entry};
 pub use walk::{scan, scan_into, Progress, ScanOptions, ScanStats};
