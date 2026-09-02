@@ -235,12 +235,18 @@ safest-first — destructive ops must be bulletproof (see D16, D1).
   default view.*
 - **E2 — List / City toggle  ☐**: switch the content area to the cityscape for
   the current folder/drive (wraps today's scan+render+cache). Click a block →
-  navigate there.
+  navigate there. **Auto-load the cache** on opening a drive (instant big-picture)
+  with an explicit **Rescan** button to refresh (freshness strategy: D17).
 - **E3 — Read-only actions  ☐**: open (default app), reveal in Explorer, copy
   path, properties.
 - **E4 — Non-destructive edits  ☐**: new folder, rename.
 - **E5 — Destructive ops (careful)  ☐**: delete → Recycle Bin, copy/move with
   conflict handling, cut/paste — with confirmations and error handling.
+- **E6 — Incremental freshness (D17)  ☐**: **local NTFS** — store last USN, read
+  the USN Change Journal on reload and apply deltas to the cached tree (near-
+  instant "update"); build alongside the local MFT fast-path (Step 1d). **NAS** —
+  no cheap incremental (no MFT/USN over SMB); refresh = re-walk, cached. Optional:
+  live watching (`ReadDirectoryChangesW`/`notify`) to keep the open session fresh.
 
 **E1a (data layer, OS-agnostic, testable on Linux): a single-directory live
 listing** (name, size, is_dir, modified) — the foundation before the UI shell.

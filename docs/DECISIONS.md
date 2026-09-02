@@ -424,3 +424,29 @@ on top of the working visualizer**, never destabilizing it:
 
 **Supersedes:** D8's "not a file manager" non-goal (that door is now the main
 road). The README non-goal is updated accordingly. D8's *no-AI* rule still holds.
+
+## D17 — Freshness / incremental-update strategy (splits by drive type)
+
+**Decided (2026-09-02):** Keep data current with minimal scanning via a
+drive-type-aware strategy, since the network genuinely denies us cheap hooks.
+
+- **Browsing is live** (E1a): navigating a folder `read_dir`s it right then —
+  always current, no cache, no staleness. The pivot to explorer means day-to-day
+  freshness is free.
+- **City view (whole-tree viz)** uses the cache: **auto-load** it on opening a
+  drive (instant big-picture) with an explicit **Rescan** to refresh. Some
+  staleness between deliberate rescans is acceptable there.
+- **Local NTFS incremental — the good case:** store the last **USN** in the cache;
+  on reload, read the **USN Change Journal** (`FSCTL_READ_USN_JOURNAL`) for all
+  changes since, apply the deltas to the cached tree, re-cache. Near-instant,
+  precise. Build this *alongside* the local MFT fast-path (Step 1d).
+- **NAS / SMB — no cheap magic (honest limit):** no MFT and no USN journal over
+  SMB. Directory-mtime diffing is rejected — it still stats every dir (~278k SMB
+  round-trips), can't skip subtrees, and **misses in-place file growth** (a file's
+  content change bumps the *file's* mtime, not the *directory's*), which is
+  disqualifying for a size viz. So NAS City-view refresh = **re-walk** (made fast,
+  cached so it's rarely paid).
+- **Live watching (optional, complementary):** while the app runs, watch for
+  changes (`ReadDirectoryChangesW` / `notify`) and patch the tree in real time —
+  works for local, limited/lossy over SMB, session-only. Nice-to-have, not the
+  primary mechanism.
