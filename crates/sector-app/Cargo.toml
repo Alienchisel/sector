@@ -21,6 +21,7 @@ path = "src/main.rs"
 # seconds instead of via a multi-minute Windows round-trip. Disabling defaults
 # (to drop glow) is what previously broke the Linux check — not worth it.
 eframe = { version = "0.36", features = ["persistence"] }
+egui_extras = "0.36"
 env_logger = "0.11.11"
 serde = { version = "1", features = ["derive"] }
 sector-core = { path = "../sector-core" }

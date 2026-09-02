@@ -25,7 +25,34 @@ use sector_core::{
     categorize, human_size, layout, layout_partial, CacheStats, FileCategory, LayoutOptions,
     NodeId, NodeKind, Tile, Tree,
 };
-use sector_scan::{scan_into, Progress, ScanOptions, ScanStats};
+use sector_scan::{list_dir, scan_into, Entry, Progress, ScanOptions, ScanStats};
+
+/// Which view the content area shows.
+#[derive(Clone, Copy, PartialEq)]
+enum View {
+    /// The file-explorer list (the new default; live navigation).
+    List,
+    /// The cityscape visualization (the original tool, now a mode).
+    City,
+}
+
+/// File-list sort column.
+#[derive(Clone, Copy, PartialEq)]
+enum SortKey {
+    Name,
+    Size,
+    Kind,
+    Modified,
+}
+
+/// A short human "kind" for a listing entry.
+fn entry_kind(e: &Entry) -> String {
+    if e.is_dir {
+        "Folder".to_string()
+    } else {
+        categorize(&e.name).label().to_string()
+    }
+}
 
 fn now_unix() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
@@ -173,6 +200,19 @@ struct SectorApp {
     menu_target: Option<(PathBuf, bool)>,
     /// A finished scan's tree queued to write to cache off the UI thread.
     pending_save: Option<(Arc<Mutex<Tree>>, PathBuf, CacheStats)>,
+
+    // ---- Explorer (E1) ----
+    view: View,
+    current_dir: PathBuf,
+    addr_edit: String,
+    entries: Vec<Entry>,
+    entries_err: Option<String>,
+    entries_dirty: bool,
+    back_stack: Vec<PathBuf>,
+    fwd_stack: Vec<PathBuf>,
+    sort_key: SortKey,
+    sort_asc: bool,
+    selected: Option<usize>,
 }
 
 impl Default for SectorApp {
@@ -197,6 +237,18 @@ impl Default for SectorApp {
             dominant: None,
             menu_target: None,
             pending_save: None,
+
+            view: View::List,
+            current_dir: PathBuf::from("C:\\"),
+            addr_edit: "C:\\".to_string(),
+            entries: Vec::new(),
+            entries_err: None,
+            entries_dirty: true,
+            back_stack: Vec::new(),
+            fwd_stack: Vec::new(),
+            sort_key: SortKey::Name,
+            sort_asc: true,
+            selected: None,
         }
     }
 }
@@ -347,6 +399,215 @@ impl SectorApp {
             stats: Some(stats),
             started: Instant::now(),
         };
+    }
+
+    // ---- Explorer navigation (E1) ----
+
+    fn navigate_to(&mut self, path: PathBuf) {
+        if path == self.current_dir {
+            self.entries_dirty = true;
+            return;
+        }
+        self.back_stack.push(self.current_dir.clone());
+        self.fwd_stack.clear();
+        self.current_dir = path;
+        self.entries_dirty = true;
+        self.selected = None;
+    }
+
+    fn go_back(&mut self) {
+        if let Some(p) = self.back_stack.pop() {
+            self.fwd_stack.push(std::mem::replace(&mut self.current_dir, p));
+            self.entries_dirty = true;
+            self.selected = None;
+        }
+    }
+
+    fn go_forward(&mut self) {
+        if let Some(p) = self.fwd_stack.pop() {
+            self.back_stack.push(std::mem::replace(&mut self.current_dir, p));
+            self.entries_dirty = true;
+            self.selected = None;
+        }
+    }
+
+    fn go_up(&mut self) {
+        if let Some(parent) = self.current_dir.parent().map(|p| p.to_path_buf()) {
+            self.navigate_to(parent);
+        }
+    }
+
+    fn sort_entries(&self, es: &mut [Entry]) {
+        let (key, asc) = (self.sort_key, self.sort_asc);
+        es.sort_by(|a, b| {
+            // Folders always first, then by the chosen key.
+            b.is_dir.cmp(&a.is_dir).then_with(|| {
+                let o = match key {
+                    SortKey::Name => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+                    SortKey::Size => a.size.cmp(&b.size),
+                    SortKey::Kind => entry_kind(a).cmp(&entry_kind(b)),
+                    SortKey::Modified => a.modified.cmp(&b.modified),
+                };
+                if asc {
+                    o
+                } else {
+                    o.reverse()
+                }
+            })
+        });
+    }
+
+    fn reload_entries(&mut self) {
+        match list_dir(&self.current_dir) {
+            Ok(mut es) => {
+                self.sort_entries(&mut es);
+                self.entries = es;
+                self.entries_err = None;
+            }
+            Err(e) => {
+                self.entries.clear();
+                self.entries_err = Some(e.to_string());
+            }
+        }
+        self.addr_edit = self.current_dir.to_string_lossy().into_owned();
+        self.entries_dirty = false;
+    }
+
+    /// The file-explorer List view: nav toolbar + a virtualized file table.
+    fn show_list(&mut self, ui: &mut egui::Ui) {
+        if self.entries_dirty {
+            self.reload_entries();
+        }
+
+        egui::Panel::top("nav").show(ui, |ui| {
+            ui.horizontal(|ui| {
+                if ui.add_enabled(!self.back_stack.is_empty(), egui::Button::new("◀")).clicked() {
+                    self.go_back();
+                }
+                if ui.add_enabled(!self.fwd_stack.is_empty(), egui::Button::new("▶")).clicked() {
+                    self.go_forward();
+                }
+                if ui
+                    .add_enabled(self.current_dir.parent().is_some(), egui::Button::new("⬆"))
+                    .clicked()
+                {
+                    self.go_up();
+                }
+                let r = ui.add(
+                    egui::TextEdit::singleline(&mut self.addr_edit).desired_width(f32::INFINITY),
+                );
+                if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    let p = PathBuf::from(self.addr_edit.trim());
+                    self.navigate_to(p);
+                }
+            });
+        });
+
+        egui::CentralPanel::default().show(ui, |ui| {
+            if let Some(err) = self.entries_err.clone() {
+                ui.centered_and_justified(|ui| {
+                    ui.weak(format!("⚠  {err}"));
+                });
+                return;
+            }
+            if self.entries.is_empty() {
+                ui.centered_and_justified(|ui| {
+                    ui.weak("(empty folder)");
+                });
+                return;
+            }
+
+            use egui_extras::{Column, TableBuilder};
+
+            // Move entries out of self so the table closures don't fight the
+            // borrow checker; deferred mutations are applied after.
+            let entries = std::mem::take(&mut self.entries);
+            let cur = self.current_dir.clone();
+            let (sort_key, sort_asc) = (self.sort_key, self.sort_asc);
+            let mut new_selected = self.selected;
+            let mut nav_target: Option<PathBuf> = None;
+            let mut new_sort: Option<SortKey> = None;
+
+            let arrow = |k: SortKey| {
+                if k == sort_key {
+                    if sort_asc {
+                        " ▲"
+                    } else {
+                        " ▼"
+                    }
+                } else {
+                    ""
+                }
+            };
+            let header_cell = |ui: &mut egui::Ui, label: String, out: &mut Option<SortKey>, k: SortKey| {
+                if ui
+                    .add(egui::Label::new(egui::RichText::new(label).strong()).sense(Sense::click()))
+                    .clicked()
+                {
+                    *out = Some(k);
+                }
+            };
+
+            TableBuilder::new(ui)
+                .striped(true)
+                .sense(Sense::click())
+                .column(Column::remainder().at_least(220.0).clip(true))
+                .column(Column::auto().at_least(90.0))
+                .column(Column::auto().at_least(90.0))
+                .column(Column::auto().at_least(90.0))
+                .header(22.0, |mut h| {
+                    h.col(|ui| header_cell(ui, format!("Name{}", arrow(SortKey::Name)), &mut new_sort, SortKey::Name));
+                    h.col(|ui| header_cell(ui, format!("Size{}", arrow(SortKey::Size)), &mut new_sort, SortKey::Size));
+                    h.col(|ui| header_cell(ui, format!("Type{}", arrow(SortKey::Kind)), &mut new_sort, SortKey::Kind));
+                    h.col(|ui| header_cell(ui, format!("Modified{}", arrow(SortKey::Modified)), &mut new_sort, SortKey::Modified));
+                })
+                .body(|body| {
+                    body.rows(20.0, entries.len(), |mut row| {
+                        let e = &entries[row.index()];
+                        row.set_selected(new_selected == Some(row.index()));
+                        row.col(|ui| {
+                            let icon = if e.is_dir { "📁" } else { "📄" };
+                            ui.label(format!("{icon}  {}", e.name));
+                        });
+                        row.col(|ui| {
+                            if !e.is_dir {
+                                ui.monospace(human_size(e.size));
+                            }
+                        });
+                        row.col(|ui| {
+                            ui.label(entry_kind(e));
+                        });
+                        row.col(|ui| {
+                            if let Some(m) = e.modified {
+                                ui.weak(humanize_age(m));
+                            }
+                        });
+                        let resp = row.response();
+                        if resp.clicked() {
+                            new_selected = Some(row.index());
+                        }
+                        if resp.double_clicked() && e.is_dir {
+                            nav_target = Some(cur.join(&e.name));
+                        }
+                    });
+                });
+
+            // Restore entries and apply deferred mutations.
+            self.entries = entries;
+            self.selected = new_selected;
+            if let Some(k) = new_sort {
+                if self.sort_key == k {
+                    self.sort_asc = !self.sort_asc;
+                } else {
+                    self.sort_key = k;
+                    self.sort_asc = true;
+                }
+                self.entries_dirty = true; // re-sort next frame
+            }
+            if let Some(t) = nav_target {
+                self.navigate_to(t);
+            }
+        });
     }
 
     /// Ancestors of `root`, from the tree root down to `root` (for the breadcrumb).
@@ -670,6 +931,22 @@ impl eframe::App for SectorApp {
             }
         }
 
+        // ---- Mode toggle: Files (explorer) / City (visualizer) -------------
+        egui::Panel::top("mode").show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.strong(sector_core::APP_NAME);
+                ui.separator();
+                ui.selectable_value(&mut self.view, View::List, "📁 Files");
+                ui.selectable_value(&mut self.view, View::City, "🏙 City");
+            });
+        });
+
+        if self.view == View::List {
+            self.show_list(ui);
+        }
+
+        // ---- City view (the original visualizer) ---------------------------
+        if self.view == View::City {
         // ---- Top bar --------------------------------------------------------
         egui::Panel::top("bar").show(ui, |ui| {
             ui.horizontal(|ui| {
@@ -986,6 +1263,7 @@ impl eframe::App for SectorApp {
                 ctx.request_repaint();
             }
         });
+        } // end City view
 
         // Kick off the queued cache write now that this frame's render (and its
         // tree lock) is done, so serialization on the background thread doesn't
