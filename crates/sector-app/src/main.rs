@@ -1409,8 +1409,8 @@ impl SectorApp {
             self.focus_pane = Pane::Tree;
         }
         if navigate {
+            // Select/navigate WITHOUT expanding — the triangle (or → key) expands.
             self.navigate_to(path.clone());
-            self.sb_expanded.insert(path.clone()); // reveal children on select
             self.focus_pane = Pane::Tree;
         }
 
