@@ -2715,8 +2715,12 @@ impl eframe::App for SectorApp {
                     match self.cache_freshness {
                         Freshness::Stale => {
                             ui.separator();
-                            ui.colored_label(egui::Color32::from_rgb(230, 170, 80), "⚠ changed since scan")
-                                .on_hover_text("The volume's USN journal advanced since this scan — Rescan to refresh.");
+                            ui.colored_label(egui::Color32::from_rgb(230, 170, 80), "⟳ volume changed")
+                                .on_hover_text(
+                                    "Something on this volume changed since the scan (per the USN \
+                                     journal). This is volume-wide, so it may be unrelated activity \
+                                     — Rescan if you want the City refreshed.",
+                                );
                         }
                         Freshness::Current => {
                             ui.separator();

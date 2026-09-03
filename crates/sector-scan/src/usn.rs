@@ -50,8 +50,10 @@ mod imp {
     const FILE_SHARE_WRITE: u32 = 0x2;
     const OPEN_EXISTING: u32 = 3;
     const FSCTL_QUERY_USN_JOURNAL: u32 = 0x0009_00f4;
+    const DRIVE_FIXED: u32 = 3;
 
     extern "system" {
+        fn GetDriveTypeW(root: *const u16) -> u32;
         fn CreateFileW(
             name: *const u16,
             access: u32,
@@ -105,6 +107,17 @@ mod imp {
             },
             _ => None,
         })?;
+        // Only local FIXED volumes have a usable USN journal. Checking the drive
+        // type first also avoids a blocking CreateFile on a mapped network drive
+        // (which has a disk letter but no local volume device) — important since
+        // this runs on the UI thread.
+        let root: Vec<u16> = std::ffi::OsStr::new(&format!("{}:\\", drive as char))
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        if unsafe { GetDriveTypeW(root.as_ptr()) } != DRIVE_FIXED {
+            return None;
+        }
         let device = format!("\\\\.\\{}:", drive as char);
         let wide: Vec<u16> =
             std::ffi::OsStr::new(&device).encode_wide().chain(std::iter::once(0)).collect();
@@ -168,10 +181,12 @@ mod imp {
         if d.usn_journal_id != mark.journal_id || d.first_usn > mark.next_usn {
             return Freshness::Unknown;
         }
-        if d.next_usn > mark.next_usn {
-            Freshness::Stale
-        } else {
-            Freshness::Current
+        match d.next_usn.cmp(&mark.next_usn) {
+            std::cmp::Ordering::Greater => Freshness::Stale,
+            std::cmp::Ordering::Equal => Freshness::Current,
+            // Backwards without an id change shouldn't happen — treat a garbage
+            // watermark as unknowable rather than falsely "current".
+            std::cmp::Ordering::Less => Freshness::Unknown,
         }
     }
 }
