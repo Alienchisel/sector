@@ -264,6 +264,11 @@ struct SectorApp {
     /// derived from an in-memory scan tree that covers this folder — so the list's
     /// Size column can show folder sizes. `None` when no scan covers it.
     folder_sizes: Option<HashMap<String, u64>>,
+    /// After the next listing loads, select this entry by name (used by "up" to
+    /// re-select the folder you came out of).
+    select_after_reload: Option<String>,
+    /// Last window title we set, to avoid resending it every frame.
+    last_title: String,
     /// True while the address bar has (or just lost) focus — suppresses the file
     /// list's Enter/Backspace shortcuts so they don't fight the address bar.
     addr_active: bool,
@@ -318,6 +323,8 @@ impl Default for SectorApp {
             selected: None,
             scroll_target: None,
             folder_sizes: None,
+            select_after_reload: None,
+            last_title: String::new(),
             addr_active: false,
             sb_visible: true,
             sb_roots: Vec::new(),
@@ -567,7 +574,13 @@ impl SectorApp {
 
     fn go_up(&mut self) {
         if let Some(parent) = self.current_dir.parent().map(|p| p.to_path_buf()) {
+            // Re-select the folder we're stepping out of, once the parent loads.
+            let child = self
+                .current_dir
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned());
             self.navigate_to(parent);
+            self.select_after_reload = child;
         }
     }
 
@@ -621,6 +634,17 @@ impl SectorApp {
         }
         self.addr_edit = self.current_dir.to_string_lossy().into_owned();
         self.entries_dirty = false;
+        // Honor a pending "select the folder we came from" (from "up").
+        if let Some(name) = self.select_after_reload.take() {
+            if let Some(i) = self
+                .entries
+                .iter()
+                .position(|e| e.name.eq_ignore_ascii_case(&name))
+            {
+                self.selected = Some(i);
+                self.scroll_target = Some(i);
+            }
+        }
     }
 
     /// Recompute [`Self::folder_sizes`] for the current folder from an in-memory
@@ -813,6 +837,48 @@ impl SectorApp {
                 });
         }
 
+        // Status footer: folder totals + the selected item's details.
+        {
+            let n = self.entries.len();
+            let folders = self.entries.iter().filter(|e| e.is_dir).count();
+            let files = n - folders;
+            let total: u64 = self.entries.iter().map(|e| self.entry_size(e)).sum();
+            let summary = format!(
+                "{} items · {} folders · {} files · {}",
+                commas(n as u64),
+                commas(folders as u64),
+                commas(files as u64),
+                human_size(total),
+            );
+            let detail = self.selected.and_then(|i| self.entries.get(i)).map(|e| {
+                let mut s = e.name.clone();
+                let known = !e.is_dir
+                    || self
+                        .folder_sizes
+                        .as_ref()
+                        .map(|m| m.contains_key(&e.name.to_lowercase()))
+                        .unwrap_or(false);
+                if known {
+                    s.push_str(&format!(" · {}", human_size(self.entry_size(e))));
+                }
+                if let Some(m) = e.modified {
+                    s.push_str(&format!(" · {}", humanize_age(m)));
+                }
+                s
+            });
+            egui::Panel::bottom("files_status").show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    if self.entries_err.is_none() {
+                        ui.weak(summary);
+                    }
+                    if let Some(d) = detail {
+                        ui.separator();
+                        ui.label(d);
+                    }
+                });
+            });
+        }
+
         egui::CentralPanel::default().show(ui, |ui| {
             if let Some(err) = self.entries_err.clone() {
                 ui.centered_and_justified(|ui| {
@@ -859,6 +925,16 @@ impl SectorApp {
                     *out = Some(k);
                 }
             };
+            // Right-aligned header, for the numeric/date columns.
+            let header_cell_r = |ui: &mut egui::Ui, label: String, out: &mut Option<SortKey>, k: SortKey| {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    header_cell(ui, label, out, k);
+                });
+            };
+            // Right-aligned data cell wrapper.
+            let cell_r = |ui: &mut egui::Ui, add: &mut dyn FnMut(&mut egui::Ui)| {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| add(ui));
+            };
 
             let mut table = TableBuilder::new(ui)
                 .striped(true)
@@ -873,9 +949,9 @@ impl SectorApp {
             table
                 .header(22.0, |mut h| {
                     h.col(|ui| header_cell(ui, format!("Name{}", arrow(SortKey::Name)), &mut new_sort, SortKey::Name));
-                    h.col(|ui| header_cell(ui, format!("Size{}", arrow(SortKey::Size)), &mut new_sort, SortKey::Size));
+                    h.col(|ui| header_cell_r(ui, format!("Size{}", arrow(SortKey::Size)), &mut new_sort, SortKey::Size));
                     h.col(|ui| header_cell(ui, format!("Type{}", arrow(SortKey::Kind)), &mut new_sort, SortKey::Kind));
-                    h.col(|ui| header_cell(ui, format!("Modified{}", arrow(SortKey::Modified)), &mut new_sort, SortKey::Modified));
+                    h.col(|ui| header_cell_r(ui, format!("Modified{}", arrow(SortKey::Modified)), &mut new_sort, SortKey::Modified));
                 })
                 .body(|body| {
                     body.rows(20.0, entries.len(), |mut row| {
@@ -899,17 +975,19 @@ impl SectorApp {
                             });
                         });
                         row.col(|ui| {
-                            if e.is_dir {
-                                // Folder size from a covering scan, if we have one.
-                                if let Some(sz) = folder_sizes
-                                    .as_ref()
-                                    .and_then(|m| m.get(&e.name.to_lowercase()))
-                                {
-                                    ui.monospace(human_size(*sz));
+                            cell_r(ui, &mut |ui| {
+                                if e.is_dir {
+                                    // Folder size from a covering scan, if we have one.
+                                    if let Some(sz) = folder_sizes
+                                        .as_ref()
+                                        .and_then(|m| m.get(&e.name.to_lowercase()))
+                                    {
+                                        ui.monospace(human_size(*sz));
+                                    }
+                                } else {
+                                    ui.monospace(human_size(e.size));
                                 }
-                            } else {
-                                ui.monospace(human_size(e.size));
-                            }
+                            });
                         });
                         row.col(|ui| match cat {
                             None => {
@@ -920,9 +998,11 @@ impl SectorApp {
                             }
                         });
                         row.col(|ui| {
-                            if let Some(m) = e.modified {
-                                ui.weak(humanize_age(m));
-                            }
+                            cell_r(ui, &mut |ui| {
+                                if let Some(m) = e.modified {
+                                    ui.weak(humanize_age(m));
+                                }
+                            });
                         });
                         let full = cur.join(&e.name);
                         let resp = row.response();
@@ -1369,6 +1449,13 @@ impl eframe::App for SectorApp {
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+
+        // Reflect the current folder in the window/taskbar title (only on change).
+        let title = format!("{} — {}", sector_core::APP_NAME, self.current_dir.display());
+        if title != self.last_title {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
+            self.last_title = title;
+        }
 
         // Poll the background scan for completion.
         let mut just_finished = false;
