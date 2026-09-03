@@ -379,6 +379,10 @@ struct SectorApp {
     anchor: Option<usize>,
     /// When set, scroll the file table to this row next build (keyboard nav).
     scroll_target: Option<usize>,
+    /// Type-ahead search buffer + when it was last appended to (resets after a
+    /// short pause), so typing letters jumps to the matching file.
+    type_ahead: String,
+    type_ahead_time: Instant,
     /// Subtree sizes for the current folder's SUBFOLDERS (lowercased name → bytes),
     /// derived from an in-memory scan tree that covers this folder — so the list's
     /// Size column can show folder sizes. `None` when no scan covers it.
@@ -483,6 +487,8 @@ impl Default for SectorApp {
             lead: None,
             anchor: None,
             scroll_target: None,
+            type_ahead: String::new(),
+            type_ahead_time: Instant::now(),
             folder_sizes: None,
             select_after_reload: None,
             last_title: String::new(),
@@ -2058,6 +2064,7 @@ impl SectorApp {
             if self.focus_pane == Pane::Tree && self.sb_visible {
                 self.tree_keys(ui);
             } else {
+                self.type_ahead_list(ui);
                 // Move the lead in the list (Shift extends the range from the
                 // anchor), scrolling it into view.
                 let n = self.entries.len();
@@ -2163,6 +2170,51 @@ impl SectorApp {
         }
         self.focus_pane = Pane::Tree;
         ui.ctx().request_repaint();
+    }
+
+    /// Type-ahead in the file list: typing letters jumps to the first matching
+    /// name; repeating the same letter cycles through matches; the buffer resets
+    /// after a short pause. Uses egui Text events, so Ctrl-combos don't trigger it.
+    fn type_ahead_list(&mut self, ui: &egui::Ui) {
+        let typed: String = ui.input(|i| {
+            i.events
+                .iter()
+                .filter_map(|e| match e {
+                    egui::Event::Text(t) => Some(t.as_str()),
+                    _ => None,
+                })
+                .collect()
+        });
+        if typed.is_empty() || self.entries.is_empty() {
+            return;
+        }
+        let typed = typed.to_lowercase();
+        let now = Instant::now();
+        let timed_out = now.duration_since(self.type_ahead_time) >= Duration::from_millis(900);
+        // Same single letter again (within the window) → cycle to the next match.
+        let repeat = !timed_out
+            && self.type_ahead.chars().count() == 1
+            && typed.chars().count() == 1
+            && self.type_ahead == typed;
+        if timed_out {
+            self.type_ahead = typed;
+        } else if !repeat {
+            self.type_ahead.push_str(&typed);
+        }
+        self.type_ahead_time = now;
+
+        let q = self.type_ahead.clone();
+        let n = self.entries.len();
+        let start = if repeat { self.lead.map_or(0, |i| i + 1) } else { 0 };
+        let hit = (0..n)
+            .map(|off| (start + off) % n)
+            .find(|&i| self.entries[i].name.to_lowercase().starts_with(&q));
+        if let Some(i) = hit {
+            self.select_only(i);
+            self.scroll_target = Some(i);
+            self.focus_pane = Pane::List;
+            ui.ctx().request_repaint();
+        }
     }
 
     /// Ancestors of `root`, from the tree root down to `root` (for the breadcrumb).
