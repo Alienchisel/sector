@@ -233,7 +233,8 @@ safest-first — destructive ops must be bulletproof (see D16, D1).
   live (`read_dir` the current folder), a details list (name, size, type, date),
   sortable; address bar, back/forward/up, folder-tree sidebar. *This is the new
   default view.* — **E1a ✅** (data layer) · **E1b.1 ✅** (shell + list) ·
-  **E1b.2 ☐** (folder-tree sidebar — Files view only, per D19).
+  **E1b.2 ✅** (folder-tree sidebar — Files view only, per D19; collapsible,
+  lazy-loaded, drive roots, auto-reveals the current path).
 - **E2 — List / City toggle  ✅**: one shared location (`current_dir`) drives both
   views; the City visualizes the folder you're browsing — instant cache-load if
   present, else a scan-prompt; drilling in the City syncs back to Files. See D18.

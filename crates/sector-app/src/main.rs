@@ -12,7 +12,8 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use std::path::PathBuf;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver};
 use std::sync::{Arc, Mutex};
@@ -216,6 +217,15 @@ struct SectorApp {
     /// True while the address bar has (or just lost) focus — suppresses the file
     /// list's Enter/Backspace shortcuts so they don't fight the address bar.
     addr_active: bool,
+
+    // ---- Folder-tree sidebar (E1b.2, Files view only — D19) ----
+    sb_visible: bool,
+    /// Drive roots (C:\, Y:\, …), enumerated once (empty = not yet computed).
+    sb_roots: Vec<PathBuf>,
+    /// Which tree nodes are expanded.
+    sb_expanded: HashSet<PathBuf>,
+    /// Lazily-filled cache: dir → its immediate subdirectories (sorted).
+    sb_cache: HashMap<PathBuf, Vec<PathBuf>>,
     /// The path the loaded City tree is rooted at (its scan/cache-load target).
     city_root: Option<PathBuf>,
     /// The location the City view currently represents (root, or a drilled-in
@@ -257,6 +267,10 @@ impl Default for SectorApp {
             sort_asc: true,
             selected: None,
             addr_active: false,
+            sb_visible: true,
+            sb_roots: Vec::new(),
+            sb_expanded: HashSet::new(),
+            sb_cache: HashMap::new(),
             city_root: None,
             city_synced_dir: None,
         }
@@ -459,6 +473,7 @@ impl SectorApp {
         self.entries_dirty = true;
         self.selected = None;
         self.sync_addr();
+        self.sb_reveal();
     }
 
     fn go_back(&mut self) {
@@ -467,6 +482,7 @@ impl SectorApp {
             self.entries_dirty = true;
             self.selected = None;
             self.sync_addr();
+            self.sb_reveal();
         }
     }
 
@@ -476,6 +492,7 @@ impl SectorApp {
             self.entries_dirty = true;
             self.selected = None;
             self.sync_addr();
+            self.sb_reveal();
         }
     }
 
@@ -521,6 +538,96 @@ impl SectorApp {
         self.entries_dirty = false;
     }
 
+    // ---- Folder-tree sidebar (E1b.2) ----
+
+    /// Expand every ancestor of `current_dir` so the tree reveals where you are.
+    fn sb_reveal(&mut self) {
+        let mut cur = self.current_dir.clone();
+        loop {
+            self.sb_expanded.insert(cur.clone());
+            match cur.parent() {
+                Some(par) => cur = par.to_path_buf(),
+                None => break,
+            }
+        }
+    }
+
+    /// A folder's immediate subdirectories, cached (lazy — filled on first expand).
+    fn sb_children(&mut self, path: &Path) -> Vec<PathBuf> {
+        if let Some(c) = self.sb_cache.get(path) {
+            return c.clone();
+        }
+        let mut dirs: Vec<PathBuf> = match list_dir(path) {
+            Ok(es) => es
+                .into_iter()
+                .filter(|e| e.is_dir && !e.is_symlink)
+                .map(|e| path.join(&e.name))
+                .collect(),
+            Err(_) => Vec::new(),
+        };
+        dirs.sort_by_key(|p| {
+            p.file_name()
+                .map(|n| n.to_string_lossy().to_lowercase())
+                .unwrap_or_default()
+        });
+        self.sb_cache.insert(path.to_path_buf(), dirs.clone());
+        dirs
+    }
+
+    /// Render the drive roots and (recursively) their expanded subtrees.
+    fn sidebar_tree(&mut self, ui: &mut egui::Ui) {
+        if self.sb_roots.is_empty() {
+            self.sb_roots = enumerate_drives();
+            self.sb_reveal(); // open the path to wherever we start
+        }
+        for root in self.sb_roots.clone() {
+            self.sb_node(ui, root, 0);
+        }
+    }
+
+    /// One tree row: an expand triangle + a clickable folder label, then (if
+    /// expanded) its children indented beneath. Navigating and toggling are
+    /// deferred out of the row closure to keep the borrows simple.
+    fn sb_node(&mut self, ui: &mut egui::Ui, path: PathBuf, depth: usize) {
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.to_string_lossy().into_owned());
+        let open = self.sb_expanded.contains(&path);
+        let is_current = self.current_dir == path;
+
+        let mut toggle = false;
+        let mut navigate = false;
+        ui.horizontal(|ui| {
+            ui.add_space(depth as f32 * 12.0);
+            let tri = if open { "▾" } else { "▸" };
+            if ui.add(egui::Button::new(tri).frame(false)).clicked() {
+                toggle = true;
+            }
+            if ui.selectable_label(is_current, format!("🗀 {name}")).clicked() {
+                navigate = true;
+            }
+        });
+
+        if toggle {
+            if open {
+                self.sb_expanded.remove(&path);
+            } else {
+                self.sb_expanded.insert(path.clone());
+            }
+        }
+        if navigate {
+            self.navigate_to(path.clone());
+            self.sb_expanded.insert(path.clone()); // reveal children on select
+        }
+
+        if self.sb_expanded.contains(&path) {
+            for child in self.sb_children(&path) {
+                self.sb_node(ui, child, depth + 1);
+            }
+        }
+    }
+
     /// The shared navigation strip: back / forward / up + the address bar. Drives
     /// `current_dir`, which BOTH views follow (E2).
     fn nav_bar(&mut self, ui: &mut egui::Ui) {
@@ -547,10 +654,26 @@ impl SectorApp {
         }
     }
 
-    /// The file-explorer List view: a virtualized file table for `current_dir`.
+    /// The file-explorer List view: a folder-tree sidebar + a virtualized file
+    /// table for `current_dir`.
     fn show_list(&mut self, ui: &mut egui::Ui) {
         if self.entries_dirty {
             self.reload_entries();
+        }
+
+        if self.sb_visible {
+            egui::Panel::left("folder_tree")
+                .resizable(true)
+                .default_size(240.0)
+                .min_size(150.0)
+                .show(ui, |ui| {
+                    ui.add_space(4.0);
+                    egui::ScrollArea::both()
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            self.sidebar_tree(ui);
+                        });
+                });
         }
 
         egui::CentralPanel::default().show(ui, |ui| {
@@ -964,6 +1087,22 @@ fn open_path(path: &std::path::Path) {
 #[cfg(not(target_os = "windows"))]
 fn open_path(_path: &std::path::Path) {}
 
+/// Enumerate drive roots for the folder-tree sidebar. Probes A:..Z: (a mounted
+/// letter answers `metadata` cheaply; an absent one fails fast). Computed once.
+#[cfg(target_os = "windows")]
+fn enumerate_drives() -> Vec<PathBuf> {
+    ('A'..='Z')
+        .filter_map(|c| {
+            let p = PathBuf::from(format!("{c}:\\"));
+            p.metadata().is_ok().then_some(p)
+        })
+        .collect()
+}
+#[cfg(not(target_os = "windows"))]
+fn enumerate_drives() -> Vec<PathBuf> {
+    vec![PathBuf::from("/")]
+}
+
 /// Hand-drawn tooltip near the cursor. egui's widget tooltip anchors to the
 /// widget rect — our widget is the whole panel, so it would land in the corner;
 /// we draw our own at the pointer instead.
@@ -1053,6 +1192,14 @@ impl eframe::App for SectorApp {
                 ui.selectable_value(&mut self.view, View::List, "📁 Files");
                 ui.selectable_value(&mut self.view, View::City, "🏙 City");
                 ui.separator();
+                if self.view == View::List
+                    && ui
+                        .selectable_label(self.sb_visible, "☰")
+                        .on_hover_text("Toggle the folder tree")
+                        .clicked()
+                {
+                    self.sb_visible = !self.sb_visible;
+                }
                 self.nav_bar(ui);
             });
         });
