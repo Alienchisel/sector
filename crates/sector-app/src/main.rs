@@ -46,12 +46,13 @@ enum SortKey {
     Modified,
 }
 
-/// A short human "kind" for a listing entry.
-fn entry_kind(e: &Entry) -> String {
+/// A short human "kind" for a listing entry (a `&'static str`, so sorting and
+/// drawing the Type column don't allocate).
+fn entry_kind(e: &Entry) -> &'static str {
     if e.is_dir {
-        "Folder".to_string()
+        "Folder"
     } else {
-        categorize(&e.name).label().to_string()
+        categorize(&e.name).label()
     }
 }
 
@@ -84,11 +85,12 @@ fn joined_path(comps: &[&str]) -> String {
 }
 
 /// The cache file path for a given scan root, or `None` if the cache dir is
-/// unavailable. Keyed by a hash of the (normalized) path.
+/// unavailable. Keyed by a hash of the (normalized) path. Pure — does NO
+/// filesystem I/O (it's called every frame in the City view); the cache dir is
+/// created lazily at save time by [`ensure_cache_dir`].
 fn cache_path_for(root: &str) -> Option<PathBuf> {
     use std::hash::{Hash, Hasher};
     let dir = dirs::cache_dir()?.join("sector");
-    std::fs::create_dir_all(&dir).ok()?;
     // Normalize so "Y:" and "Y:\" (and case) map to the same cache key. Appending
     // the separator (rather than stripping it) keeps existing "X:\" caches valid.
     let mut key = root.trim().to_lowercase();
@@ -382,22 +384,24 @@ impl SectorApp {
     }
 
     /// Load a previously-cached scan for the current folder — instant, no walk.
-    fn load_cached(&mut self) {
+    /// Returns `false` if there was no readable/valid cache (caller decides what
+    /// to show instead).
+    fn load_cached(&mut self) -> bool {
         let Some(cp) = cache_path_for(&self.current_dir.to_string_lossy()) else {
             eprintln!("[sector] load_cached: no cache dir");
-            return;
+            return false;
         };
         let bytes = match std::fs::read(&cp) {
             Ok(b) => b,
             Err(e) => {
                 eprintln!("[sector] load_cached: read {} failed: {e}", cp.display());
-                return;
+                return false;
             }
         };
         eprintln!("[sector] load_cached: read {} bytes from {}", bytes.len(), cp.display());
         let Some((tree, cs)) = Tree::from_cache_bytes(&bytes) else {
             eprintln!("[sector] load_cached: DESERIALIZE FAILED");
-            return;
+            return false;
         };
         eprintln!("[sector] load_cached: OK — {} nodes, {} files", tree.len(), cs.files);
         let tree = Arc::new(Mutex::new(tree));
@@ -428,6 +432,7 @@ impl SectorApp {
             stats: Some(stats),
             started: Instant::now(),
         };
+        true
     }
 
     /// Point the City at `current_dir` (E2). Instant cache-load if one exists;
@@ -437,9 +442,10 @@ impl SectorApp {
         let has_cache = cache_path_for(&cur.to_string_lossy())
             .map(|p| p.exists())
             .unwrap_or(false);
-        if has_cache {
-            self.load_cached();
-        } else {
+        // Try the cache; if it's missing OR fails to load (corrupt/truncated),
+        // drop to an idle scan-prompt rather than leaving the previous folder's
+        // cityscape on screen mislabeled as this one.
+        if !(has_cache && self.load_cached()) {
             // Cancel any scan of the old location and clear the cityscape.
             if let ScanState::Running { cancel, .. } = &self.scan {
                 cancel.store(true, Ordering::Relaxed);
@@ -622,8 +628,19 @@ impl SectorApp {
         }
 
         if self.sb_expanded.contains(&path) {
-            for child in self.sb_children(&path) {
-                self.sb_node(ui, child, depth + 1);
+            // Cap children per node: the tree isn't virtualized, so a folder with
+            // thousands of subfolders would otherwise render thousands of rows
+            // every frame. Beyond the cap, point to the (virtualized) list.
+            const CAP: usize = 400;
+            let kids = self.sb_children(&path);
+            for child in kids.iter().take(CAP) {
+                self.sb_node(ui, child.clone(), depth + 1);
+            }
+            if kids.len() > CAP {
+                ui.horizontal(|ui| {
+                    ui.add_space((depth as f32 + 1.0) * 12.0);
+                    ui.weak(format!("… {} more — open in the list", kids.len() - CAP));
+                });
             }
         }
     }
@@ -649,8 +666,18 @@ impl SectorApp {
         // file list won't also act on Enter/Backspace.
         self.addr_active = r.has_focus() || r.lost_focus();
         if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-            let p = PathBuf::from(self.addr_edit.trim());
-            self.navigate_to(p);
+            let raw = self.addr_edit.trim();
+            // "C:" means the drive-relative cwd on Windows; the user means the
+            // drive root, so append a separator to a bare drive letter.
+            let norm = if raw.len() == 2
+                && raw.as_bytes()[0].is_ascii_alphabetic()
+                && raw.as_bytes()[1] == b':'
+            {
+                format!("{raw}\\")
+            } else {
+                raw.to_string()
+            };
+            self.navigate_to(PathBuf::from(norm));
         }
     }
 
@@ -806,7 +833,16 @@ impl SectorApp {
                     self.sort_key = k;
                     self.sort_asc = true;
                 }
-                self.entries_dirty = true; // re-sort next frame
+                // Re-sort IN PLACE (no directory re-read) and keep the same file
+                // selected across the reorder — its index changes, so track it by
+                // name rather than by position.
+                let sel_name =
+                    self.selected.and_then(|i| self.entries.get(i)).map(|e| e.name.clone());
+                let mut es = std::mem::take(&mut self.entries);
+                self.sort_entries(&mut es);
+                self.entries = es;
+                self.selected =
+                    sel_name.and_then(|n| self.entries.iter().position(|e| e.name == n));
             }
             if let Some(t) = nav_target {
                 self.navigate_to(t);
@@ -1007,7 +1043,11 @@ fn build_scape(
     let plinth_front = [tr(0.0, PLANE, 0.0), tr(PLANE, PLANE, 0.0), tr(PLANE, PLANE, -PLINTH_TH), tr(0.0, PLANE, -PLINTH_TH)];
 
     // Back-to-front: far (small x+y) first.
-    leaves.sort_by(|a, b| (a.rect.x + a.rect.y).partial_cmp(&(b.rect.x + b.rect.y)).unwrap());
+    leaves.sort_by(|a, b| {
+        (a.rect.x + a.rect.y)
+            .partial_cmp(&(b.rect.x + b.rect.y))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
 
     let blocks = leaves
         .iter()
@@ -1087,15 +1127,20 @@ fn open_path(path: &std::path::Path) {
 #[cfg(not(target_os = "windows"))]
 fn open_path(_path: &std::path::Path) {}
 
-/// Enumerate drive roots for the folder-tree sidebar. Probes A:..Z: (a mounted
-/// letter answers `metadata` cheaply; an absent one fails fast). Computed once.
+/// Enumerate drive roots for the folder-tree sidebar. Uses `GetLogicalDrives`
+/// (a kernel bitmask — no per-drive I/O), so a mapped-but-disconnected network
+/// drive can't stall the first paint the way probing `metadata()` on it would,
+/// and such drives still appear in the tree. Computed once.
 #[cfg(target_os = "windows")]
 fn enumerate_drives() -> Vec<PathBuf> {
+    // kernel32 is always linked on Windows; the bitmask sets bit 0 = A:, 1 = B:…
+    extern "system" {
+        fn GetLogicalDrives() -> u32;
+    }
+    let mask = unsafe { GetLogicalDrives() };
     ('A'..='Z')
-        .filter_map(|c| {
-            let p = PathBuf::from(format!("{c}:\\"));
-            p.metadata().is_ok().then_some(p)
-        })
+        .enumerate()
+        .filter_map(|(i, c)| (mask & (1 << i) != 0).then(|| PathBuf::from(format!("{c}:\\"))))
         .collect()
 }
 #[cfg(not(target_os = "windows"))]
@@ -1553,11 +1598,11 @@ impl eframe::App for SectorApp {
                 None
             };
         if let Some(t) = drilled {
+            // Route through navigate_to so a City drill joins the shared history
+            // (Back undoes it), updates the address bar, and reveals the Files
+            // tree — then mark it synced so this doesn't trigger a City re-sync.
             if t != self.current_dir {
-                self.current_dir = t;
-                self.entries_dirty = true;
-                self.selected = None;
-                self.sync_addr();
+                self.navigate_to(t);
             }
             self.city_synced_dir = Some(self.current_dir.clone());
         }
@@ -1573,10 +1618,16 @@ impl eframe::App for SectorApp {
                     g.to_cache_bytes(cs)
                 };
                 match result {
-                    Ok(bytes) => match std::fs::write(&cp, &bytes) {
-                        Ok(()) => eprintln!("[sector] cache saved: {} ({} bytes)", cp.display(), bytes.len()),
-                        Err(e) => eprintln!("[sector] cache SAVE (write) FAILED: {e}"),
-                    },
+                    Ok(bytes) => {
+                        // Create the cache dir here (cache_path_for is pure now).
+                        if let Some(parent) = cp.parent() {
+                            let _ = std::fs::create_dir_all(parent);
+                        }
+                        match std::fs::write(&cp, &bytes) {
+                            Ok(()) => eprintln!("[sector] cache saved: {} ({} bytes)", cp.display(), bytes.len()),
+                            Err(e) => eprintln!("[sector] cache SAVE (write) FAILED: {e}"),
+                        }
+                    }
                     Err(e) => eprintln!("[sector] cache SAVE (serialize) FAILED: {e}"),
                 }
             });

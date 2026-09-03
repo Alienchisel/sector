@@ -22,6 +22,19 @@ pub struct Entry {
     pub is_symlink: bool,
 }
 
+/// Is this metadata a Windows reparse point (junction / mount point / symlink)?
+#[cfg(windows)]
+fn is_reparse_point(md: Option<&std::fs::Metadata>) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+    md.map(|m| m.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0)
+        .unwrap_or(false)
+}
+#[cfg(not(windows))]
+fn is_reparse_point(_md: Option<&std::fs::Metadata>) -> bool {
+    false
+}
+
 /// List a directory's immediate entries. Per-entry errors (a file that vanished,
 /// a permission glitch) are skipped rather than failing the whole listing; only
 /// a failure to open the directory itself returns `Err`.
@@ -33,12 +46,17 @@ pub fn list_dir(path: &Path) -> std::io::Result<Vec<Entry>> {
         let Ok(ft) = dirent.file_type() else { continue };
         let md = dirent.metadata().ok();
         let is_dir = ft.is_dir();
+        // Treat Windows junctions / mount points (reparse points) as symlinks too
+        // — `FileType::is_symlink` misses them, and a junction pointing at an
+        // ancestor would otherwise loop the folder tree. `DirEntry::metadata`
+        // does not follow the reparse point, so these attributes are the link's.
+        let is_symlink = ft.is_symlink() || is_reparse_point(md.as_ref());
         out.push(Entry {
             name: dirent.file_name().to_string_lossy().into_owned(),
             is_dir,
             size: if is_dir { 0 } else { md.as_ref().map(|m| m.len()).unwrap_or(0) },
             modified: md.and_then(|m| m.modified().ok()),
-            is_symlink: ft.is_symlink(),
+            is_symlink,
         });
     }
     Ok(out)
