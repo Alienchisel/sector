@@ -264,11 +264,15 @@ struct SectorApp {
     /// derived from an in-memory scan tree that covers this folder — so the list's
     /// Size column can show folder sizes. `None` when no scan covers it.
     folder_sizes: Option<HashMap<String, u64>>,
-    /// After the next listing loads, select this entry by name (used by "up" to
-    /// re-select the folder you came out of).
-    select_after_reload: Option<String>,
+    /// After the listing for `.0` loads, select the entry named `.1` — used by
+    /// "up" (re-select the folder you left) and F5 (keep the selection). The path
+    /// guards against applying it in an unrelated folder.
+    select_after_reload: Option<(PathBuf, String)>,
     /// Last window title we set, to avoid resending it every frame.
     last_title: String,
+    /// Cached status-footer summary (item counts + total), recomputed only when
+    /// the listing or folder sizes change — not every frame.
+    status_summary: String,
     /// True while the address bar has (or just lost) focus — suppresses the file
     /// list's Enter/Backspace shortcuts so they don't fight the address bar.
     addr_active: bool,
@@ -281,6 +285,10 @@ struct SectorApp {
     sb_expanded: HashSet<PathBuf>,
     /// Lazily-filled cache: dir → its immediate subdirectories (sorted).
     sb_cache: HashMap<PathBuf, Vec<PathBuf>>,
+    /// Modified-time of the current folder's cache file, if one exists — computed
+    /// on folder change (in sync_city) so the City top bar doesn't stat it every
+    /// frame. `None` = no cache for the current folder.
+    cache_mtime: Option<SystemTime>,
     /// The path the loaded City tree is rooted at (its scan/cache-load target).
     city_root: Option<PathBuf>,
     /// The location the City view currently represents (root, or a drilled-in
@@ -325,6 +333,8 @@ impl Default for SectorApp {
             folder_sizes: None,
             select_after_reload: None,
             last_title: String::new(),
+            status_summary: String::new(),
+            cache_mtime: None,
             addr_active: false,
             sb_visible: true,
             sb_roots: Vec::new(),
@@ -474,7 +484,7 @@ impl SectorApp {
         }
         eprintln!("[sector] load_cached: OK — {} nodes, {} files", tree.len(), cs.files);
         let tree = Arc::new(Mutex::new(tree));
-        self.dominant = Some(tree.lock().expect("tree").dominant_categories());
+        self.dominant = Some(tree.lock().unwrap_or_else(|e| e.into_inner()).dominant_categories());
         let stats = ScanStats {
             dirs: cs.dirs,
             files: cs.files,
@@ -509,9 +519,12 @@ impl SectorApp {
     /// otherwise drop to an idle scan-prompt (a full scan stays deliberate).
     fn sync_city(&mut self) {
         let cur = self.current_dir.clone();
-        let has_cache = cache_path_for(&cur.to_string_lossy())
-            .map(|p| p.exists())
-            .unwrap_or(false);
+        // One stat here (folder change), reused by the City top bar's Load-cached
+        // button so it doesn't re-stat the file every frame.
+        let md = cache_path_for(&cur.to_string_lossy())
+            .and_then(|p| std::fs::metadata(p).ok());
+        self.cache_mtime = md.as_ref().and_then(|m| m.modified().ok());
+        let has_cache = md.is_some();
         // Try the cache; if it's missing OR fails to load (corrupt/truncated),
         // drop to an idle scan-prompt rather than leaving the previous folder's
         // cityscape on screen mislabeled as this one.
@@ -579,8 +592,10 @@ impl SectorApp {
                 .current_dir
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned());
-            self.navigate_to(parent);
-            self.select_after_reload = child;
+            self.navigate_to(parent.clone());
+            if let Some(c) = child {
+                self.select_after_reload = Some((parent, c));
+            }
         }
     }
 
@@ -634,17 +649,22 @@ impl SectorApp {
         }
         self.addr_edit = self.current_dir.to_string_lossy().into_owned();
         self.entries_dirty = false;
-        // Honor a pending "select the folder we came from" (from "up").
-        if let Some(name) = self.select_after_reload.take() {
-            if let Some(i) = self
-                .entries
-                .iter()
-                .position(|e| e.name.eq_ignore_ascii_case(&name))
-            {
-                self.selected = Some(i);
-                self.scroll_target = Some(i);
+        // Honor a pending select-by-name (from "up" or F5) — but only in the
+        // folder it was meant for, so a stale value can't select elsewhere.
+        if let Some((dir, name)) = self.select_after_reload.take() {
+            if dir == self.current_dir {
+                if let Some(i) = self
+                    .entries
+                    .iter()
+                    .position(|e| e.name.eq_ignore_ascii_case(&name))
+                {
+                    self.selected = Some(i);
+                    self.scroll_target = Some(i);
+                }
             }
         }
+        // Now that the new listing is in place, refresh the footer summary.
+        self.refresh_status_summary();
     }
 
     /// Recompute [`Self::folder_sizes`] for the current folder from an in-memory
@@ -653,6 +673,26 @@ impl SectorApp {
     /// it `None` when no completed scan covers `current_dir`.
     fn recompute_folder_sizes(&mut self) {
         self.folder_sizes = self.compute_folder_sizes();
+        self.refresh_status_summary(); // the total depends on folder sizes
+    }
+
+    /// Recompute the cached status-footer summary. O(n) over the listing, but
+    /// only when it (or folder sizes) changes — never per frame.
+    fn refresh_status_summary(&mut self) {
+        if self.entries_err.is_some() {
+            self.status_summary.clear();
+            return;
+        }
+        let n = self.entries.len();
+        let folders = self.entries.iter().filter(|e| e.is_dir).count();
+        let total: u64 = self.entries.iter().map(|e| self.entry_size(e)).sum();
+        self.status_summary = format!(
+            "{} items · {} folders · {} files · {}",
+            commas(n as u64),
+            commas(folders as u64),
+            commas((n - folders) as u64),
+            human_size(total),
+        );
     }
 
     fn compute_folder_sizes(&self) -> Option<HashMap<String, u64>> {
@@ -660,14 +700,21 @@ impl SectorApp {
             return None;
         };
         let root = self.city_root.as_ref()?;
-        let rel = self.current_dir.strip_prefix(root).ok()?;
-        let comps: Vec<String> = rel
-            .components()
-            .filter_map(|c| c.as_os_str().to_str().map(str::to_owned))
-            .collect();
-        let refs: Vec<&str> = comps.iter().map(String::as_str).collect();
+        // Relative components from the scan root to the current folder, compared
+        // case-insensitively (Windows) since the tree walk is too. Lowercasing is
+        // fine — find_descendant matches case-insensitively.
+        let lower = |p: &Path| -> Vec<String> {
+            p.components()
+                .map(|c| c.as_os_str().to_string_lossy().to_lowercase())
+                .collect()
+        };
+        let (root_c, cur_c) = (lower(root), lower(&self.current_dir));
+        if !cur_c.starts_with(&root_c) {
+            return None; // current folder isn't inside the scanned root
+        }
+        let comps: Vec<&str> = cur_c[root_c.len()..].iter().map(String::as_str).collect();
         let t = tree.lock().ok()?;
-        let node = t.find_descendant(Tree::ROOT, &refs)?;
+        let node = t.find_descendant(Tree::ROOT, &comps)?;
         let mut map = HashMap::new();
         for &child in t.children(node) {
             let n = t.node(child);
@@ -837,19 +884,8 @@ impl SectorApp {
                 });
         }
 
-        // Status footer: folder totals + the selected item's details.
+        // Status footer: folder totals (cached) + the selected item's details.
         {
-            let n = self.entries.len();
-            let folders = self.entries.iter().filter(|e| e.is_dir).count();
-            let files = n - folders;
-            let total: u64 = self.entries.iter().map(|e| self.entry_size(e)).sum();
-            let summary = format!(
-                "{} items · {} folders · {} files · {}",
-                commas(n as u64),
-                commas(folders as u64),
-                commas(files as u64),
-                human_size(total),
-            );
             let detail = self.selected.and_then(|i| self.entries.get(i)).map(|e| {
                 let mut s = e.name.clone();
                 let known = !e.is_dir
@@ -868,9 +904,7 @@ impl SectorApp {
             });
             egui::Panel::bottom("files_status").show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    if self.entries_err.is_none() {
-                        ui.weak(summary);
-                    }
+                    ui.weak(&self.status_summary);
                     if let Some(d) = detail {
                         ui.separator();
                         ui.label(d);
@@ -1078,8 +1112,17 @@ impl SectorApp {
         let typing = self.addr_active || ui.ctx().memory(|m| m.focused()).is_some();
         if !typing {
             // F5: re-read the current folder AND drop the (lazy) tree cache, so
-            // on-disk changes show without a restart.
+            // on-disk changes show without a restart. Keep the same file selected
+            // by name (the old index may no longer be valid after the re-read).
             if ui.input(|i| i.key_pressed(egui::Key::F5)) {
+                let keep = self
+                    .selected
+                    .and_then(|i| self.entries.get(i))
+                    .map(|e| e.name.clone());
+                self.selected = None;
+                if let Some(name) = keep {
+                    self.select_after_reload = Some((self.current_dir.clone(), name));
+                }
                 self.entries_dirty = true;
                 self.sb_cache.clear();
             }
@@ -1475,7 +1518,7 @@ impl eframe::App for SectorApp {
             // Compute dominant content category per node now (one O(n) pass on
             // the finished tree) so folders can be colored by what they contain.
             if let ScanState::Running { tree, stats, .. } = &self.scan {
-                let t = tree.lock().expect("tree");
+                let t = tree.lock().unwrap_or_else(|e| e.into_inner());
                 self.dominant = Some(t.dominant_categories());
                 let root_name = t.node(Tree::ROOT).name.to_string();
                 drop(t);
@@ -1571,16 +1614,15 @@ impl eframe::App for SectorApp {
                         .on_hover_text("Replay duration — drag to change the pace, then Load cached again.");
                     }
 
-                    // Offer an instant load if a cache exists for this folder.
-                    if let Some(cp) = cache_path_for(&self.current_dir.to_string_lossy()) {
-                        if let Ok(age) = std::fs::metadata(&cp).and_then(|m| m.modified()) {
-                            if ui
-                                .button(format!("⟳ Load cached · {}", humanize_age(age)))
-                                .on_hover_text("Reopen the last scan of this path instantly, without walking the filesystem.")
-                                .clicked()
-                            {
-                                self.load_cached();
-                            }
+                    // Offer an instant load if a cache exists for this folder
+                    // (age precomputed in sync_city — no per-frame stat).
+                    if let Some(age) = self.cache_mtime {
+                        if ui
+                            .button(format!("⟳ Load cached · {}", humanize_age(age)))
+                            .on_hover_text("Reopen the last scan of this path instantly, without walking the filesystem.")
+                            .clicked()
+                        {
+                            self.load_cached();
                         }
                     }
                 });
@@ -1618,7 +1660,7 @@ impl eframe::App for SectorApp {
                         });
                     }
                     Some(st) => {
-                        let t = tree.lock().expect("tree");
+                        let t = tree.lock().unwrap_or_else(|e| e.into_inner());
                         ui.horizontal_wrapped(|ui| {
                             if self.root != Tree::ROOT && ui.button("⬆ Up").clicked() {
                                 self.root = t.node(self.root).parent;
@@ -1686,7 +1728,7 @@ impl eframe::App for SectorApp {
                 && ctx.memory(|m| m.focused()).is_none()
                 && ctx.input(|i| i.key_pressed(egui::Key::Backspace))
             {
-                let t = tree.lock().expect("tree");
+                let t = tree.lock().unwrap_or_else(|e| e.into_inner());
                 self.root = t.node(self.root).parent;
             }
 
@@ -1717,7 +1759,7 @@ impl eframe::App for SectorApp {
                     || self.last_root != self.root
                     || self.last_layout.elapsed() >= REPLAY_STEP;
                 if restep {
-                    let t = tree.lock().expect("tree");
+                    let t = tree.lock().unwrap_or_else(|e| e.into_inner());
                     let k = (((reveal as f64) * t.len() as f64) as usize).max(1);
                     let (sizes, counts) = t.partial_metrics(k);
                     let tiles = layout_partial(&t, self.root, plane, &self.opts, k, &sizes);
@@ -1740,7 +1782,7 @@ impl eframe::App for SectorApp {
                     || self.crystallize
                     || (scanning && self.last_layout.elapsed() >= RELAYOUT_THROTTLE);
                 if need {
-                    let t = tree.lock().expect("tree");
+                    let t = tree.lock().unwrap_or_else(|e| e.into_inner());
                     self.tiles = layout(&t, self.root, plane, &self.opts);
                     self.scape =
                         build_scape(&t, &self.tiles, self.dominant.as_deref(), area, rev, None);
@@ -1795,7 +1837,7 @@ impl eframe::App for SectorApp {
             if let (Some(i), Some(p)) = (hovered, hover_pos) {
                 let node_id = self.scape.blocks[i].node;
                 let (path, size, kind_str, drillable) = {
-                    let t = tree.lock().expect("tree");
+                    let t = tree.lock().unwrap_or_else(|e| e.into_inner());
                     let node = t.node(node_id);
                     let is_dir = node.kind == NodeKind::Dir;
                     let n_children = t.children(node_id).len();
@@ -1827,7 +1869,7 @@ impl eframe::App for SectorApp {
             if response.secondary_clicked() {
                 self.menu_target = response.interact_pointer_pos().and_then(|p| {
                     self.scape.blocks.iter().rev().find(|b| point_in_block(p, b)).map(|b| {
-                        let t = tree.lock().expect("tree");
+                        let t = tree.lock().unwrap_or_else(|e| e.into_inner());
                         let is_dir = t.node(b.node).kind == NodeKind::Dir;
                         let mut pb = PathBuf::new();
                         for comp in t.path_components(b.node) {
@@ -1865,7 +1907,7 @@ impl eframe::App for SectorApp {
                 if self.root == Tree::ROOT {
                     self.city_root.clone()
                 } else {
-                    let t = tree.lock().expect("tree");
+                    let t = tree.lock().unwrap_or_else(|e| e.into_inner());
                     Some(PathBuf::from(joined_path(&t.path_components(self.root))))
                 }
             } else {
@@ -1888,7 +1930,7 @@ impl eframe::App for SectorApp {
         if let Some((arc, cp, cs)) = self.pending_save.take() {
             std::thread::spawn(move || {
                 let result = {
-                    let g = arc.lock().expect("tree");
+                    let g = arc.lock().unwrap_or_else(|e| e.into_inner());
                     g.to_cache_bytes(cs)
                 };
                 match result {
