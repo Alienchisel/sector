@@ -1610,6 +1610,9 @@ impl SectorApp {
                 .min_size(150.0)
                 .show(ui, |ui| {
                     ui.add_space(4.0);
+                    // Reserve space for the scrollbar (don't float it over the
+                    // rows) so the full-width row text can't run under it.
+                    ui.spacing_mut().scroll.floating = false;
                     egui::ScrollArea::vertical()
                         .auto_shrink([false, false])
                         .show(ui, |ui| {
