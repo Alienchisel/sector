@@ -31,6 +31,13 @@ use sector_scan::{
     ScanOptions, ScanStats, UsnMark,
 };
 
+/// Which Files-view pane the keyboard drives (focus-follows-click).
+#[derive(Clone, Copy, PartialEq)]
+enum Pane {
+    Tree,
+    List,
+}
+
 /// Which view the content area shows.
 #[derive(Clone, Copy, PartialEq)]
 enum View {
@@ -409,6 +416,11 @@ struct SectorApp {
 
     // ---- Folder-tree sidebar (E1b.2, Files view only — D19) ----
     sb_visible: bool,
+    /// Which pane the keyboard drives (focus follows your last click).
+    focus_pane: Pane,
+    /// Request to scroll the tree so the current node is visible (after a
+    /// keyboard move in the tree).
+    tree_scroll: bool,
     /// Drive roots (C:\, Y:\, …), enumerated once (empty = not yet computed).
     sb_roots: Vec<PathBuf>,
     /// Which tree nodes are expanded.
@@ -489,6 +501,8 @@ impl Default for SectorApp {
             addr_edit_focus: false,
             props_visible: false,
             sb_visible: true,
+            focus_pane: Pane::List,
+            tree_scroll: false,
             sb_roots: Vec::new(),
             sb_expanded: HashSet::new(),
             sb_cache: HashMap::new(),
@@ -1235,14 +1249,36 @@ impl SectorApp {
 
     // ---- Folder-tree sidebar (E1b.2) ----
 
-    /// Expand every ancestor of `current_dir` so the tree reveals where you are.
+    /// Expand every ANCESTOR of `current_dir` so the tree reveals where you are,
+    /// leaving the current folder itself highlighted-but-not-expanded (a click
+    /// expands it explicitly; keyboard arrowing just highlights).
     fn sb_reveal(&mut self) {
         let mut cur = self.current_dir.clone();
-        loop {
-            self.sb_expanded.insert(cur.clone());
-            match cur.parent() {
-                Some(par) => cur = par.to_path_buf(),
-                None => break,
+        while let Some(parent) = cur.parent().map(|p| p.to_path_buf()) {
+            self.sb_expanded.insert(parent.clone());
+            cur = parent;
+        }
+    }
+
+    /// The currently-visible tree nodes, in display order (roots + expanded
+    /// subtrees, matching `sb_node`'s render order incl. the 400-child cap).
+    fn sb_visible_nodes(&mut self) -> Vec<PathBuf> {
+        if self.sb_roots.is_empty() {
+            self.sb_roots = enumerate_drives();
+            self.sb_reveal();
+        }
+        let mut out = Vec::new();
+        for root in self.sb_roots.clone() {
+            self.sb_collect_visible(&root, &mut out);
+        }
+        out
+    }
+
+    fn sb_collect_visible(&mut self, path: &Path, out: &mut Vec<PathBuf>) {
+        out.push(path.to_path_buf());
+        if self.sb_expanded.contains(path) {
+            for child in self.sb_children(path).into_iter().take(400) {
+                self.sb_collect_visible(&child, out);
             }
         }
     }
@@ -1293,6 +1329,7 @@ impl SectorApp {
 
         let mut toggle = false;
         let mut navigate = false;
+        let scroll_here = self.tree_scroll && is_current && self.focus_pane == Pane::Tree;
         ui.horizontal(|ui| {
             ui.add_space(depth as f32 * 12.0);
             // Painted disclosure triangle (a font glyph like ▸ renders as a
@@ -1316,8 +1353,12 @@ impl SectorApp {
             if resp.clicked() {
                 toggle = true;
             }
-            if ui.selectable_label(is_current, format!("🗀 {name}")).clicked() {
+            let label = ui.selectable_label(is_current, format!("🗀 {name}"));
+            if label.clicked() {
                 navigate = true;
+            }
+            if scroll_here {
+                label.scroll_to_me(Some(egui::Align::Center));
             }
         });
 
@@ -1327,10 +1368,12 @@ impl SectorApp {
             } else {
                 self.sb_expanded.insert(path.clone());
             }
+            self.focus_pane = Pane::Tree;
         }
         if navigate {
             self.navigate_to(path.clone());
             self.sb_expanded.insert(path.clone()); // reveal children on select
+            self.focus_pane = Pane::Tree;
         }
 
         if self.sb_expanded.contains(&path) {
@@ -1521,6 +1564,7 @@ impl SectorApp {
                             self.sidebar_tree(ui);
                         });
                 });
+            self.tree_scroll = false; // one-shot: consumed by this render
         }
 
         // Status footer: folder totals (cached) + selection details.
@@ -1833,6 +1877,7 @@ impl SectorApp {
                 } else {
                     self.select_only(i);
                 }
+                self.focus_pane = Pane::List; // keyboard now drives the list
             }
             // A right-click on an unselected row selects just it (keeps a
             // multi-selection when right-clicking within it).
@@ -1962,47 +2007,115 @@ impl SectorApp {
                 }
             }
 
-            // Move the lead with the keyboard (and scroll it into view). Holding
-            // Shift extends the selection from the anchor; otherwise select one.
-            let n = self.entries.len();
-            if n > 0 {
-                const PAGE: usize = 12;
-                let cur = self.lead;
-                let mut moved = cur;
-                ui.input(|i| {
-                    use egui::Key;
-                    if i.key_pressed(Key::ArrowDown) {
-                        moved = Some(cur.map_or(0, |c| (c + 1).min(n - 1)));
-                    }
-                    if i.key_pressed(Key::ArrowUp) {
-                        moved = Some(cur.map_or(0, |c| c.saturating_sub(1)));
-                    }
-                    if i.key_pressed(Key::PageDown) {
-                        moved = Some(cur.map_or(0, |c| (c + PAGE).min(n - 1)));
-                    }
-                    if i.key_pressed(Key::PageUp) {
-                        moved = Some(cur.map_or(0, |c| c.saturating_sub(PAGE)));
-                    }
-                    if i.key_pressed(Key::Home) {
-                        moved = Some(0);
-                    }
-                    if i.key_pressed(Key::End) {
-                        moved = Some(n - 1);
-                    }
-                });
-                if let Some(m) = moved {
-                    if moved != cur {
-                        if ui.input(|i| i.modifiers.shift) {
-                            self.select_range_to(m);
-                        } else {
-                            self.select_only(m);
+            // Arrows drive whichever pane has focus. The tree only when it's shown.
+            if self.focus_pane == Pane::Tree && self.sb_visible {
+                self.tree_keys(ui);
+            } else {
+                // Move the lead in the list (Shift extends the range from the
+                // anchor), scrolling it into view.
+                let n = self.entries.len();
+                if n > 0 {
+                    const PAGE: usize = 12;
+                    let cur = self.lead;
+                    let mut moved = cur;
+                    ui.input(|i| {
+                        use egui::Key;
+                        if i.key_pressed(Key::ArrowDown) {
+                            moved = Some(cur.map_or(0, |c| (c + 1).min(n - 1)));
                         }
-                        self.scroll_target = Some(m);
-                        ui.ctx().request_repaint();
+                        if i.key_pressed(Key::ArrowUp) {
+                            moved = Some(cur.map_or(0, |c| c.saturating_sub(1)));
+                        }
+                        if i.key_pressed(Key::PageDown) {
+                            moved = Some(cur.map_or(0, |c| (c + PAGE).min(n - 1)));
+                        }
+                        if i.key_pressed(Key::PageUp) {
+                            moved = Some(cur.map_or(0, |c| c.saturating_sub(PAGE)));
+                        }
+                        if i.key_pressed(Key::Home) {
+                            moved = Some(0);
+                        }
+                        if i.key_pressed(Key::End) {
+                            moved = Some(n - 1);
+                        }
+                    });
+                    if let Some(m) = moved {
+                        if moved != cur {
+                            if ui.input(|i| i.modifiers.shift) {
+                                self.select_range_to(m);
+                            } else {
+                                self.select_only(m);
+                            }
+                            self.scroll_target = Some(m);
+                            ui.ctx().request_repaint();
+                        }
                     }
                 }
             }
         }
+    }
+
+    /// Keyboard navigation for the folder tree (when it has focus): ↑/↓ move &
+    /// navigate, → expand/first-child, ← collapse/parent, Home/End to the ends.
+    fn tree_keys(&mut self, ui: &egui::Ui) {
+        use egui::Key;
+        let (down, up, right, left, home, end) = ui.input(|i| {
+            (
+                i.key_pressed(Key::ArrowDown),
+                i.key_pressed(Key::ArrowUp),
+                i.key_pressed(Key::ArrowRight),
+                i.key_pressed(Key::ArrowLeft),
+                i.key_pressed(Key::Home),
+                i.key_pressed(Key::End),
+            )
+        });
+        if !(down || up || right || left || home || end) {
+            return;
+        }
+        let visible = self.sb_visible_nodes();
+        if visible.is_empty() {
+            return;
+        }
+        let cur = visible.iter().position(|p| p == &self.current_dir);
+        let go = |app: &mut Self, path: PathBuf| {
+            app.navigate_to(path);
+            app.tree_scroll = true;
+        };
+        if down {
+            let ni = cur.map_or(0, |i| (i + 1).min(visible.len() - 1));
+            go(self, visible[ni].clone());
+        } else if up {
+            if let Some(i) = cur {
+                if i > 0 {
+                    go(self, visible[i - 1].clone());
+                }
+            }
+        } else if home {
+            go(self, visible[0].clone());
+        } else if end {
+            go(self, visible[visible.len() - 1].clone());
+        } else if right {
+            // Expand a collapsed folder; if already expanded, step into its first child.
+            let cur_dir = self.current_dir.clone();
+            let mut kids = self.sb_children(&cur_dir);
+            if !kids.is_empty() {
+                if !self.sb_expanded.contains(&cur_dir) {
+                    self.sb_expanded.insert(cur_dir);
+                } else {
+                    go(self, kids.remove(0));
+                }
+            }
+        } else if left {
+            // Collapse an expanded folder; otherwise step out to the parent.
+            let cur_dir = self.current_dir.clone();
+            if self.sb_expanded.contains(&cur_dir) {
+                self.sb_expanded.remove(&cur_dir);
+            } else if let Some(parent) = cur_dir.parent().map(|p| p.to_path_buf()) {
+                go(self, parent);
+            }
+        }
+        self.focus_pane = Pane::Tree;
+        ui.ctx().request_repaint();
     }
 
     /// Ancestors of `root`, from the tree root down to `root` (for the breadcrumb).
