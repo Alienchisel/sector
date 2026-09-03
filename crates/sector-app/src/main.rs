@@ -773,15 +773,34 @@ impl SectorApp {
     }
 
     /// Select the inclusive range `anchor..=i` (Shift+click / Shift+arrow),
-    /// leaving `anchor` fixed and moving `lead` to `i`.
+    /// keeping `anchor` fixed and moving `lead` to `i`. If there's no anchor yet
+    /// (extending from an empty state), establish one at `i` so the next extend
+    /// grows the range instead of resetting it.
     fn select_range_to(&mut self, i: usize) {
         let a = self.anchor.unwrap_or(i);
+        self.anchor = Some(a);
         let (lo, hi) = (a.min(i), a.max(i));
         self.sel.clear();
         for e in self.entries.iter().skip(lo).take(hi - lo + 1) {
             self.sel.insert(e.name.clone());
         }
         self.lead = Some(i);
+    }
+
+    /// The item single-item ops (Open / Rename / Properties) should target: the
+    /// lead if it's actually selected, else the sole selected item, else none.
+    /// (Guards against Ctrl+click deselecting the lead but ops still hitting it.)
+    fn op_target(&self) -> Option<usize> {
+        if let Some(i) = self.lead {
+            if self.entries.get(i).is_some_and(|e| self.sel.contains(&e.name)) {
+                return Some(i);
+            }
+        }
+        if self.sel.len() == 1 {
+            let name = self.sel.iter().next()?;
+            return self.entries.iter().position(|e| &e.name == name);
+        }
+        None
     }
 
     fn lead_entry(&self) -> Option<&Entry> {
@@ -869,7 +888,8 @@ impl SectorApp {
     /// the text filter, preserving the selection by name. Cheap re-clone; call it
     /// whenever the filter or the hidden toggle changes.
     fn apply_filter(&mut self) {
-        let lead_name = self.lead_entry().map(|e| e.name.clone());
+        let name_of = |i: Option<usize>| i.and_then(|i| self.entries.get(i)).map(|e| e.name.clone());
+        let (lead_name, anchor_name) = (name_of(self.lead), name_of(self.anchor));
         let show_hidden = self.show_hidden;
         let f = self.filter.trim().to_lowercase();
         self.entries = self
@@ -881,12 +901,15 @@ impl SectorApp {
             })
             .cloned()
             .collect();
-        // Keep only selected names that are still visible; remap lead/anchor.
+        // Keep only selected names that are still visible; remap lead & anchor by
+        // their OWN names (don't collapse the range anchor into the lead).
         let visible: HashSet<String> = self.entries.iter().map(|e| e.name.clone()).collect();
         self.sel.retain(|n| visible.contains(n));
-        self.lead = lead_name.and_then(|n| self.entries.iter().position(|e| e.name == n));
-        self.anchor = self.lead;
-        self.scroll_target = self.lead;
+        let pos = |n: Option<String>| n.and_then(|n| self.entries.iter().position(|e| e.name == n));
+        self.lead = pos(lead_name);
+        self.anchor = pos(anchor_name);
+        // NB: scrolling to the selection is done by the sort handler, not here —
+        // a filter keystroke shouldn't yank the viewport.
         self.refresh_status_summary();
     }
 
@@ -1058,7 +1081,7 @@ impl SectorApp {
 
     /// Field list for the Properties panel (the current selection), or `None`.
     fn selected_properties(&self) -> Option<Vec<(&'static str, String)>> {
-        let e = self.lead_entry()?;
+        let e = self.entries.get(self.op_target()?)?;
         let mut f: Vec<(&'static str, String)> = Vec::new();
         f.push(("Name", e.name.clone()));
         f.push(("Location", self.current_dir.to_string_lossy().into_owned()));
@@ -1757,6 +1780,7 @@ impl SectorApp {
                 self.sort_entries(&mut es);
                 self.all_entries = es;
                 self.apply_filter();
+                self.scroll_target = self.lead; // keep the selection visible
             }
             if let Some(t) = nav_target {
                 self.navigate_to(t);
@@ -1805,9 +1829,11 @@ impl SectorApp {
             if ui.input(|i| i.key_pressed(egui::Key::Backspace)) {
                 self.go_up();
             }
-            // F2 renames the lead item; Ctrl+Shift+N makes a new folder.
+            // F2 renames the target item; Ctrl+Shift+N makes a new folder.
             if ui.input(|i| i.key_pressed(egui::Key::F2)) {
-                if let Some(name) = self.lead_entry().map(|e| e.name.clone()) {
+                if let Some(name) =
+                    self.op_target().and_then(|i| self.entries.get(i)).map(|e| e.name.clone())
+                {
                     self.open_rename(name);
                 }
             }
@@ -1833,13 +1859,15 @@ impl SectorApp {
             }
             if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                 if ui.input(|i| i.modifiers.alt) {
-                    // Alt+Enter: show properties for the lead item.
-                    if self.lead.is_some() {
+                    // Alt+Enter: show properties for the target item.
+                    if self.op_target().is_some() {
                         self.props_visible = true;
                     }
                 } else {
-                    let action =
-                        self.lead_entry().map(|e| (self.current_dir.join(&e.name), e.is_dir));
+                    let action = self
+                        .op_target()
+                        .and_then(|i| self.entries.get(i))
+                        .map(|e| (self.current_dir.join(&e.name), e.is_dir));
                     if let Some((full, is_dir)) = action {
                         if is_dir {
                             self.navigate_to(full);
