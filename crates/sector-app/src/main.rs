@@ -3323,13 +3323,33 @@ impl eframe::App for SectorApp {
                 ui.set_width(340.0);
                 ui.strong(title);
                 ui.add_space(6.0);
+                let edit_id = egui::Id::new("sector_name_prompt_edit");
                 let r = ui.add(
                     egui::TextEdit::singleline(&mut prompt.buf)
+                        .id(edit_id)
                         .desired_width(f32::INFINITY)
                         .hint_text("Name"),
                 );
                 if prompt.focus {
                     r.request_focus();
+                    // Preselect: for a rename, the stem (up to the last dot) so
+                    // typing replaces the name but keeps the extension — like
+                    // Explorer; for a new folder, the whole name.
+                    let end = match &prompt.kind {
+                        PromptKind::Rename { .. } => match prompt.buf.rfind('.') {
+                            Some(dot) if dot > 0 => prompt.buf[..dot].chars().count(),
+                            _ => prompt.buf.chars().count(),
+                        },
+                        PromptKind::NewFolder => prompt.buf.chars().count(),
+                    };
+                    if let Some(mut state) = egui::TextEdit::load_state(ui.ctx(), edit_id) {
+                        let range = egui::text::CCursorRange::two(
+                            egui::text::CCursor::new(0),
+                            egui::text::CCursor::new(end),
+                        );
+                        state.cursor.set_char_range(Some(range));
+                        egui::TextEdit::store_state(ui.ctx(), edit_id, state);
+                    }
                     prompt.focus = false;
                 }
                 if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
