@@ -388,6 +388,10 @@ struct SectorApp {
     clipboard: Option<Clipboard>,
     /// A paste running in the background, if any.
     paste_job: Option<PasteJob>,
+    /// Paths awaiting delete confirmation (the modal is up), if any.
+    confirm_delete: Option<Vec<PathBuf>>,
+    /// A background delete-to-Recycle-Bin in progress: `Ok(count)` or `Err(msg)`.
+    delete_job: Option<Receiver<Result<usize, String>>>,
     /// Transient error from the last edit/paste, shown in the footer.
     op_error: Option<String>,
     /// True while the address bar has (or just lost) focus — suppresses the file
@@ -465,6 +469,8 @@ impl Default for SectorApp {
             prompt: None,
             clipboard: None,
             paste_job: None,
+            confirm_delete: None,
+            delete_job: None,
             op_error: None,
             cache_mtime: None,
             addr_active: false,
@@ -1137,8 +1143,8 @@ impl SectorApp {
 
     /// Start pasting the clipboard into the current folder (background thread).
     fn start_paste(&mut self) {
-        if self.paste_job.is_some() {
-            return; // one paste at a time
+        if self.paste_job.is_some() || self.delete_job.is_some() {
+            return; // one background file operation at a time
         }
         let Some(clip) = &self.clipboard else { return };
         let dest_dir = self.current_dir.clone();
@@ -1180,6 +1186,35 @@ impl SectorApp {
         });
         self.op_error = None;
         self.paste_job = Some(PasteJob { rx, cancel, cut, desc });
+    }
+
+    /// Ask to delete the current selection (opens the confirmation modal).
+    fn request_delete(&mut self) {
+        // One background file operation at a time.
+        if self.delete_job.is_some() || self.paste_job.is_some() {
+            return;
+        }
+        let paths = self.selected_paths();
+        if !paths.is_empty() {
+            self.confirm_delete = Some(paths);
+        }
+    }
+
+    /// Delete `paths` to the Recycle Bin on a background thread.
+    fn start_delete(&mut self, paths: Vec<PathBuf>) {
+        if self.delete_job.is_some() || paths.is_empty() {
+            return;
+        }
+        let (tx, rx) = channel();
+        std::thread::spawn(move || {
+            let n = paths.len();
+            let result = trash::delete_all(&paths)
+                .map(|()| n)
+                .map_err(|e| format!("Couldn't recycle: {e}"));
+            let _ = tx.send(result);
+        });
+        self.op_error = None;
+        self.delete_job = Some(rx);
     }
 
     // ---- Folder-tree sidebar (E1b.2) ----
@@ -1488,8 +1523,11 @@ impl SectorApp {
             let mut clear_err = false;
             egui::Panel::bottom("files_status").show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    // A running paste takes over the footer with a spinner + Cancel.
-                    if let Some(job) = &self.paste_job {
+                    // A running paste/delete takes over the footer with a spinner.
+                    if self.delete_job.is_some() {
+                        ui.spinner();
+                        ui.label("Moving to Recycle Bin…");
+                    } else if let Some(job) = &self.paste_job {
                         ui.spinner();
                         ui.label(&job.desc);
                         if ui.button("Cancel").clicked() {
@@ -1568,6 +1606,7 @@ impl SectorApp {
             let mut copy_req = false;
             let mut cut_req = false;
             let mut paste_req = false;
+            let mut delete_req = false;
             let can_paste = self.clipboard.is_some() && self.paste_job.is_none();
 
             let arrow = |k: SortKey| {
@@ -1726,6 +1765,10 @@ impl SectorApp {
                                 paste_req = true;
                                 ui.close();
                             }
+                            if ui.button("Delete").clicked() {
+                                delete_req = true;
+                                ui.close();
+                            }
                             ui.separator();
                             if ui.button("Rename…").clicked() {
                                 rename_req = Some(e.name.clone());
@@ -1805,12 +1848,16 @@ impl SectorApp {
             if paste_req {
                 self.start_paste();
             }
+            if delete_req {
+                self.request_delete();
+            }
         });
 
         // Keyboard parity with Explorer: F5 refreshes; arrows/Home/End/PageUp/Down
         // move the selection; Enter opens it; Backspace goes up — but never while
         // the address bar owns the keyboard (F5 there would wipe in-progress text).
         let typing = self.prompt.is_some()
+            || self.confirm_delete.is_some()
             || self.addr_active
             || ui.ctx().memory(|m| m.focused()).is_some();
         if !typing {
@@ -1856,6 +1903,10 @@ impl SectorApp {
             }
             if ui.input(|i| i.modifiers.ctrl && !i.modifiers.shift && i.key_pressed(egui::Key::V)) {
                 self.start_paste();
+            }
+            // Delete → Recycle Bin (with a confirmation).
+            if ui.input(|i| i.key_pressed(egui::Key::Delete)) {
+                self.request_delete();
             }
             if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                 if ui.input(|i| i.modifiers.alt) {
@@ -2496,6 +2547,28 @@ impl eframe::App for SectorApp {
             }
         }
 
+        // Poll a background delete (E5) for completion.
+        let mut delete_done: Option<Result<usize, String>> = None;
+        if let Some(rx) = &self.delete_job {
+            match rx.try_recv() {
+                Ok(r) => delete_done = Some(r),
+                Err(std::sync::mpsc::TryRecvError::Empty) => ctx.request_repaint(),
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    delete_done = Some(Err("Delete worker stopped unexpectedly.".into()));
+                }
+            }
+        }
+        if let Some(result) = delete_done {
+            self.delete_job = None;
+            self.clear_selection();
+            self.entries_dirty = true;
+            self.sb_cache.clear();
+            match result {
+                Ok(_) => self.op_error = None,
+                Err(e) => self.op_error = Some(e),
+            }
+        }
+
         // ---- Shared nav: mode toggle + back/forward/up + address bar -------
         egui::Panel::top("mode").show(ui, |ui| {
             ui.horizontal(|ui| {
@@ -2881,6 +2954,44 @@ impl eframe::App for SectorApp {
             self.city_synced_dir = Some(self.current_dir.clone());
         }
         } // end City view
+
+        // ---- Delete confirmation (E5) --------------------------------------
+        if let Some(paths) = self.confirm_delete.take() {
+            let mut confirm = false;
+            let mut cancel = false;
+            let modal = egui::Modal::new(egui::Id::new("sector_delete_confirm")).show(&ctx, |ui| {
+                ui.set_width(360.0);
+                ui.strong("Move to Recycle Bin?");
+                ui.add_space(6.0);
+                if paths.len() == 1 {
+                    let name = paths[0]
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    ui.label(format!("“{name}” will be moved to the Recycle Bin."));
+                } else {
+                    ui.label(format!("{} items will be moved to the Recycle Bin.", paths.len()));
+                }
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Move to Recycle Bin").clicked() {
+                        confirm = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                });
+                // Enter confirms, Esc/backdrop cancels.
+                if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    confirm = true;
+                }
+            });
+            if confirm {
+                self.start_delete(paths);
+            } else if !(cancel || modal.should_close()) {
+                self.confirm_delete = Some(paths); // keep the dialog open
+            }
+        }
 
         // ---- New folder / Rename dialog (E4) --------------------------------
         if let Some(mut prompt) = self.prompt.take() {

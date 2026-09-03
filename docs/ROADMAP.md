@@ -247,12 +247,14 @@ safest-first — destructive ops must be bulletproof (see D16, D1).
   (empty / invalid-char / reserved / duplicate checks; OS errors shown in-dialog,
   which stays open). Refreshes the listing + tree and re-selects the affected
   item afterwards.
-- **E5 — Destructive ops (careful)**: **cut/copy/paste ✅** — background copy/move
+- **E5 — Destructive ops (careful)  ✅**: **cut/copy/paste** — background copy/move
   (Ctrl+C/X/V + context menu), never overwrites (auto-renames to "- Copy"), a cut
   source is deleted only after its copy fully succeeds, cross-volume move falls
   back to copy-then-delete, folder-into-itself rejected, partial results cleaned
-  up on cancel/failure. **Delete → Recycle Bin ☐** still to come (needs a shell
-  API for the Recycle Bin).
+  up on cancel/failure; links/junctions skipped. **Multi-select** (click/Ctrl/
+  Shift, Ctrl+A) drives batch copy/cut/delete. **Delete → Recycle Bin** (Del /
+  context menu) via the `trash` crate (IFileOperation), with a confirmation and a
+  background worker. *Shift+Delete permanent-delete intentionally not offered.*
 - **E6 — Incremental freshness (D17)  ☐**: **local NTFS** — store last USN, read
   the USN Change Journal on reload and apply deltas to the cached tree (near-
   instant "update"); build alongside the local MFT fast-path (Step 1d). **NAS** —

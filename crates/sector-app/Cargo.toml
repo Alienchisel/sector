@@ -27,3 +27,4 @@ serde = { version = "1", features = ["derive"] }
 sector-core = { path = "../sector-core" }
 sector-scan = { path = "../sector-scan" }
 dirs = "5"
+trash = "5.2.7"
