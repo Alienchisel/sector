@@ -390,8 +390,8 @@ struct SectorApp {
     paste_job: Option<PasteJob>,
     /// Paths awaiting delete confirmation (the modal is up), if any.
     confirm_delete: Option<Vec<PathBuf>>,
-    /// A background delete-to-Recycle-Bin in progress: `Ok(count)` or `Err(msg)`.
-    delete_job: Option<Receiver<Result<usize, String>>>,
+    /// A background delete-to-Recycle-Bin in progress: `Ok(())` or `Err(msg)`.
+    delete_job: Option<Receiver<Result<(), String>>>,
     /// Transient error from the last edit/paste, shown in the footer.
     op_error: Option<String>,
     /// True while the address bar has (or just lost) focus — suppresses the file
@@ -1202,15 +1202,12 @@ impl SectorApp {
 
     /// Delete `paths` to the Recycle Bin on a background thread.
     fn start_delete(&mut self, paths: Vec<PathBuf>) {
-        if self.delete_job.is_some() || paths.is_empty() {
-            return;
+        if self.delete_job.is_some() || self.paste_job.is_some() || paths.is_empty() {
+            return; // one background file operation at a time
         }
         let (tx, rx) = channel();
         std::thread::spawn(move || {
-            let n = paths.len();
-            let result = trash::delete_all(&paths)
-                .map(|()| n)
-                .map_err(|e| format!("Couldn't recycle: {e}"));
+            let result = trash::delete_all(&paths).map_err(|e| format!("Couldn't delete: {e}"));
             let _ = tx.send(result);
         });
         self.op_error = None;
@@ -2415,6 +2412,39 @@ fn enumerate_drives() -> Vec<PathBuf> {
     vec![PathBuf::from("/")]
 }
 
+/// Is `path` on a network drive? Network locations have NO Recycle Bin, so a
+/// "delete" there is permanent — the confirmation must say so. Uses
+/// `GetDriveTypeW` on the volume root (mapped drive "Y:\" or UNC "\\srv\share\").
+#[cfg(target_os = "windows")]
+fn is_network_path(path: &Path) -> bool {
+    use std::os::windows::ffi::OsStrExt;
+    extern "system" {
+        fn GetDriveTypeW(root: *const u16) -> u32;
+    }
+    const DRIVE_REMOTE: u32 = 4;
+    let mut root = std::ffi::OsString::new();
+    for comp in path.components() {
+        use std::path::Component::*;
+        match comp {
+            Prefix(p) => root.push(p.as_os_str()),
+            RootDir => {
+                root.push("\\");
+                break;
+            }
+            _ => break,
+        }
+    }
+    if root.is_empty() {
+        return false;
+    }
+    let wide: Vec<u16> = root.encode_wide().chain(std::iter::once(0)).collect();
+    unsafe { GetDriveTypeW(wide.as_ptr()) == DRIVE_REMOTE }
+}
+#[cfg(not(target_os = "windows"))]
+fn is_network_path(_path: &Path) -> bool {
+    false
+}
+
 /// Hand-drawn tooltip near the cursor. egui's widget tooltip anchors to the
 /// widget rect — our widget is the whole panel, so it would land in the corner;
 /// we draw our own at the pointer instead.
@@ -2548,7 +2578,7 @@ impl eframe::App for SectorApp {
         }
 
         // Poll a background delete (E5) for completion.
-        let mut delete_done: Option<Result<usize, String>> = None;
+        let mut delete_done: Option<Result<(), String>> = None;
         if let Some(rx) = &self.delete_job {
             match rx.try_recv() {
                 Ok(r) => delete_done = Some(r),
@@ -2560,12 +2590,15 @@ impl eframe::App for SectorApp {
         }
         if let Some(result) = delete_done {
             self.delete_job = None;
-            self.clear_selection();
+            // Either way, the folder may have changed on disk — refresh the view.
             self.entries_dirty = true;
             self.sb_cache.clear();
             match result {
-                Ok(_) => self.op_error = None,
-                Err(e) => self.op_error = Some(e),
+                Ok(()) => {
+                    self.clear_selection(); // items are gone
+                    self.op_error = None;
+                }
+                Err(e) => self.op_error = Some(e), // keep selection to retry
             }
         }
 
@@ -2959,30 +2992,46 @@ impl eframe::App for SectorApp {
         if let Some(paths) = self.confirm_delete.take() {
             let mut confirm = false;
             let mut cancel = false;
+            // Network drives have no Recycle Bin — such a delete is PERMANENT.
+            let permanent = paths.iter().any(|p| is_network_path(p));
+            let what = if paths.len() == 1 {
+                paths[0]
+                    .file_name()
+                    .map(|n| format!("“{}”", n.to_string_lossy()))
+                    .unwrap_or_else(|| "1 item".into())
+            } else {
+                format!("{} items", paths.len())
+            };
             let modal = egui::Modal::new(egui::Id::new("sector_delete_confirm")).show(&ctx, |ui| {
-                ui.set_width(360.0);
-                ui.strong("Move to Recycle Bin?");
-                ui.add_space(6.0);
-                if paths.len() == 1 {
-                    let name = paths[0]
-                        .file_name()
-                        .map(|n| n.to_string_lossy().into_owned())
-                        .unwrap_or_default();
-                    ui.label(format!("“{name}” will be moved to the Recycle Bin."));
+                ui.set_width(380.0);
+                if permanent {
+                    ui.strong("Permanently delete?");
+                    ui.add_space(6.0);
+                    ui.colored_label(
+                        egui::Color32::from_rgb(224, 108, 108),
+                        format!(
+                            "⚠ {what} on a network drive will be PERMANENTLY deleted — \
+                             network drives have no Recycle Bin, so this can't be undone."
+                        ),
+                    );
                 } else {
-                    ui.label(format!("{} items will be moved to the Recycle Bin.", paths.len()));
+                    ui.strong("Move to Recycle Bin?");
+                    ui.add_space(6.0);
+                    ui.label(format!("{what} will be moved to the Recycle Bin."));
                 }
                 ui.add_space(10.0);
                 ui.horizontal(|ui| {
-                    if ui.button("Move to Recycle Bin").clicked() {
+                    let label = if permanent { "Delete permanently" } else { "Move to Recycle Bin" };
+                    if ui.button(label).clicked() {
                         confirm = true;
                     }
                     if ui.button("Cancel").clicked() {
                         cancel = true;
                     }
                 });
-                // Enter confirms, Esc/backdrop cancels.
-                if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                // Enter confirms a recoverable recycle; a PERMANENT delete must be
+                // an explicit click (no accidental Enter). Esc/backdrop cancels.
+                if !permanent && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                     confirm = true;
                 }
             });
