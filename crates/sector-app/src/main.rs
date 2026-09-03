@@ -214,6 +214,7 @@ fn main() -> eframe::Result<()> {
                 app.anim_mode = if s.replay_mode { AnimMode::Replay } else { AnimMode::Reveal };
                 app.current_dir = PathBuf::from(&s.current_dir);
                 app.addr_edit = s.current_dir;
+                app.show_hidden = s.show_hidden;
             }
             Ok(Box::new(app))
         }),
@@ -267,7 +268,16 @@ struct SectorApp {
     view: View,
     current_dir: PathBuf,
     addr_edit: String,
+    /// The full listing of `current_dir` (all entries, sorted).
+    all_entries: Vec<Entry>,
+    /// The filtered/visible subset actually shown (hidden toggle + text filter).
+    /// Everything — selection, keyboard, footer — indexes THIS.
     entries: Vec<Entry>,
+    /// Case-insensitive name filter for the current folder (transient; cleared on
+    /// navigation).
+    filter: String,
+    /// Show hidden/system entries (off by default, like Explorer).
+    show_hidden: bool,
     entries_err: Option<String>,
     entries_dirty: bool,
     back_stack: Vec<PathBuf>,
@@ -340,7 +350,10 @@ impl Default for SectorApp {
             view: View::List,
             current_dir: PathBuf::from("C:\\"),
             addr_edit: "C:\\".to_string(),
+            all_entries: Vec::new(),
             entries: Vec::new(),
+            filter: String::new(),
+            show_hidden: false,
             entries_err: None,
             entries_dirty: true,
             back_stack: Vec::new(),
@@ -390,6 +403,8 @@ struct Settings {
     replay_mode: bool,
     /// The folder to reopen at (the shared explorer/City location, E2).
     current_dir: String,
+    #[serde(default)]
+    show_hidden: bool,
 }
 
 impl Default for Settings {
@@ -399,6 +414,7 @@ impl Default for Settings {
             threads: DEFAULT_THREADS,
             replay_mode: false,
             current_dir: "C:\\".to_string(),
+            show_hidden: false,
         }
     }
 }
@@ -581,6 +597,7 @@ impl SectorApp {
         self.current_dir = path;
         self.entries_dirty = true;
         self.selected = None;
+        self.filter.clear();
         self.sync_addr();
         self.sb_reveal();
     }
@@ -590,6 +607,7 @@ impl SectorApp {
             self.fwd_stack.push(std::mem::replace(&mut self.current_dir, p));
             self.entries_dirty = true;
             self.selected = None;
+            self.filter.clear();
             self.sync_addr();
             self.sb_reveal();
         }
@@ -600,6 +618,7 @@ impl SectorApp {
             self.back_stack.push(std::mem::replace(&mut self.current_dir, p));
             self.entries_dirty = true;
             self.selected = None;
+            self.filter.clear();
             self.sync_addr();
             self.sb_reveal();
         }
@@ -659,14 +678,15 @@ impl SectorApp {
         match list_dir(&self.current_dir) {
             Ok(mut es) => {
                 self.sort_entries(&mut es);
-                self.entries = es;
+                self.all_entries = es;
                 self.entries_err = None;
             }
             Err(e) => {
-                self.entries.clear();
+                self.all_entries.clear();
                 self.entries_err = Some(e.to_string());
             }
         }
+        self.apply_filter();
         self.addr_edit = self.current_dir.to_string_lossy().into_owned();
         self.entries_dirty = false;
         // Honor a pending select-by-name (from "up" or F5) — but only in the
@@ -684,6 +704,26 @@ impl SectorApp {
             }
         }
         // Now that the new listing is in place, refresh the footer summary.
+        self.refresh_status_summary();
+    }
+
+    /// Rebuild the visible `entries` from `all_entries` by the hidden toggle and
+    /// the text filter, preserving the selection by name. Cheap re-clone; call it
+    /// whenever the filter or the hidden toggle changes.
+    fn apply_filter(&mut self) {
+        let sel_name = self.selected.and_then(|i| self.entries.get(i)).map(|e| e.name.clone());
+        let show_hidden = self.show_hidden;
+        let f = self.filter.trim().to_lowercase();
+        self.entries = self
+            .all_entries
+            .iter()
+            .filter(|e| {
+                (show_hidden || !e.is_hidden)
+                    && (f.is_empty() || e.name.to_lowercase().contains(&f))
+            })
+            .cloned()
+            .collect();
+        self.selected = sel_name.and_then(|n| self.entries.iter().position(|e| e.name == n));
         self.refresh_status_summary();
     }
 
@@ -706,8 +746,16 @@ impl SectorApp {
         let n = self.entries.len();
         let folders = self.entries.iter().filter(|e| e.is_dir).count();
         let total: u64 = self.entries.iter().map(|e| self.entry_size(e)).sum();
+        // If a filter or the hidden toggle is narrowing the listing, lead with the
+        // shown-of-total count.
+        let hidden_or_filtered = n != self.all_entries.len();
+        let prefix = if hidden_or_filtered {
+            format!("{} of {} shown · ", commas(n as u64), commas(self.all_entries.len() as u64))
+        } else {
+            String::new()
+        };
         self.status_summary = format!(
-            "{} items · {} folders · {} files · {}",
+            "{prefix}{} items · {} folders · {} files · {}",
             commas(n as u64),
             commas(folders as u64),
             commas((n - folders) as u64),
@@ -765,7 +813,7 @@ impl SectorApp {
     /// (case-insensitively) in the current listing.
     fn unique_new_folder_name(&self) -> String {
         let taken =
-            |name: &str| self.entries.iter().any(|e| e.name.eq_ignore_ascii_case(name));
+            |name: &str| self.all_entries.iter().any(|e| e.name.eq_ignore_ascii_case(name));
         if !taken("New folder") {
             return "New folder".to_string();
         }
@@ -791,7 +839,7 @@ impl SectorApp {
         if name == "." || name == ".." {
             return Err("That name is reserved.".into());
         }
-        let clashes = self.entries.iter().any(|e| {
+        let clashes = self.all_entries.iter().any(|e| {
             e.name.eq_ignore_ascii_case(name)
                 && !allow.map(|a| e.name.eq_ignore_ascii_case(a)).unwrap_or(false)
         });
@@ -830,6 +878,7 @@ impl SectorApp {
     fn after_edit(&mut self, select_name: String) {
         self.entries_dirty = true;
         self.sb_cache.clear(); // the folder tree may have changed
+        self.filter.clear(); // so the new/renamed item is visible
         self.select_after_reload = Some((self.current_dir.clone(), select_name));
     }
 
@@ -976,6 +1025,34 @@ impl SectorApp {
         if self.entries_dirty {
             self.reload_entries();
         }
+
+        // Filter toolbar: name filter + hidden-files toggle.
+        egui::Panel::top("files_bar").show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label("🔍");
+                let r = ui.add(
+                    egui::TextEdit::singleline(&mut self.filter)
+                        .desired_width(220.0)
+                        .hint_text("Filter this folder…"),
+                );
+                let mut changed = r.changed();
+                if !self.filter.is_empty() && ui.button("✕").on_hover_text("Clear filter").clicked() {
+                    self.filter.clear();
+                    changed = true;
+                }
+                ui.separator();
+                if ui
+                    .checkbox(&mut self.show_hidden, "Hidden")
+                    .on_hover_text("Show hidden / system files")
+                    .changed()
+                {
+                    changed = true;
+                }
+                if changed {
+                    self.apply_filter();
+                }
+            });
+        });
 
         if self.sb_visible {
             egui::Panel::left("folder_tree")
@@ -1209,16 +1286,12 @@ impl SectorApp {
                     self.sort_key = k;
                     self.sort_asc = true;
                 }
-                // Re-sort IN PLACE (no directory re-read) and keep the same file
-                // selected across the reorder — its index changes, so track it by
-                // name rather than by position.
-                let sel_name =
-                    self.selected.and_then(|i| self.entries.get(i)).map(|e| e.name.clone());
-                let mut es = std::mem::take(&mut self.entries);
+                // Re-sort the full listing IN PLACE (no directory re-read), then
+                // re-apply the filter (which preserves the selection by name).
+                let mut es = std::mem::take(&mut self.all_entries);
                 self.sort_entries(&mut es);
-                self.entries = es;
-                self.selected =
-                    sel_name.and_then(|n| self.entries.iter().position(|e| e.name == n));
+                self.all_entries = es;
+                self.apply_filter();
             }
             if let Some(t) = nav_target {
                 self.navigate_to(t);
@@ -1624,6 +1697,7 @@ impl eframe::App for SectorApp {
             threads: self.threads,
             replay_mode: self.anim_mode == AnimMode::Replay,
             current_dir: self.current_dir.to_string_lossy().into_owned(),
+            show_hidden: self.show_hidden,
         };
         eframe::set_value(storage, "settings", &s);
     }
