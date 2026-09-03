@@ -26,7 +26,10 @@ use sector_core::{
     categorize, human_size, layout, layout_partial, CacheStats, FileCategory, LayoutOptions,
     NodeId, NodeKind, Tile, Tree,
 };
-use sector_scan::{list_dir, scan_into, Entry, Progress, ScanOptions, ScanStats};
+use sector_scan::{
+    freshness as usn_freshness, list_dir, query_mark, scan_into, Entry, Freshness, Progress,
+    ScanOptions, ScanStats, UsnMark,
+};
 
 /// Which view the content area shows.
 #[derive(Clone, Copy, PartialEq)]
@@ -416,6 +419,12 @@ struct SectorApp {
     /// on folder change (in sync_city) so the City top bar doesn't stat it every
     /// frame. `None` = no cache for the current folder.
     cache_mtime: Option<SystemTime>,
+    /// USN watermark captured at the START of the current scan (stored in the
+    /// cache when it completes, for E6 freshness).
+    pending_usn_mark: Option<UsnMark>,
+    /// Freshness of the currently-loaded cache vs the live volume (E6). Only
+    /// meaningful right after a cache-load.
+    cache_freshness: Freshness,
     /// The path the loaded City tree is rooted at (its scan/cache-load target).
     city_root: Option<PathBuf>,
     /// The location the City view currently represents (root, or a drilled-in
@@ -473,6 +482,8 @@ impl Default for SectorApp {
             delete_job: None,
             op_error: None,
             cache_mtime: None,
+            pending_usn_mark: None,
+            cache_freshness: Freshness::Unknown,
             addr_active: false,
             addr_editing: false,
             addr_edit_focus: false,
@@ -584,6 +595,10 @@ impl SectorApp {
         self.menu_target = None;
         self.city_root = Some(self.current_dir.clone());
         self.city_synced_dir = Some(self.current_dir.clone());
+        // Capture the USN watermark BEFORE the scan, so any later change counts
+        // as making the cache stale (E6). None on NAS / non-NTFS.
+        self.pending_usn_mark = query_mark(&self.current_dir);
+        self.cache_freshness = Freshness::Unknown;
         self.scan = ScanState::Running {
             tree,
             progress,
@@ -627,6 +642,10 @@ impl SectorApp {
             return false;
         }
         eprintln!("[sector] load_cached: OK — {} nodes, {} files", tree.len(), cs.files);
+        // E6: is this cached view still current per the USN journal?
+        let mark = UsnMark { journal_id: cs.usn_journal_id, next_usn: cs.usn_next };
+        self.cache_freshness = usn_freshness(&self.current_dir, &mark);
+        eprintln!("[sector] load_cached: freshness {:?}", self.cache_freshness);
         let tree = Arc::new(Mutex::new(tree));
         self.dominant = Some(tree.lock().unwrap_or_else(|e| e.into_inner()).dominant_categories());
         let stats = ScanStats {
@@ -2519,11 +2538,14 @@ impl eframe::App for SectorApp {
                 if let Some(st) = stats {
                     if !st.cancelled {
                         if let Some(cp) = cache_path_for(&root_name) {
+                            let mark = self.pending_usn_mark.unwrap_or(UsnMark::NONE);
                             let cs = CacheStats {
                                 dirs: st.dirs,
                                 files: st.files,
                                 bytes: st.bytes,
                                 saved_unix: now_unix(),
+                                usn_journal_id: mark.journal_id,
+                                usn_next: mark.next_usn,
                             };
                             self.pending_save = Some((Arc::clone(tree), cp, cs));
                         } else {
@@ -2688,6 +2710,20 @@ impl eframe::App for SectorApp {
                         {
                             self.load_cached();
                         }
+                    }
+                    // E6: freshness of the loaded cache vs the live NTFS volume.
+                    match self.cache_freshness {
+                        Freshness::Stale => {
+                            ui.separator();
+                            ui.colored_label(egui::Color32::from_rgb(230, 170, 80), "⚠ changed since scan")
+                                .on_hover_text("The volume's USN journal advanced since this scan — Rescan to refresh.");
+                        }
+                        Freshness::Current => {
+                            ui.separator();
+                            ui.colored_label(egui::Color32::from_rgb(120, 200, 120), "✓ up to date")
+                                .on_hover_text("No changes on this volume since the scan (per the NTFS USN journal).");
+                        }
+                        Freshness::Unknown => {}
                     }
                 });
                 if let ScanState::Running { cancel, stats: None, .. } = &self.scan {

@@ -17,6 +17,8 @@ fn main() {
         files: stats.files,
         bytes: stats.bytes,
         saved_unix: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
+        usn_journal_id: 0,
+        usn_next: 0,
     };
     let out = std::env::temp_dir().join("sector_cache_check.bin");
 

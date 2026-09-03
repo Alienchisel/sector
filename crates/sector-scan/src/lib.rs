@@ -6,7 +6,9 @@
 //! not disk throughput. Windows-only fast paths (MFT/USN) come later.
 
 pub mod browse;
+pub mod usn;
 pub mod walk;
 
 pub use browse::{list_dir, Entry};
+pub use usn::{freshness, query_mark, Freshness, UsnMark};
 pub use walk::{scan, scan_into, Progress, ScanOptions, ScanStats};

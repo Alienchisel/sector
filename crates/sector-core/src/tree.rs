@@ -30,6 +30,10 @@ pub struct CacheStats {
     pub bytes: u64,
     /// When the scan was saved (Unix seconds).
     pub saved_unix: u64,
+    /// NTFS USN journal watermark at scan time (E6 freshness). `0` = none (not a
+    /// local NTFS volume, or the journal was unavailable).
+    pub usn_journal_id: u64,
+    pub usn_next: i64,
 }
 
 /// Cache file framing: a 4-byte magic + little-endian u16 version prefix the
@@ -38,7 +42,7 @@ pub struct CacheStats {
 /// header lets [`Tree::from_cache_bytes`] reject anything it doesn't recognize.
 /// Bump `CACHE_VERSION` whenever the body layout changes.
 const CACHE_MAGIC: [u8; 4] = *b"SECT";
-const CACHE_VERSION: u16 = 1;
+const CACHE_VERSION: u16 = 2; // v2 added the USN watermark to CacheStats
 
 /// On-disk cache format (v1). Struct-of-arrays of only the essential per-node
 /// fields; `children`, `subtree_size`, and `file_count` are rebuilt on load.
@@ -500,7 +504,14 @@ mod tests {
         let _b = t.add_child_propagating(users, "movie.mkv", NodeKind::File, 200);
         let _empty = t.add_child_propagating(Tree::ROOT, "Empty", NodeKind::Dir, 0);
 
-        let stats = CacheStats { dirs: 2, files: 2, bytes: 300, saved_unix: 42 };
+        let stats = CacheStats {
+            dirs: 2,
+            files: 2,
+            bytes: 300,
+            saved_unix: 42,
+            usn_journal_id: 0,
+            usn_next: 0,
+        };
         let bytes = t.to_cache_bytes(stats).unwrap();
         let (r, rs) = Tree::from_cache_bytes(&bytes).unwrap();
 
