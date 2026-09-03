@@ -450,3 +450,29 @@ drive-type-aware strategy, since the network genuinely denies us cheap hooks.
   changes (`ReadDirectoryChangesW` / `notify`) and patch the tree in real time —
   works for local, limited/lossy over SMB, session-only. Nice-to-have, not the
   primary mechanism.
+
+## D18 — One shared location; the City visualizes the current folder (E2)
+
+**Decision.** Files and City are two views of a *single* location, `current_dir`,
+driven by one shared nav strip (mode toggle + back/forward/up + address bar). The
+City always visualizes **the folder you're browsing**, not a separately-typed path.
+
+- **Files → City.** Switching to City *reconciles* to `current_dir`: instant
+  **cache-load** if a scan of that folder exists, otherwise a **scan-prompt**
+  (a deep scan stays deliberate — never auto-fired on a toggle). Caches are keyed
+  per folder, so each visited folder reopens instantly once scanned.
+- **City → Files.** Drilling in the City (clicking a block / breadcrumb) writes
+  the drilled folder back into `current_dir`, so toggling to Files lands there.
+- **No re-scan on internal drill.** `city_synced_dir` tracks what the City is
+  showing; the reconcile fires only when `current_dir` drifts from it (i.e. an
+  *external* navigation), never for in-City drilling.
+
+**Why.** This is what "explorer first, visualizer second" (D16) means in practice:
+the visualization is a *lens on where you are*, not a separate tool with its own
+address. It also removes the confusing dual-path state (Files at `C:\`, City at
+`Y:\`) that the two-independent-views design produced.
+
+**Deferred.** Bidirectional *within-tree* reuse — navigating into a subfolder via
+Files then toggling to City currently re-loads that folder's own cache rather than
+re-rooting the already-loaded parent tree. Correct and instant (per-folder cache),
+just not maximally clever; a find-node-by-path optimization can come later.

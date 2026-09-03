@@ -150,7 +150,8 @@ fn main() -> eframe::Result<()> {
                 app.replay_secs = s.replay_secs.clamp(0.5, 60.0);
                 app.threads = s.threads.clamp(1, 256);
                 app.anim_mode = if s.replay_mode { AnimMode::Replay } else { AnimMode::Reveal };
-                app.path_input = s.path_input;
+                app.current_dir = PathBuf::from(&s.current_dir);
+                app.addr_edit = s.current_dir;
             }
             Ok(Box::new(app))
         }),
@@ -172,7 +173,6 @@ enum ScanState {
 }
 
 struct SectorApp {
-    path_input: String,
     /// Worker threads to use for the next scan (tunable — see DEFAULT_THREADS).
     threads: usize,
     scan: ScanState,
@@ -213,12 +213,16 @@ struct SectorApp {
     sort_key: SortKey,
     sort_asc: bool,
     selected: Option<usize>,
+    /// The path the loaded City tree is rooted at (its scan/cache-load target).
+    city_root: Option<PathBuf>,
+    /// The location the City view currently represents (root, or a drilled-in
+    /// subfolder). When this drifts from `current_dir`, the City re-syncs.
+    city_synced_dir: Option<PathBuf>,
 }
 
 impl Default for SectorApp {
     fn default() -> Self {
         SectorApp {
-            path_input: "C:\\".to_string(),
             threads: DEFAULT_THREADS,
             scan: ScanState::Idle,
             root: Tree::ROOT,
@@ -249,6 +253,8 @@ impl Default for SectorApp {
             sort_key: SortKey::Name,
             sort_asc: true,
             selected: None,
+            city_root: None,
+            city_synced_dir: None,
         }
     }
 }
@@ -275,7 +281,8 @@ struct Settings {
     replay_secs: f32,
     threads: usize,
     replay_mode: bool,
-    path_input: String,
+    /// The folder to reopen at (the shared explorer/City location, E2).
+    current_dir: String,
 }
 
 impl Default for Settings {
@@ -284,7 +291,7 @@ impl Default for Settings {
             replay_secs: REPLAY_SECS,
             threads: DEFAULT_THREADS,
             replay_mode: false,
-            path_input: "C:\\".to_string(),
+            current_dir: "C:\\".to_string(),
         }
     }
 }
@@ -324,7 +331,7 @@ impl SectorApp {
             cancel.store(true, Ordering::Relaxed);
         }
 
-        let path = PathBuf::from(self.path_input.trim());
+        let path = self.current_dir.clone();
         let tree = Arc::new(Mutex::new(Tree::new(path.to_string_lossy().into_owned())));
         let progress = Arc::new(Progress::default());
         let cancel = Arc::new(AtomicBool::new(false));
@@ -344,6 +351,8 @@ impl SectorApp {
         self.crystallize = false;
         self.dominant = None;
         self.menu_target = None;
+        self.city_root = Some(self.current_dir.clone());
+        self.city_synced_dir = Some(self.current_dir.clone());
         self.scan = ScanState::Running {
             tree,
             progress,
@@ -354,9 +363,9 @@ impl SectorApp {
         };
     }
 
-    /// Load a previously-cached scan for the current path — instant, no walk.
+    /// Load a previously-cached scan for the current folder — instant, no walk.
     fn load_cached(&mut self) {
-        let Some(cp) = cache_path_for(&self.path_input) else {
+        let Some(cp) = cache_path_for(&self.current_dir.to_string_lossy()) else {
             eprintln!("[sector] load_cached: no cache dir");
             return;
         };
@@ -388,6 +397,8 @@ impl SectorApp {
         self.crystallize = true;
         self.reveal_start = Some(Instant::now()); // animate the city rising
         self.menu_target = None;
+        self.city_root = Some(self.current_dir.clone());
+        self.city_synced_dir = Some(self.current_dir.clone());
         // No scanner thread; the dead channel is never polled because `stats`
         // is already `Some`.
         let (_tx, rx) = channel();
@@ -401,7 +412,37 @@ impl SectorApp {
         };
     }
 
+    /// Point the City at `current_dir` (E2). Instant cache-load if one exists;
+    /// otherwise drop to an idle scan-prompt (a full scan stays deliberate).
+    fn sync_city(&mut self) {
+        let cur = self.current_dir.clone();
+        let has_cache = cache_path_for(&cur.to_string_lossy())
+            .map(|p| p.exists())
+            .unwrap_or(false);
+        if has_cache {
+            self.load_cached();
+        } else {
+            // Cancel any scan of the old location and clear the cityscape.
+            if let ScanState::Running { cancel, .. } = &self.scan {
+                cancel.store(true, Ordering::Relaxed);
+            }
+            self.scan = ScanState::Idle;
+            self.root = Tree::ROOT;
+            self.tiles.clear();
+            self.scape = Scape::default();
+            self.dominant = None;
+            self.reveal_start = None;
+        }
+        self.city_root = Some(cur.clone());
+        self.city_synced_dir = Some(cur);
+    }
+
     // ---- Explorer navigation (E1) ----
+
+    /// Keep the address bar showing the canonical current directory.
+    fn sync_addr(&mut self) {
+        self.addr_edit = self.current_dir.to_string_lossy().into_owned();
+    }
 
     fn navigate_to(&mut self, path: PathBuf) {
         if path == self.current_dir {
@@ -413,6 +454,7 @@ impl SectorApp {
         self.current_dir = path;
         self.entries_dirty = true;
         self.selected = None;
+        self.sync_addr();
     }
 
     fn go_back(&mut self) {
@@ -420,6 +462,7 @@ impl SectorApp {
             self.fwd_stack.push(std::mem::replace(&mut self.current_dir, p));
             self.entries_dirty = true;
             self.selected = None;
+            self.sync_addr();
         }
     }
 
@@ -428,6 +471,7 @@ impl SectorApp {
             self.back_stack.push(std::mem::replace(&mut self.current_dir, p));
             self.entries_dirty = true;
             self.selected = None;
+            self.sync_addr();
         }
     }
 
@@ -473,35 +517,34 @@ impl SectorApp {
         self.entries_dirty = false;
     }
 
-    /// The file-explorer List view: nav toolbar + a virtualized file table.
+    /// The shared navigation strip: back / forward / up + the address bar. Drives
+    /// `current_dir`, which BOTH views follow (E2).
+    fn nav_bar(&mut self, ui: &mut egui::Ui) {
+        if ui.add_enabled(!self.back_stack.is_empty(), egui::Button::new("◀")).on_hover_text("Back").clicked() {
+            self.go_back();
+        }
+        if ui.add_enabled(!self.fwd_stack.is_empty(), egui::Button::new("▶")).on_hover_text("Forward").clicked() {
+            self.go_forward();
+        }
+        if ui
+            .add_enabled(self.current_dir.parent().is_some(), egui::Button::new("⬆"))
+            .on_hover_text("Up")
+            .clicked()
+        {
+            self.go_up();
+        }
+        let r = ui.add(egui::TextEdit::singleline(&mut self.addr_edit).desired_width(f32::INFINITY));
+        if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+            let p = PathBuf::from(self.addr_edit.trim());
+            self.navigate_to(p);
+        }
+    }
+
+    /// The file-explorer List view: a virtualized file table for `current_dir`.
     fn show_list(&mut self, ui: &mut egui::Ui) {
         if self.entries_dirty {
             self.reload_entries();
         }
-
-        egui::Panel::top("nav").show(ui, |ui| {
-            ui.horizontal(|ui| {
-                if ui.add_enabled(!self.back_stack.is_empty(), egui::Button::new("◀")).clicked() {
-                    self.go_back();
-                }
-                if ui.add_enabled(!self.fwd_stack.is_empty(), egui::Button::new("▶")).clicked() {
-                    self.go_forward();
-                }
-                if ui
-                    .add_enabled(self.current_dir.parent().is_some(), egui::Button::new("⬆"))
-                    .clicked()
-                {
-                    self.go_up();
-                }
-                let r = ui.add(
-                    egui::TextEdit::singleline(&mut self.addr_edit).desired_width(f32::INFINITY),
-                );
-                if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                    let p = PathBuf::from(self.addr_edit.trim());
-                    self.navigate_to(p);
-                }
-            });
-        });
 
         egui::CentralPanel::default().show(ui, |ui| {
             if let Some(err) = self.entries_err.clone() {
@@ -880,7 +923,7 @@ impl eframe::App for SectorApp {
             replay_secs: self.replay_secs,
             threads: self.threads,
             replay_mode: self.anim_mode == AnimMode::Replay,
-            path_input: self.path_input.clone(),
+            current_dir: self.current_dir.to_string_lossy().into_owned(),
         };
         eframe::set_value(storage, "settings", &s);
     }
@@ -931,13 +974,15 @@ impl eframe::App for SectorApp {
             }
         }
 
-        // ---- Mode toggle: Files (explorer) / City (visualizer) -------------
+        // ---- Shared nav: mode toggle + back/forward/up + address bar -------
         egui::Panel::top("mode").show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.strong(sector_core::APP_NAME);
                 ui.separator();
                 ui.selectable_value(&mut self.view, View::List, "📁 Files");
                 ui.selectable_value(&mut self.view, View::City, "🏙 City");
+                ui.separator();
+                self.nav_bar(ui);
             });
         });
 
@@ -947,16 +992,25 @@ impl eframe::App for SectorApp {
 
         // ---- City view (the original visualizer) ---------------------------
         if self.view == View::City {
+        // E2: keep the City pointed at the folder you're browsing. When the
+        // location drifts (address bar, up/back, or a Files navigation), re-sync
+        // — instant cache-load if available, else drop to a scan-prompt.
+        if self.city_synced_dir.as_deref() != Some(self.current_dir.as_path()) {
+            self.sync_city();
+        }
         // ---- Top bar --------------------------------------------------------
         egui::Panel::top("bar").show(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.strong(sector_core::APP_NAME);
-                ui.separator();
                 let scanning = matches!(&self.scan, ScanState::Running { stats: None, .. });
                 ui.add_enabled_ui(!scanning, |ui| {
-                    ui.label("Path:");
-                    ui.text_edit_singleline(&mut self.path_input);
-                    if ui.button("Scan").clicked() {
+                    let scanned = self.city_root.as_deref() == Some(self.current_dir.as_path())
+                        && matches!(&self.scan, ScanState::Running { stats: Some(_), .. });
+                    let scan_label = if scanned { "Rescan" } else { "Scan" };
+                    if ui
+                        .button(scan_label)
+                        .on_hover_text("Deep-scan this folder into a cityscape (slow for a big tree; cached afterwards).")
+                        .clicked()
+                    {
                         self.start_scan();
                     }
                     ui.add(
@@ -980,8 +1034,8 @@ impl eframe::App for SectorApp {
                         .on_hover_text("Replay duration — drag to change the pace, then Load cached again.");
                     }
 
-                    // Offer an instant load if a cache exists for this path.
-                    if let Some(cp) = cache_path_for(&self.path_input) {
+                    // Offer an instant load if a cache exists for this folder.
+                    if let Some(cp) = cache_path_for(&self.current_dir.to_string_lossy()) {
                         if let Ok(age) = std::fs::metadata(&cp).and_then(|m| m.modified()) {
                             if ui
                                 .button(format!("⟳ Load cached · {}", humanize_age(age)))
@@ -1002,7 +1056,10 @@ impl eframe::App for SectorApp {
 
             match &self.scan {
                 ScanState::Idle => {
-                    ui.label("Enter a path and press Scan (e.g. C:\\ or a NAS drive Y:\\).");
+                    ui.label(format!(
+                        "No cityscape for {} yet — press Scan to build one.",
+                        self.current_dir.display()
+                    ));
                 }
                 ScanState::Running {
                     tree,
@@ -1263,6 +1320,29 @@ impl eframe::App for SectorApp {
                 ctx.request_repaint();
             }
         });
+
+        // E2: reflect any in-City drill (block click / breadcrumb) back into the
+        // shared location, so Files follows — without re-triggering a re-sync.
+        let drilled: Option<PathBuf> =
+            if let ScanState::Running { tree, stats: Some(_), .. } = &self.scan {
+                if self.root == Tree::ROOT {
+                    self.city_root.clone()
+                } else {
+                    let t = tree.lock().expect("tree");
+                    Some(PathBuf::from(joined_path(&t.path_components(self.root))))
+                }
+            } else {
+                None
+            };
+        if let Some(t) = drilled {
+            if t != self.current_dir {
+                self.current_dir = t;
+                self.entries_dirty = true;
+                self.selected = None;
+                self.sync_addr();
+            }
+            self.city_synced_dir = Some(self.current_dir.clone());
+        }
         } // end City view
 
         // Kick off the queued cache write now that this frame's render (and its
