@@ -1330,37 +1330,69 @@ impl SectorApp {
         let mut toggle = false;
         let mut navigate = false;
         let scroll_here = self.tree_scroll && is_current && self.focus_pane == Pane::Tree;
-        ui.horizontal(|ui| {
-            ui.add_space(depth as f32 * 12.0);
-            // Painted disclosure triangle (a font glyph like ▸ renders as a
-            // missing-glyph box in egui's bundled font).
-            let (rect, resp) =
-                ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::click());
-            let c = rect.center();
-            let color = if resp.hovered() {
-                ui.visuals().strong_text_color()
-            } else {
-                ui.visuals().weak_text_color()
-            };
-            let pts = if open {
-                // pointing down
-                vec![c + Vec2::new(-4.0, -2.0), c + Vec2::new(4.0, -2.0), c + Vec2::new(0.0, 3.0)]
-            } else {
-                // pointing right
-                vec![c + Vec2::new(-2.0, -4.0), c + Vec2::new(-2.0, 4.0), c + Vec2::new(3.0, 0.0)]
-            };
-            ui.painter().add(egui::Shape::convex_polygon(pts, color, Stroke::NONE));
-            if resp.clicked() {
+
+        // The whole row is ONE full-width interactive element, so hovering
+        // anywhere on it (text or the space beside it) highlights uniformly.
+        // Colors pulled up front so the visuals borrow doesn't clash with painting.
+        let (sel_bg, sel_fg, hover_bg, weak, strong, text) = {
+            let v = ui.visuals();
+            (
+                v.selection.bg_fill,
+                v.selection.stroke.color,
+                v.widgets.hovered.weak_bg_fill,
+                v.weak_text_color(),
+                v.strong_text_color(),
+                v.text_color(),
+            )
+        };
+        let row_h = 18.0;
+        let (rect, resp) =
+            ui.allocate_exact_size(egui::vec2(ui.available_width(), row_h), Sense::click());
+        let painter = ui.painter();
+        if is_current {
+            painter.rect_filled(rect, 2.0, sel_bg);
+        } else if resp.hovered() {
+            painter.rect_filled(rect, 2.0, hover_bg);
+        }
+        let indent = depth as f32 * 12.0;
+        // Disclosure triangle (painted — a font glyph renders as a missing-glyph box).
+        let tri_c = egui::pos2(rect.left() + indent + 11.0, rect.center().y);
+        let tri_rect = egui::Rect::from_center_size(tri_c, egui::vec2(16.0, row_h));
+        let tri_col = if is_current {
+            sel_fg
+        } else if resp.hovered() {
+            strong
+        } else {
+            weak
+        };
+        let pts = if open {
+            vec![tri_c + Vec2::new(-4.0, -2.0), tri_c + Vec2::new(4.0, -2.0), tri_c + Vec2::new(0.0, 3.0)]
+        } else {
+            vec![tri_c + Vec2::new(-2.0, -4.0), tri_c + Vec2::new(-2.0, 4.0), tri_c + Vec2::new(3.0, 0.0)]
+        };
+        painter.add(egui::Shape::convex_polygon(pts, tri_col, Stroke::NONE));
+        let text_col = if is_current { sel_fg } else { text };
+        painter.text(
+            egui::pos2(rect.left() + indent + 22.0, rect.center().y),
+            egui::Align2::LEFT_CENTER,
+            format!("🗀 {name}"),
+            egui::FontId::proportional(14.0),
+            text_col,
+        );
+        if resp.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        if scroll_here {
+            resp.scroll_to_me(Some(egui::Align::Center));
+        }
+        // A click on the triangle toggles; anywhere else navigates.
+        if resp.clicked() {
+            if resp.interact_pointer_pos().map(|p| tri_rect.contains(p)).unwrap_or(false) {
                 toggle = true;
-            }
-            let label = ui.selectable_label(is_current, format!("🗀 {name}"));
-            if label.clicked() {
+            } else {
                 navigate = true;
             }
-            if scroll_here {
-                label.scroll_to_me(Some(egui::Align::Center));
-            }
-        });
+        }
 
         if toggle {
             if open {
@@ -1558,7 +1590,7 @@ impl SectorApp {
                 .min_size(150.0)
                 .show(ui, |ui| {
                     ui.add_space(4.0);
-                    egui::ScrollArea::both()
+                    egui::ScrollArea::vertical()
                         .auto_shrink([false, false])
                         .show(ui, |ui| {
                             self.sidebar_tree(ui);
