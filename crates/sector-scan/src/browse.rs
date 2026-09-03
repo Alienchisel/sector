@@ -18,11 +18,13 @@ pub struct Entry {
     /// deep scan — that's the "City" mode's job).
     pub size: u64,
     pub modified: Option<SystemTime>,
+    pub created: Option<SystemTime>,
     /// A symlink/reparse point (shown but not auto-traversed).
     pub is_symlink: bool,
     /// Hidden or system entry (Windows HIDDEN/SYSTEM attributes) — the explorer
     /// hides these by default.
     pub is_hidden: bool,
+    pub readonly: bool,
 }
 
 /// Is this metadata a Windows reparse point (junction / mount point / symlink)?
@@ -69,13 +71,16 @@ pub fn list_dir(path: &Path) -> std::io::Result<Vec<Entry>> {
         // does not follow the reparse point, so these attributes are the link's.
         let is_symlink = ft.is_symlink() || is_reparse_point(md.as_ref());
         let is_hidden = is_hidden_entry(md.as_ref());
+        let readonly = md.as_ref().map(|m| m.permissions().readonly()).unwrap_or(false);
         out.push(Entry {
             name: dirent.file_name().to_string_lossy().into_owned(),
             is_dir,
             size: if is_dir { 0 } else { md.as_ref().map(|m| m.len()).unwrap_or(0) },
-            modified: md.and_then(|m| m.modified().ok()),
+            modified: md.as_ref().and_then(|m| m.modified().ok()),
+            created: md.as_ref().and_then(|m| m.created().ok()),
             is_symlink,
             is_hidden,
+            readonly,
         });
     }
     Ok(out)

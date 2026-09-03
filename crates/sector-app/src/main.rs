@@ -93,6 +93,24 @@ fn commas(n: u64) -> String {
 
 /// Join path components cleanly (trim any trailing separator on each, e.g. the
 /// drive root "Y:\\"), avoiding the doubled `\\` in displayed paths.
+/// Split a path into clickable breadcrumb segments: `(label, navigable path)`,
+/// root first. Drive-letter paths (`C:\Users\Docs`) work fully; a bare drive
+/// segment navigates to the drive root. (UNC `\\server\share` isn't split — it
+/// comes back as a single segment; those are rare here — mapped drives are used.)
+fn breadcrumb_segments(dir: &Path) -> Vec<(String, PathBuf)> {
+    let s = dir.to_string_lossy().replace('/', "\\");
+    let parts: Vec<&str> = s.split('\\').filter(|p| !p.is_empty()).collect();
+    let mut out = Vec::with_capacity(parts.len());
+    for i in 0..parts.len() {
+        let mut path = parts[..=i].join("\\");
+        if i == 0 && path.ends_with(':') {
+            path.push('\\'); // drive root, not the drive-relative dir
+        }
+        out.push((parts[i].to_string(), PathBuf::from(path)));
+    }
+    out
+}
+
 fn joined_path(comps: &[&str]) -> String {
     comps
         .iter()
@@ -173,6 +191,30 @@ fn humanize_age(modified: SystemTime) -> String {
     } else {
         format!("{}d ago", secs / 86_400)
     }
+}
+
+/// An absolute UTC timestamp "YYYY-MM-DD HH:MM" (no timezone/date dependency).
+/// Uses Howard Hinnant's civil-from-days algorithm.
+fn format_datetime(t: SystemTime) -> String {
+    let secs = match t.duration_since(UNIX_EPOCH) {
+        Ok(d) => d.as_secs() as i64,
+        Err(_) => return "—".to_string(),
+    };
+    let days = secs.div_euclid(86_400);
+    let tod = secs.rem_euclid(86_400);
+    let (hh, mm) = (tod / 3600, (tod % 3600) / 60);
+    // civil_from_days: days since 1970-01-01 → (year, month, day)
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    format!("{y:04}-{m:02}-{d:02} {hh:02}:{mm:02} UTC")
 }
 
 /// Max re-layout frequency while a scan is in progress.
@@ -305,6 +347,12 @@ struct SectorApp {
     /// True while the address bar has (or just lost) focus — suppresses the file
     /// list's Enter/Backspace shortcuts so they don't fight the address bar.
     addr_active: bool,
+    /// Path shown as an editable text field (true) vs a clickable breadcrumb.
+    addr_editing: bool,
+    /// Request focus for the address field on the next frame (entering edit mode).
+    addr_edit_focus: bool,
+    /// Show the right-hand Properties panel for the selection.
+    props_visible: bool,
 
     // ---- Folder-tree sidebar (E1b.2, Files view only — D19) ----
     sb_visible: bool,
@@ -369,6 +417,9 @@ impl Default for SectorApp {
             prompt: None,
             cache_mtime: None,
             addr_active: false,
+            addr_editing: false,
+            addr_edit_focus: false,
+            props_visible: false,
             sb_visible: true,
             sb_roots: Vec::new(),
             sb_expanded: HashSet::new(),
@@ -882,6 +933,51 @@ impl SectorApp {
         self.select_after_reload = Some((self.current_dir.clone(), select_name));
     }
 
+    /// Field list for the Properties panel (the current selection), or `None`.
+    fn selected_properties(&self) -> Option<Vec<(&'static str, String)>> {
+        let e = self.selected.and_then(|i| self.entries.get(i))?;
+        let mut f: Vec<(&'static str, String)> = Vec::new();
+        f.push(("Name", e.name.clone()));
+        f.push(("Location", self.current_dir.to_string_lossy().into_owned()));
+        let type_str = if e.is_dir {
+            "Folder".to_string()
+        } else {
+            let cat = categorize(&e.name).label();
+            match Path::new(&e.name).extension().and_then(|x| x.to_str()) {
+                Some(ext) => format!("{cat}  ·  .{}", ext.to_lowercase()),
+                None => cat.to_string(),
+            }
+        };
+        f.push(("Type", type_str));
+        let size_str = if e.is_dir {
+            match self.folder_sizes.as_ref().and_then(|m| m.get(&e.name.to_lowercase())) {
+                Some(sz) => format!("{} ({} bytes)", human_size(*sz), commas(*sz)),
+                None => "— (scan for folder size)".to_string(),
+            }
+        } else {
+            format!("{} ({} bytes)", human_size(e.size), commas(e.size))
+        };
+        f.push(("Size", size_str));
+        if let Some(m) = e.modified {
+            f.push(("Modified", format!("{}  ·  {}", format_datetime(m), humanize_age(m))));
+        }
+        if let Some(c) = e.created {
+            f.push(("Created", format_datetime(c)));
+        }
+        let mut attrs = Vec::new();
+        if e.is_hidden {
+            attrs.push("Hidden");
+        }
+        if e.readonly {
+            attrs.push("Read-only");
+        }
+        if e.is_symlink {
+            attrs.push("Link / reparse");
+        }
+        f.push(("Attributes", if attrs.is_empty() { "—".to_string() } else { attrs.join(", ") }));
+        Some(f)
+    }
+
     // ---- Folder-tree sidebar (E1b.2) ----
 
     /// Expand every ancestor of `current_dir` so the tree reveals where you are.
@@ -999,23 +1095,57 @@ impl SectorApp {
         {
             self.go_up();
         }
-        let r = ui.add(egui::TextEdit::singleline(&mut self.addr_edit).desired_width(f32::INFINITY));
-        // Remember whether the address bar owns the keyboard this frame, so the
-        // file list won't also act on Enter/Backspace.
-        self.addr_active = r.has_focus() || r.lost_focus();
-        if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-            let raw = self.addr_edit.trim();
-            // "C:" means the drive-relative cwd on Windows; the user means the
-            // drive root, so append a separator to a bare drive letter.
-            let norm = if raw.len() == 2
-                && raw.as_bytes()[0].is_ascii_alphabetic()
-                && raw.as_bytes()[1] == b':'
-            {
-                format!("{raw}\\")
-            } else {
-                raw.to_string()
-            };
-            self.navigate_to(PathBuf::from(norm));
+
+        if self.addr_editing {
+            // Editable path field.
+            let r = ui
+                .add(egui::TextEdit::singleline(&mut self.addr_edit).desired_width(f32::INFINITY));
+            if self.addr_edit_focus {
+                r.request_focus();
+                self.addr_edit_focus = false;
+            }
+            self.addr_active = r.has_focus() || r.lost_focus();
+            if r.lost_focus() {
+                if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    let raw = self.addr_edit.trim();
+                    // "C:" is drive-relative; the user means the drive root.
+                    let norm = if raw.len() == 2
+                        && raw.as_bytes()[0].is_ascii_alphabetic()
+                        && raw.as_bytes()[1] == b':'
+                    {
+                        format!("{raw}\\")
+                    } else {
+                        raw.to_string()
+                    };
+                    self.navigate_to(PathBuf::from(norm));
+                }
+                self.addr_editing = false; // leave edit mode on commit or blur
+            }
+        } else {
+            self.addr_active = false;
+            // Clickable breadcrumb, then a pencil to switch to the text field.
+            let mut go: Option<PathBuf> = None;
+            let segs = breadcrumb_segments(&self.current_dir);
+            let last = segs.len().saturating_sub(1);
+            ui.spacing_mut().item_spacing.x = 2.0;
+            for (i, (label, path)) in segs.iter().enumerate() {
+                if i > 0 {
+                    ui.weak("›");
+                }
+                if i == last {
+                    ui.strong(label); // current folder — not a link
+                } else if ui.add(egui::Button::new(label).frame(false)).clicked() {
+                    go = Some(path.clone());
+                }
+            }
+            if ui.button("✎").on_hover_text("Edit path").clicked() {
+                self.addr_edit = self.current_dir.to_string_lossy().into_owned();
+                self.addr_editing = true;
+                self.addr_edit_focus = true;
+            }
+            if let Some(p) = go {
+                self.navigate_to(p);
+            }
         }
     }
 
@@ -1051,8 +1181,60 @@ impl SectorApp {
                 if changed {
                     self.apply_filter();
                 }
+                ui.separator();
+                if ui
+                    .selectable_label(self.props_visible, "ℹ Details")
+                    .on_hover_text("Properties panel (Alt+Enter)")
+                    .clicked()
+                {
+                    self.props_visible = !self.props_visible;
+                }
             });
         });
+
+        // Right-hand Properties panel for the selection.
+        if self.props_visible {
+            let props = self.selected_properties();
+            let mut close = false;
+            egui::Panel::right("props_panel")
+                .resizable(true)
+                .default_size(300.0)
+                .min_size(220.0)
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.strong("Properties");
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.button("✕").clicked() {
+                                close = true;
+                            }
+                        });
+                    });
+                    ui.separator();
+                    match &props {
+                        Some(fields) => {
+                            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                                egui::Grid::new("props_grid")
+                                    .num_columns(2)
+                                    .spacing([12.0, 6.0])
+                                    .striped(true)
+                                    .show(ui, |ui| {
+                                        for (k, v) in fields {
+                                            ui.strong(*k);
+                                            ui.add(egui::Label::new(v).wrap());
+                                            ui.end_row();
+                                        }
+                                    });
+                            });
+                        }
+                        None => {
+                            ui.weak("Select an item to see its details.");
+                        }
+                    }
+                });
+            if close {
+                self.props_visible = false;
+            }
+        }
 
         if self.sb_visible {
             egui::Panel::left("folder_tree")
@@ -1126,6 +1308,7 @@ impl SectorApp {
             let mut new_sort: Option<SortKey> = None;
             let mut rename_req: Option<String> = None;
             let mut new_folder_req = false;
+            let mut props_req = false;
 
             let arrow = |k: SortKey| {
                 if k == sort_key {
@@ -1271,6 +1454,11 @@ impl SectorApp {
                                 new_folder_req = true;
                                 ui.close();
                             }
+                            ui.separator();
+                            if ui.button("Properties").clicked() {
+                                props_req = true;
+                                ui.close();
+                            }
                         });
                     });
                 });
@@ -1301,6 +1489,9 @@ impl SectorApp {
             }
             if new_folder_req {
                 self.open_new_folder();
+            }
+            if props_req {
+                self.props_visible = true;
             }
         });
 
@@ -1341,15 +1532,22 @@ impl SectorApp {
                 self.open_new_folder();
             }
             if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                let action = self
-                    .selected
-                    .and_then(|i| self.entries.get(i))
-                    .map(|e| (self.current_dir.join(&e.name), e.is_dir));
-                if let Some((full, is_dir)) = action {
-                    if is_dir {
-                        self.navigate_to(full);
-                    } else {
-                        open_path(&full);
+                if ui.input(|i| i.modifiers.alt) {
+                    // Alt+Enter: show properties for the selection.
+                    if self.selected.is_some() {
+                        self.props_visible = true;
+                    }
+                } else {
+                    let action = self
+                        .selected
+                        .and_then(|i| self.entries.get(i))
+                        .map(|e| (self.current_dir.join(&e.name), e.is_dir));
+                    if let Some((full, is_dir)) = action {
+                        if is_dir {
+                            self.navigate_to(full);
+                        } else {
+                            open_path(&full);
+                        }
                     }
                 }
             }
