@@ -1491,7 +1491,7 @@ impl SectorApp {
                     go = Some(path.clone());
                 }
             }
-            if ui.button("✎").on_hover_text("Edit path").clicked() {
+            if ui.button("📝").on_hover_text("Edit path").clicked() {
                 self.addr_edit = self.current_dir.to_string_lossy().into_owned();
                 self.addr_editing = true;
                 self.addr_edit_focus = true;
@@ -1519,7 +1519,7 @@ impl SectorApp {
                         .hint_text("Filter this folder…"),
                 );
                 let mut changed = r.changed();
-                if !self.filter.is_empty() && ui.button("✕").on_hover_text("Clear filter").clicked() {
+                if !self.filter.is_empty() && ui.button("×").on_hover_text("Clear filter").clicked() {
                     self.filter.clear();
                     changed = true;
                 }
@@ -1536,7 +1536,7 @@ impl SectorApp {
                 }
                 ui.separator();
                 if ui
-                    .selectable_label(self.props_visible, "ℹ Details")
+                    .selectable_label(self.props_visible, "Details")
                     .on_hover_text("Properties panel (Alt+Enter)")
                     .clicked()
                 {
@@ -1557,7 +1557,7 @@ impl SectorApp {
                     ui.horizontal(|ui| {
                         ui.strong("Properties");
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui.button("✕").clicked() {
+                            if ui.button("×").clicked() {
                                 close = true;
                             }
                         });
@@ -1650,7 +1650,7 @@ impl SectorApp {
                         }
                     } else if let Some(err) = &self.op_error {
                         ui.colored_label(egui::Color32::from_rgb(224, 108, 108), format!("⚠ {err}"));
-                        if ui.button("✕").on_hover_text("Dismiss").clicked() {
+                        if ui.button("×").on_hover_text("Dismiss").clicked() {
                             clear_err = true;
                         }
                     } else {
@@ -1661,8 +1661,8 @@ impl SectorApp {
                         }
                         if let Some(c) = &self.clipboard {
                             ui.separator();
-                            let (glyph, verb) = if c.cut { ("✂", "cut") } else { ("⎘", "copied") };
-                            ui.weak(format!("{glyph} {} {verb}", c.paths.len()));
+                            let verb = if c.cut { "cut" } else { "copied" };
+                            ui.weak(format!("📋 {} {verb}", c.paths.len()));
                         }
                     }
                 });
@@ -2863,14 +2863,14 @@ impl eframe::App for SectorApp {
                 ui.separator();
                 if self.view == View::List {
                     if ui
-                        .selectable_label(self.sb_visible, "☰")
+                        .selectable_label(self.sb_visible, "🗂")
                         .on_hover_text("Toggle the folder tree")
                         .clicked()
                     {
                         self.sb_visible = !self.sb_visible;
                     }
                     if ui
-                        .button("＋")
+                        .button("+")
                         .on_hover_text("New folder (Ctrl+Shift+N)")
                         .clicked()
                     {
@@ -2933,7 +2933,7 @@ impl eframe::App for SectorApp {
                     // (age precomputed in sync_city — no per-frame stat).
                     if let Some(age) = self.cache_mtime {
                         if ui
-                            .button(format!("⟳ Load cached · {}", humanize_age(age)))
+                            .button(format!("Load cached · {}", humanize_age(age)))
                             .on_hover_text("Reopen the last scan of this path instantly, without walking the filesystem.")
                             .clicked()
                         {
@@ -2944,7 +2944,7 @@ impl eframe::App for SectorApp {
                     match self.cache_freshness {
                         Freshness::Stale => {
                             ui.separator();
-                            ui.colored_label(egui::Color32::from_rgb(230, 170, 80), "⟳ volume changed")
+                            ui.colored_label(egui::Color32::from_rgb(230, 170, 80), "volume changed")
                                 .on_hover_text(
                                     "Something on this volume changed since the scan (per the USN \
                                      journal). This is volume-wide, so it may be unrelated activity \
@@ -2953,7 +2953,7 @@ impl eframe::App for SectorApp {
                         }
                         Freshness::Current => {
                             ui.separator();
-                            ui.colored_label(egui::Color32::from_rgb(120, 200, 120), "✓ up to date")
+                            ui.colored_label(egui::Color32::from_rgb(120, 200, 120), "up to date")
                                 .on_hover_text("No changes on this volume since the scan (per the NTFS USN journal).");
                         }
                         Freshness::Unknown => {}
