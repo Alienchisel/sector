@@ -242,7 +242,11 @@ safest-first — destructive ops must be bulletproof (see D16, D1).
   files, in-app navigate for folders), right-click menu (Open · Reveal/Open in
   Explorer · Copy path · Copy name), Backspace = up. *Properties dialog deferred
   — needs a ShellExecute call via the `windows` crate.*
-- **E4 — Non-destructive edits  ☐**: new folder, rename.
+- **E4 — Non-destructive edits  ✅**: New folder (Ctrl+Shift+N / ＋ button /
+  context menu) and Rename (F2 / context menu), via a validated modal dialog
+  (empty / invalid-char / reserved / duplicate checks; OS errors shown in-dialog,
+  which stays open). Refreshes the listing + tree and re-selects the affected
+  item afterwards.
 - **E5 — Destructive ops (careful)  ☐**: delete → Recycle Bin, copy/move with
   conflict handling, cut/paste — with confirmations and error handling.
 - **E6 — Incremental freshness (D17)  ☐**: **local NTFS** — store last USN, read

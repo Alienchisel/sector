@@ -37,6 +37,23 @@ enum View {
     City,
 }
 
+/// A pending name-entry dialog (E4): create a folder, or rename an entry.
+enum PromptKind {
+    NewFolder,
+    Rename { orig: String },
+}
+
+struct NamePrompt {
+    kind: PromptKind,
+    buf: String,
+    error: Option<String>,
+    /// Request keyboard focus for the text field on the next frame.
+    focus: bool,
+}
+
+/// Characters Windows forbids in a file/folder name.
+const INVALID_NAME_CHARS: &[char] = &['\\', '/', ':', '*', '?', '"', '<', '>', '|'];
+
 /// File-list sort column.
 #[derive(Clone, Copy, PartialEq)]
 enum SortKey {
@@ -273,6 +290,8 @@ struct SectorApp {
     /// Cached status-footer summary (item counts + total), recomputed only when
     /// the listing or folder sizes change — not every frame.
     status_summary: String,
+    /// An open New-folder / Rename dialog (E4), if any.
+    prompt: Option<NamePrompt>,
     /// True while the address bar has (or just lost) focus — suppresses the file
     /// list's Enter/Backspace shortcuts so they don't fight the address bar.
     addr_active: bool,
@@ -334,6 +353,7 @@ impl Default for SectorApp {
             select_after_reload: None,
             last_title: String::new(),
             status_summary: String::new(),
+            prompt: None,
             cache_mtime: None,
             addr_active: false,
             sb_visible: true,
@@ -725,6 +745,94 @@ impl SectorApp {
         Some(map)
     }
 
+    // ---- Edits: New folder / Rename (E4) ----
+
+    fn open_rename(&mut self, orig: String) {
+        self.prompt = Some(NamePrompt {
+            kind: PromptKind::Rename { orig: orig.clone() },
+            buf: orig,
+            error: None,
+            focus: true,
+        });
+    }
+
+    fn open_new_folder(&mut self) {
+        let buf = self.unique_new_folder_name();
+        self.prompt = Some(NamePrompt { kind: PromptKind::NewFolder, buf, error: None, focus: true });
+    }
+
+    /// "New folder", or "New folder (2)", … — the first name not already taken
+    /// (case-insensitively) in the current listing.
+    fn unique_new_folder_name(&self) -> String {
+        let taken =
+            |name: &str| self.entries.iter().any(|e| e.name.eq_ignore_ascii_case(name));
+        if !taken("New folder") {
+            return "New folder".to_string();
+        }
+        for i in 2..10_000 {
+            let cand = format!("New folder ({i})");
+            if !taken(&cand) {
+                return cand;
+            }
+        }
+        format!("New folder ({})", now_unix())
+    }
+
+    /// Validate `name` for the current folder; `allow` is the one existing name a
+    /// rename is allowed to keep (its own). Returns the trimmed name or an error.
+    fn validate_name<'a>(&self, name: &'a str, allow: Option<&str>) -> Result<&'a str, String> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err("Name can't be empty.".into());
+        }
+        if name.contains(INVALID_NAME_CHARS) {
+            return Err("Name can't contain \\ / : * ? \" < > |".into());
+        }
+        if name == "." || name == ".." {
+            return Err("That name is reserved.".into());
+        }
+        let clashes = self.entries.iter().any(|e| {
+            e.name.eq_ignore_ascii_case(name)
+                && !allow.map(|a| e.name.eq_ignore_ascii_case(a)).unwrap_or(false)
+        });
+        if clashes {
+            return Err("An item with that name already exists.".into());
+        }
+        Ok(name)
+    }
+
+    /// Apply a prompt's action to the filesystem. On success returns `Ok`; on a
+    /// validation or OS error returns `Err(message)` (the dialog stays open).
+    fn commit_prompt(&mut self, prompt: &NamePrompt) -> Result<(), String> {
+        match &prompt.kind {
+            PromptKind::NewFolder => {
+                let name = self.validate_name(&prompt.buf, None)?.to_string();
+                let target = self.current_dir.join(&name);
+                std::fs::create_dir(&target)
+                    .map_err(|e| format!("Couldn't create the folder: {e}"))?;
+                self.after_edit(name);
+            }
+            PromptKind::Rename { orig } => {
+                let name = self.validate_name(&prompt.buf, Some(orig))?.to_string();
+                if name == *orig {
+                    return Ok(()); // no change — just close
+                }
+                let src = self.current_dir.join(orig);
+                let dst = self.current_dir.join(&name);
+                std::fs::rename(&src, &dst).map_err(|e| format!("Couldn't rename: {e}"))?;
+                self.after_edit(name);
+            }
+        }
+        Ok(())
+    }
+
+    /// Refresh views after a successful edit, and select the affected item.
+    fn after_edit(&mut self, select_name: String) {
+        self.entries_dirty = true;
+        self.sb_cache.clear(); // the folder tree may have changed
+        self.select_after_reload = Some((self.current_dir.clone(), select_name));
+    }
+
     // ---- Folder-tree sidebar (E1b.2) ----
 
     /// Expand every ancestor of `current_dir` so the tree reveals where you are.
@@ -939,6 +1047,8 @@ impl SectorApp {
             let mut new_selected = self.selected;
             let mut nav_target: Option<PathBuf> = None;
             let mut new_sort: Option<SortKey> = None;
+            let mut rename_req: Option<String> = None;
+            let mut new_folder_req = false;
 
             let arrow = |k: SortKey| {
                 if k == sort_key {
@@ -1075,6 +1185,15 @@ impl SectorApp {
                                 ui.ctx().copy_text(e.name.clone());
                                 ui.close();
                             }
+                            ui.separator();
+                            if ui.button("Rename…").clicked() {
+                                rename_req = Some(e.name.clone());
+                                ui.close();
+                            }
+                            if ui.button("New folder…").clicked() {
+                                new_folder_req = true;
+                                ui.close();
+                            }
                         });
                     });
                 });
@@ -1104,12 +1223,20 @@ impl SectorApp {
             if let Some(t) = nav_target {
                 self.navigate_to(t);
             }
+            if let Some(name) = rename_req {
+                self.open_rename(name);
+            }
+            if new_folder_req {
+                self.open_new_folder();
+            }
         });
 
         // Keyboard parity with Explorer: F5 refreshes; arrows/Home/End/PageUp/Down
         // move the selection; Enter opens it; Backspace goes up — but never while
         // the address bar owns the keyboard (F5 there would wipe in-progress text).
-        let typing = self.addr_active || ui.ctx().memory(|m| m.focused()).is_some();
+        let typing = self.prompt.is_some()
+            || self.addr_active
+            || ui.ctx().memory(|m| m.focused()).is_some();
         if !typing {
             // F5: re-read the current folder AND drop the (lazy) tree cache, so
             // on-disk changes show without a restart. Keep the same file selected
@@ -1128,6 +1255,17 @@ impl SectorApp {
             }
             if ui.input(|i| i.key_pressed(egui::Key::Backspace)) {
                 self.go_up();
+            }
+            // F2 renames the selection; Ctrl+Shift+N makes a new folder.
+            if ui.input(|i| i.key_pressed(egui::Key::F2)) {
+                if let Some(name) =
+                    self.selected.and_then(|i| self.entries.get(i)).map(|e| e.name.clone())
+                {
+                    self.open_rename(name);
+                }
+            }
+            if ui.input(|i| i.modifiers.ctrl && i.modifiers.shift && i.key_pressed(egui::Key::N)) {
+                self.open_new_folder();
             }
             if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                 let action = self
@@ -1554,13 +1692,21 @@ impl eframe::App for SectorApp {
                 ui.selectable_value(&mut self.view, View::List, "📁 Files");
                 ui.selectable_value(&mut self.view, View::City, "🏙 City");
                 ui.separator();
-                if self.view == View::List
-                    && ui
+                if self.view == View::List {
+                    if ui
                         .selectable_label(self.sb_visible, "☰")
                         .on_hover_text("Toggle the folder tree")
                         .clicked()
-                {
-                    self.sb_visible = !self.sb_visible;
+                    {
+                        self.sb_visible = !self.sb_visible;
+                    }
+                    if ui
+                        .button("＋")
+                        .on_hover_text("New folder (Ctrl+Shift+N)")
+                        .clicked()
+                    {
+                        self.open_new_folder();
+                    }
                 }
                 self.nav_bar(ui);
             });
@@ -1923,6 +2069,61 @@ impl eframe::App for SectorApp {
             self.city_synced_dir = Some(self.current_dir.clone());
         }
         } // end City view
+
+        // ---- New folder / Rename dialog (E4) --------------------------------
+        if let Some(mut prompt) = self.prompt.take() {
+            let title = match &prompt.kind {
+                PromptKind::NewFolder => "New folder",
+                PromptKind::Rename { .. } => "Rename",
+            };
+            let mut commit = false;
+            let mut cancel = false;
+            let modal = egui::Modal::new(egui::Id::new("sector_name_prompt")).show(&ctx, |ui| {
+                ui.set_width(340.0);
+                ui.strong(title);
+                ui.add_space(6.0);
+                let r = ui.add(
+                    egui::TextEdit::singleline(&mut prompt.buf)
+                        .desired_width(f32::INFINITY)
+                        .hint_text("Name"),
+                );
+                if prompt.focus {
+                    r.request_focus();
+                    prompt.focus = false;
+                }
+                if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    commit = true;
+                }
+                if let Some(e) = &prompt.error {
+                    ui.add_space(4.0);
+                    ui.colored_label(egui::Color32::from_rgb(224, 108, 108), e);
+                }
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    if ui.button("OK").clicked() {
+                        commit = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+            // Esc or a click on the backdrop closes (cancels) the dialog.
+            if cancel || modal.should_close() {
+                // dropped: prompt stays taken → closed
+            } else if commit {
+                match self.commit_prompt(&prompt) {
+                    Ok(()) => {} // success → closed
+                    Err(e) => {
+                        prompt.error = Some(e);
+                        prompt.focus = true;
+                        self.prompt = Some(prompt); // keep open, show the error
+                    }
+                }
+            } else {
+                self.prompt = Some(prompt); // still open
+            }
+        }
 
         // Kick off the queued cache write now that this frame's render (and its
         // tree lock) is done, so serialization on the background thread doesn't
