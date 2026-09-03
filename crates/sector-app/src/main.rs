@@ -1054,13 +1054,18 @@ impl SectorApp {
         let sources = clip.paths.clone();
         let cut = clip.cut;
 
-        // Validate on the UI thread (fast) before spawning the worker.
+        // Validate on the UI thread (fast) before spawning the worker. Compare
+        // CANONICAL paths so case differences and junction/mapped-drive aliases
+        // can't sneak a folder into itself (which would recurse until the disk
+        // fills). Falls back to the raw path if canonicalize fails.
+        let dest_c = std::fs::canonicalize(&dest_dir).unwrap_or_else(|_| dest_dir.clone());
         for src in &sources {
-            if src.is_dir() && (dest_dir == *src || dest_dir.starts_with(src)) {
+            let src_c = std::fs::canonicalize(src).unwrap_or_else(|_| src.clone());
+            if src.is_dir() && (dest_c == src_c || dest_c.starts_with(&src_c)) {
                 self.op_error = Some("Can't paste a folder into itself.".into());
                 return;
             }
-            if cut && src.parent() == Some(dest_dir.as_path()) {
+            if cut && src_c.parent() == Some(dest_c.as_path()) {
                 self.op_error = Some("It's already in this folder.".into());
                 return;
             }
@@ -2064,41 +2069,95 @@ fn unique_dest(dir: &Path, name: &str) -> PathBuf {
     make(&format!(" - Copy ({})", now_unix()))
 }
 
-/// Recursively copy `src` to a fresh `dst`, aborting if `cancel` is set. Files
-/// use `fs::copy`; directories are created and their contents copied. Assumes
-/// `dst` does not already exist (see [`unique_dest`]).
-fn copy_any(src: &Path, dst: &Path, cancel: &AtomicBool) -> std::io::Result<()> {
+/// Is this metadata a symlink or Windows reparse point (junction / mount point)?
+/// We neither follow nor materialize these during a copy.
+fn is_reparse(md: &std::fs::Metadata) -> bool {
+    if md.file_type().is_symlink() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        return md.file_attributes() & 0x400 != 0; // FILE_ATTRIBUTE_REPARSE_POINT
+    }
+    #[cfg(not(windows))]
+    false
+}
+
+const COPY_MAX_DEPTH: u32 = 512;
+const COPY_BUF: usize = 1 << 20; // 1 MiB
+
+/// Copy one file, checking `cancel` between chunks so a large file stays
+/// interruptible. `dst` is a fresh path (see [`unique_dest`]).
+fn copy_file_cancellable(src: &Path, dst: &Path, cancel: &AtomicBool) -> std::io::Result<()> {
+    use std::io::{Read, Write};
+    let mut r = std::fs::File::open(src)?;
+    let mut w = std::fs::File::create(dst)?;
+    let mut buf = vec![0u8; COPY_BUF];
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "cancelled"));
+        }
+        let n = r.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        w.write_all(&buf[..n])?;
+    }
+    Ok(())
+}
+
+/// Recursively copy `src` to a fresh `dst`, aborting if `cancel` is set.
+/// Symlinks/junctions are SKIPPED (never followed or dereferenced) so a
+/// directory junction can't send us into an unrelated or ancestor tree.
+/// Depth-capped as a stack-overflow safety net. Assumes `dst` doesn't exist.
+fn copy_any(src: &Path, dst: &Path, cancel: &AtomicBool, depth: u32) -> std::io::Result<()> {
     if cancel.load(Ordering::Relaxed) {
         return Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "cancelled"));
     }
-    // symlink_metadata: classify the entry itself, don't follow a directory link.
+    if depth > COPY_MAX_DEPTH {
+        return Err(std::io::Error::other("directory tree too deep to copy"));
+    }
     let md = std::fs::symlink_metadata(src)?;
+    if is_reparse(&md) {
+        return Ok(()); // skip the link/junction rather than follow it
+    }
     if md.is_dir() {
         std::fs::create_dir(dst)?;
         for entry in std::fs::read_dir(src)? {
             let entry = entry?;
-            copy_any(&entry.path(), &dst.join(entry.file_name()), cancel)?;
+            copy_any(&entry.path(), &dst.join(entry.file_name()), cancel, depth + 1)?;
         }
         Ok(())
     } else {
-        std::fs::copy(src, dst).map(|_| ())
+        copy_file_cancellable(src, dst, cancel)
     }
 }
 
-/// Remove a path whether it's a file or a directory tree (best-effort).
-fn remove_any(path: &Path) {
-    let _ = if path.is_dir() {
+/// Remove a path whether it's a file or a directory tree.
+fn remove_any(path: &Path) -> std::io::Result<()> {
+    if path.is_dir() {
         std::fs::remove_dir_all(path)
     } else {
         std::fs::remove_file(path)
-    };
+    }
 }
 
-/// Worker body for a paste: copy or move each source into `dest_dir` (each to a
-/// unique, non-overwriting destination). For Cut, tries an atomic rename first
-/// and falls back to copy-then-delete across volumes — the source is removed
-/// ONLY after its copy fully succeeds. On any failure the partial destination is
-/// cleaned up (always a fresh path). Returns the last pasted name.
+/// Clean up a partial destination after a failed copy — but NOT if the failure
+/// was that `dst` already existed (a race: it isn't ours to delete).
+fn cleanup_partial(dst: &Path, err: &std::io::Error) {
+    if err.kind() != std::io::ErrorKind::AlreadyExists {
+        let _ = remove_any(dst);
+    }
+}
+
+/// Worker body for a paste: copy or move each source into `dest_dir`, each to a
+/// unique non-overwriting destination. Safety: a Cut uses an atomic rename on the
+/// same volume, else copy-then-delete — and the source is removed ONLY after its
+/// copy fully succeeds; if that removal fails, the good copy is kept and the
+/// outcome is reported honestly. Links/junctions as a source are refused. On any
+/// copy failure the partial (fresh) destination is cleaned up. Returns the last
+/// pasted name.
 fn run_paste(
     sources: Vec<PathBuf>,
     dest_dir: PathBuf,
@@ -2111,21 +2170,32 @@ fn run_paste(
             Some(n) => n.to_string_lossy().into_owned(),
             None => return Err("Invalid source path.".to_string()),
         };
+        // Refuse to copy/move a link or junction as a whole (v1).
+        if std::fs::symlink_metadata(src).map(|m| is_reparse(&m)).unwrap_or(false) {
+            return Err(format!("“{name}” is a link/junction — not copied."));
+        }
         let dst = unique_dest(&dest_dir, &name);
-        let result: std::io::Result<()> = if cut {
-            match std::fs::rename(src, &dst) {
-                Ok(()) => Ok(()), // atomic, same volume
-                Err(_) => copy_any(src, &dst, &cancel).map(|()| {
-                    remove_any(src); // safe: the copy fully succeeded
-                }),
+
+        if cut {
+            // Same-volume: atomic rename (fast, preserves junctions inside).
+            if std::fs::rename(src, &dst).is_ok() {
+                last = dst.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or(name);
+                continue;
             }
-        } else {
-            copy_any(src, &dst, &cancel)
-        };
-        if let Err(e) = result {
-            remove_any(&dst); // clean up the partial (fresh) destination
-            let verb = if cut { "Move" } else { "Copy" };
-            return Err(format!("{verb} failed: {e}"));
+            // Cross-volume: copy, then remove the source.
+            if let Err(e) = copy_any(src, &dst, &cancel, 0) {
+                cleanup_partial(&dst, &e);
+                return Err(format!("Move failed: {e}"));
+            }
+            if let Err(e) = remove_any(src) {
+                // Copy is good; do NOT delete it. Report that the source remains.
+                return Err(format!(
+                    "Copied “{name}”, but couldn't remove the original ({e}) — both remain."
+                ));
+            }
+        } else if let Err(e) = copy_any(src, &dst, &cancel, 0) {
+            cleanup_partial(&dst, &e);
+            return Err(format!("Copy failed: {e}"));
         }
         last = dst.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or(name);
     }
@@ -2268,9 +2338,9 @@ impl eframe::App for SectorApp {
                     if paste_was_cut {
                         self.clipboard = None; // a cut is consumed by the paste
                     }
-                    self.entries_dirty = true;
-                    self.sb_cache.clear();
-                    self.select_after_reload = Some((self.current_dir.clone(), name));
+                    // Refresh listing + tree, clear the filter so the pasted item
+                    // is visible, and select it by name.
+                    self.after_edit(name);
                     self.op_error = None;
                 }
                 Err(e) => self.op_error = Some(e),
@@ -2806,6 +2876,35 @@ mod tests {
         assert_eq!(name2, "src - Copy");
         assert!(dest.join("src/f.txt").exists()); // first copy untouched
         assert!(dest.join("src - Copy/f.txt").exists());
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn paste_skips_and_refuses_symlinks() {
+        use std::os::unix::fs::symlink;
+        let d = scratch("link");
+        // A source folder containing a symlink to an OUTSIDE directory.
+        let outside = d.join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("secret.txt"), b"do not copy me").unwrap();
+        std::fs::create_dir(d.join("src")).unwrap();
+        std::fs::write(d.join("src/real.txt"), b"ok").unwrap();
+        symlink(&outside, d.join("src/link")).unwrap();
+
+        let dest = d.join("dest");
+        std::fs::create_dir(&dest).unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+
+        // Copying the folder skips the symlink (never follows into `outside`).
+        run_paste(vec![d.join("src")], dest.clone(), false, cancel.clone()).unwrap();
+        assert!(dest.join("src/real.txt").exists());
+        assert!(!dest.join("src/link").exists()); // link skipped
+        assert!(!dest.join("src/link/secret.txt").exists()); // target NOT copied
+
+        // A symlink AS the source is refused outright.
+        let err = run_paste(vec![d.join("src/link")], dest, false, cancel).unwrap_err();
+        assert!(err.contains("link/junction"));
         std::fs::remove_dir_all(&d).ok();
     }
 
