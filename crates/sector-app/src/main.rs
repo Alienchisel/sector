@@ -1381,7 +1381,7 @@ impl SectorApp {
         painter.text(
             egui::pos2(rect.left() + indent + 22.0, rect.center().y),
             egui::Align2::LEFT_CENTER,
-            format!("🗀 {name}"),
+            format!("📁 {name}"),
             egui::FontId::proportional(14.0),
             text_col,
         );
