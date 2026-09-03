@@ -94,13 +94,30 @@ fn commas(n: u64) -> String {
 /// Join path components cleanly (trim any trailing separator on each, e.g. the
 /// drive root "Y:\\"), avoiding the doubled `\\` in displayed paths.
 /// Split a path into clickable breadcrumb segments: `(label, navigable path)`,
-/// root first. Drive-letter paths (`C:\Users\Docs`) work fully; a bare drive
-/// segment navigates to the drive root. (UNC `\\server\share` isn't split — it
-/// comes back as a single segment; those are rare here — mapped drives are used.)
+/// root first. Drive-letter paths (`C:\Users\Docs`) — a bare drive segment
+/// navigates to the drive root. UNC paths (`\\server\share\dir`) keep the
+/// `\\server\share` as one root segment so its target stays absolute.
 fn breadcrumb_segments(dir: &Path) -> Vec<(String, PathBuf)> {
     let s = dir.to_string_lossy().replace('/', "\\");
     let parts: Vec<&str> = s.split('\\').filter(|p| !p.is_empty()).collect();
     let mut out = Vec::with_capacity(parts.len());
+
+    if s.starts_with("\\\\") {
+        // UNC: parts = [server, share, sub, …]; the root is \\server\share.
+        if parts.len() < 2 {
+            return out; // malformed \\server with no share — nothing to click
+        }
+        let root = format!("\\\\{}\\{}", parts[0], parts[1]);
+        let mut acc = root.clone();
+        out.push((root, PathBuf::from(&acc)));
+        for p in &parts[2..] {
+            acc.push('\\');
+            acc.push_str(p);
+            out.push((p.to_string(), PathBuf::from(&acc)));
+        }
+        return out;
+    }
+
     for i in 0..parts.len() {
         let mut path = parts[..=i].join("\\");
         if i == 0 && path.ends_with(':') {
@@ -599,6 +616,7 @@ impl SectorApp {
             started: Instant::now(),
         };
         self.recompute_folder_sizes(); // the tree now covers this folder
+        self.refresh_status_summary();
         true
     }
 
@@ -754,8 +772,7 @@ impl SectorApp {
                 }
             }
         }
-        // Now that the new listing is in place, refresh the footer summary.
-        self.refresh_status_summary();
+        // (apply_filter already refreshed the status summary for the new listing.)
     }
 
     /// Rebuild the visible `entries` from `all_entries` by the hidden toggle and
@@ -775,16 +792,18 @@ impl SectorApp {
             .cloned()
             .collect();
         self.selected = sel_name.and_then(|n| self.entries.iter().position(|e| e.name == n));
+        // Keep the (preserved) selection visible after a filter/sort change.
+        self.scroll_target = self.selected;
         self.refresh_status_summary();
     }
 
     /// Recompute [`Self::folder_sizes`] for the current folder from an in-memory
     /// scan tree that covers it (the City's loaded/cached tree). Cheap — a lock,
     /// a shallow name-walk, and a small map over the immediate subfolders. Leaves
-    /// it `None` when no completed scan covers `current_dir`.
+    /// it `None` when no completed scan covers `current_dir`. Callers refresh the
+    /// status summary (the total depends on folder sizes).
     fn recompute_folder_sizes(&mut self) {
         self.folder_sizes = self.compute_folder_sizes();
-        self.refresh_status_summary(); // the total depends on folder sizes
     }
 
     /// Recompute the cached status-footer summary. O(n) over the listing, but
@@ -889,6 +908,17 @@ impl SectorApp {
         }
         if name == "." || name == ".." {
             return Err("That name is reserved.".into());
+        }
+        // Windows reserved device names (also when used as the base of an
+        // extension, e.g. "CON.txt"). A tailored message beats the raw OS error.
+        let base = name.split('.').next().unwrap_or(name).trim_end();
+        let up = base.to_ascii_uppercase();
+        let reserved = matches!(up.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+            || ((up.starts_with("COM") || up.starts_with("LPT"))
+                && up.len() == 4
+                && matches!(up.as_bytes()[3], b'1'..=b'9'));
+        if reserved {
+            return Err(format!("\"{base}\" is a name reserved by Windows."));
         }
         let clashes = self.all_entries.iter().any(|e| {
             e.name.eq_ignore_ascii_case(name)
@@ -1954,6 +1984,7 @@ impl eframe::App for SectorApp {
             // The finished scan now covers the current folder — surface its
             // subfolder sizes in the list.
             self.recompute_folder_sizes();
+            self.refresh_status_summary();
         }
 
         // ---- Shared nav: mode toggle + back/forward/up + address bar -------
@@ -2427,5 +2458,51 @@ impl eframe::App for SectorApp {
                 }
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn datetime_known_values() {
+        assert_eq!(format_datetime(UNIX_EPOCH), "1970-01-01 00:00 UTC");
+        // 2021-01-01 00:00:00 UTC = 1_609_459_200 s.
+        let t = UNIX_EPOCH + Duration::from_secs(1_609_459_200);
+        assert_eq!(format_datetime(t), "2021-01-01 00:00 UTC");
+        // + 13h 37m.
+        let t2 = UNIX_EPOCH + Duration::from_secs(1_609_459_200 + 13 * 3600 + 37 * 60);
+        assert_eq!(format_datetime(t2), "2021-01-01 13:37 UTC");
+    }
+
+    #[test]
+    fn breadcrumb_drive_paths() {
+        let segs = breadcrumb_segments(Path::new(r"C:\Users\Docs"));
+        assert_eq!(
+            segs,
+            vec![
+                ("C:".to_string(), PathBuf::from(r"C:\")),
+                ("Users".to_string(), PathBuf::from(r"C:\Users")),
+                ("Docs".to_string(), PathBuf::from(r"C:\Users\Docs")),
+            ]
+        );
+        // Drive root stays a root ("C:\", not the drive-relative "C:").
+        let root = breadcrumb_segments(Path::new(r"C:\"));
+        assert_eq!(root, vec![("C:".to_string(), PathBuf::from(r"C:\"))]);
+    }
+
+    #[test]
+    fn breadcrumb_unc_paths() {
+        let segs = breadcrumb_segments(Path::new(r"\\nas\Media\Manga"));
+        assert_eq!(
+            segs,
+            vec![
+                (r"\\nas\Media".to_string(), PathBuf::from(r"\\nas\Media")),
+                ("Manga".to_string(), PathBuf::from(r"\\nas\Media\Manga")),
+            ]
+        );
+        // A malformed \\server with no share yields nothing to click.
+        assert!(breadcrumb_segments(Path::new(r"\\server")).is_empty());
     }
 }
