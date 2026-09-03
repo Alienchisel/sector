@@ -2027,10 +2027,13 @@ impl SectorApp {
             || self.addr_active
             || ui.ctx().memory(|m| m.focused()).is_some();
         if !typing {
-            // F5: re-read the current folder AND drop the (lazy) tree cache, so
-            // on-disk changes show without a restart. Keep the same file selected
-            // by name (the old index may no longer be valid after the re-read).
-            if ui.input(|i| i.key_pressed(egui::Key::F5)) {
+            // F5 / Ctrl+R: re-read the current folder AND drop the (lazy) tree
+            // cache, so on-disk changes show without a restart. Keep the same file
+            // selected by name (the old index may not be valid after the re-read).
+            let refresh = ui.input(|i| {
+                i.key_pressed(egui::Key::F5) || (i.modifiers.ctrl && i.key_pressed(egui::Key::R))
+            });
+            if refresh {
                 let keep = self.lead_entry().map(|e| e.name.clone());
                 self.clear_selection();
                 if let Some(name) = keep {
