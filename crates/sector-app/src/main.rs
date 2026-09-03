@@ -1442,7 +1442,7 @@ impl SectorApp {
             self.go_forward();
         }
         if ui
-            .add_enabled(self.current_dir.parent().is_some(), egui::Button::new("⬆"))
+            .add_enabled(self.current_dir.parent().is_some(), egui::Button::new("↑"))
             .on_hover_text("Up")
             .clicked()
         {
@@ -1491,7 +1491,7 @@ impl SectorApp {
                     go = Some(path.clone());
                 }
             }
-            if ui.button("📝").on_hover_text("Edit path").clicked() {
+            if ui.button("Edit").on_hover_text("Edit the path as text").clicked() {
                 self.addr_edit = self.current_dir.to_string_lossy().into_owned();
                 self.addr_editing = true;
                 self.addr_edit_focus = true;
@@ -1509,10 +1509,24 @@ impl SectorApp {
             self.reload_entries();
         }
 
-        // Filter toolbar: name filter + hidden-files toggle.
+        // Files toolbar: folder-tree toggle, New folder, name filter, hidden.
         egui::Panel::top("files_bar").show(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.label("🔍");
+                if ui
+                    .selectable_label(self.sb_visible, "Folders")
+                    .on_hover_text("Show/hide the folder tree")
+                    .clicked()
+                {
+                    self.sb_visible = !self.sb_visible;
+                }
+                if ui
+                    .button("New folder")
+                    .on_hover_text("New folder (Ctrl+Shift+N)")
+                    .clicked()
+                {
+                    self.open_new_folder();
+                }
+                ui.separator();
                 let r = ui.add(
                     egui::TextEdit::singleline(&mut self.filter)
                         .desired_width(220.0)
@@ -2853,31 +2867,15 @@ impl eframe::App for SectorApp {
             }
         }
 
-        // ---- Shared nav: mode toggle + back/forward/up + address bar -------
+        // ---- Top strip: identity + view mode + shared navigation -----------
         egui::Panel::top("mode").show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.strong(sector_core::APP_NAME);
                 ui.separator();
-                ui.selectable_value(&mut self.view, View::List, "📁 Files");
-                ui.selectable_value(&mut self.view, View::City, "🏙 City");
+                ui.selectable_value(&mut self.view, View::List, "Files");
+                ui.selectable_value(&mut self.view, View::City, "City");
                 ui.separator();
-                if self.view == View::List {
-                    if ui
-                        .selectable_label(self.sb_visible, "🗂")
-                        .on_hover_text("Toggle the folder tree")
-                        .clicked()
-                    {
-                        self.sb_visible = !self.sb_visible;
-                    }
-                    if ui
-                        .button("+")
-                        .on_hover_text("New folder (Ctrl+Shift+N)")
-                        .clicked()
-                    {
-                        self.open_new_folder();
-                    }
-                }
-                self.nav_bar(ui);
+                self.nav_bar(ui); // back / forward / up + address (both views)
             });
         });
 
@@ -2995,7 +2993,7 @@ impl eframe::App for SectorApp {
                     Some(st) => {
                         let t = tree.lock().unwrap_or_else(|e| e.into_inner());
                         ui.horizontal_wrapped(|ui| {
-                            if self.root != Tree::ROOT && ui.button("⬆ Up").clicked() {
+                            if self.root != Tree::ROOT && ui.button("↑ Up").clicked() {
                                 self.root = t.node(self.root).parent;
                             }
                             for (i, id) in Self::breadcrumb(&t, self.root).into_iter().enumerate() {
