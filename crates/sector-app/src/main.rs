@@ -1729,18 +1729,27 @@ impl SectorApp {
                     ""
                 }
             };
+            // Left-aligned header, vertically centered (so it lines up with the
+            // right-aligned headers, which are also center-aligned).
             let header_cell = |ui: &mut egui::Ui, label: String, out: &mut Option<SortKey>, k: SortKey| {
-                if ui
-                    .add(egui::Label::new(egui::RichText::new(label).strong()).sense(Sense::click()))
-                    .clicked()
-                {
-                    *out = Some(k);
-                }
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    if ui
+                        .add(egui::Label::new(egui::RichText::new(label).strong()).sense(Sense::click()))
+                        .clicked()
+                    {
+                        *out = Some(k);
+                    }
+                });
             };
             // Right-aligned header, for the numeric/date columns.
             let header_cell_r = |ui: &mut egui::Ui, label: String, out: &mut Option<SortKey>, k: SortKey| {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    header_cell(ui, label, out, k);
+                    if ui
+                        .add(egui::Label::new(egui::RichText::new(label).strong()).sense(Sense::click()))
+                        .clicked()
+                    {
+                        *out = Some(k);
+                    }
                 });
             };
             // Right-aligned data cell wrapper.
