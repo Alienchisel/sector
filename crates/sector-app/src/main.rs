@@ -359,7 +359,14 @@ struct SectorApp {
     fwd_stack: Vec<PathBuf>,
     sort_key: SortKey,
     sort_asc: bool,
-    selected: Option<usize>,
+    /// Selected entries, by name (stable across sort/filter). Source of truth for
+    /// highlighting and multi-item operations.
+    sel: HashSet<String>,
+    /// The focus/cursor row (index into `entries`): the single-item-op target and
+    /// the moving end of a shift-range.
+    lead: Option<usize>,
+    /// The fixed base of a shift-range selection (index into `entries`).
+    anchor: Option<usize>,
     /// When set, scroll the file table to this row next build (keyboard nav).
     scroll_target: Option<usize>,
     /// Subtree sizes for the current folder's SUBFOLDERS (lowercased name → bytes),
@@ -447,7 +454,9 @@ impl Default for SectorApp {
             fwd_stack: Vec::new(),
             sort_key: SortKey::Name,
             sort_asc: true,
-            selected: None,
+            sel: HashSet::new(),
+            lead: None,
+            anchor: None,
             scroll_target: None,
             folder_sizes: None,
             select_after_reload: None,
@@ -690,7 +699,7 @@ impl SectorApp {
         self.fwd_stack.clear();
         self.current_dir = path;
         self.entries_dirty = true;
-        self.selected = None;
+        self.clear_selection();
         self.filter.clear();
         self.op_error = None;
         self.sync_addr();
@@ -701,7 +710,7 @@ impl SectorApp {
         if let Some(p) = self.back_stack.pop() {
             self.fwd_stack.push(std::mem::replace(&mut self.current_dir, p));
             self.entries_dirty = true;
-            self.selected = None;
+            self.clear_selection();
             self.filter.clear();
             self.sync_addr();
             self.sb_reveal();
@@ -712,7 +721,7 @@ impl SectorApp {
         if let Some(p) = self.fwd_stack.pop() {
             self.back_stack.push(std::mem::replace(&mut self.current_dir, p));
             self.entries_dirty = true;
-            self.selected = None;
+            self.clear_selection();
             self.filter.clear();
             self.sync_addr();
             self.sb_reveal();
@@ -731,6 +740,61 @@ impl SectorApp {
                 self.select_after_reload = Some((parent, c));
             }
         }
+    }
+
+    // ---- Selection (multi-select) ----
+
+    fn clear_selection(&mut self) {
+        self.sel.clear();
+        self.lead = None;
+        self.anchor = None;
+    }
+
+    /// Select exactly row `i` (plain click / arrow).
+    fn select_only(&mut self, i: usize) {
+        self.sel.clear();
+        if let Some(e) = self.entries.get(i) {
+            self.sel.insert(e.name.clone());
+            self.lead = Some(i);
+            self.anchor = Some(i);
+        }
+    }
+
+    /// Toggle row `i` in the selection (Ctrl+click).
+    fn toggle_at(&mut self, i: usize) {
+        if let Some(e) = self.entries.get(i) {
+            let name = e.name.clone();
+            if !self.sel.remove(&name) {
+                self.sel.insert(name);
+            }
+            self.lead = Some(i);
+            self.anchor = Some(i);
+        }
+    }
+
+    /// Select the inclusive range `anchor..=i` (Shift+click / Shift+arrow),
+    /// leaving `anchor` fixed and moving `lead` to `i`.
+    fn select_range_to(&mut self, i: usize) {
+        let a = self.anchor.unwrap_or(i);
+        let (lo, hi) = (a.min(i), a.max(i));
+        self.sel.clear();
+        for e in self.entries.iter().skip(lo).take(hi - lo + 1) {
+            self.sel.insert(e.name.clone());
+        }
+        self.lead = Some(i);
+    }
+
+    fn lead_entry(&self) -> Option<&Entry> {
+        self.lead.and_then(|i| self.entries.get(i))
+    }
+
+    /// Selected entries' absolute paths, in listing order.
+    fn selected_paths(&self) -> Vec<PathBuf> {
+        self.entries
+            .iter()
+            .filter(|e| self.sel.contains(&e.name))
+            .map(|e| self.current_dir.join(&e.name))
+            .collect()
     }
 
     /// The size to sort/show for an entry: files use their own size; folders use
@@ -793,7 +857,7 @@ impl SectorApp {
                     .iter()
                     .position(|e| e.name.eq_ignore_ascii_case(&name))
                 {
-                    self.selected = Some(i);
+                    self.select_only(i);
                     self.scroll_target = Some(i);
                 }
             }
@@ -805,7 +869,7 @@ impl SectorApp {
     /// the text filter, preserving the selection by name. Cheap re-clone; call it
     /// whenever the filter or the hidden toggle changes.
     fn apply_filter(&mut self) {
-        let sel_name = self.selected.and_then(|i| self.entries.get(i)).map(|e| e.name.clone());
+        let lead_name = self.lead_entry().map(|e| e.name.clone());
         let show_hidden = self.show_hidden;
         let f = self.filter.trim().to_lowercase();
         self.entries = self
@@ -817,9 +881,12 @@ impl SectorApp {
             })
             .cloned()
             .collect();
-        self.selected = sel_name.and_then(|n| self.entries.iter().position(|e| e.name == n));
-        // Keep the (preserved) selection visible after a filter/sort change.
-        self.scroll_target = self.selected;
+        // Keep only selected names that are still visible; remap lead/anchor.
+        let visible: HashSet<String> = self.entries.iter().map(|e| e.name.clone()).collect();
+        self.sel.retain(|n| visible.contains(n));
+        self.lead = lead_name.and_then(|n| self.entries.iter().position(|e| e.name == n));
+        self.anchor = self.lead;
+        self.scroll_target = self.lead;
         self.refresh_status_summary();
     }
 
@@ -991,7 +1058,7 @@ impl SectorApp {
 
     /// Field list for the Properties panel (the current selection), or `None`.
     fn selected_properties(&self) -> Option<Vec<(&'static str, String)>> {
-        let e = self.selected.and_then(|i| self.entries.get(i))?;
+        let e = self.lead_entry()?;
         let mut f: Vec<(&'static str, String)> = Vec::new();
         f.push(("Name", e.name.clone()));
         f.push(("Location", self.current_dir.to_string_lossy().into_owned()));
@@ -1036,10 +1103,11 @@ impl SectorApp {
 
     // ---- Cut / copy / paste (E5) ----
 
-    /// Put the current selection on the clipboard (`cut` = move on paste).
+    /// Put the current selection (all selected items) on the clipboard.
     fn clip_selected(&mut self, cut: bool) {
-        if let Some(name) = self.selected.and_then(|i| self.entries.get(i)).map(|e| e.name.clone()) {
-            self.clipboard = Some(Clipboard { paths: vec![self.current_dir.join(&name)], cut });
+        let paths = self.selected_paths();
+        if !paths.is_empty() {
+            self.clipboard = Some(Clipboard { paths, cut });
             self.op_error = None;
         }
     }
@@ -1364,24 +1432,35 @@ impl SectorApp {
                 });
         }
 
-        // Status footer: folder totals (cached) + the selected item's details.
+        // Status footer: folder totals (cached) + selection details.
         {
-            let detail = self.selected.and_then(|i| self.entries.get(i)).map(|e| {
-                let mut s = e.name.clone();
-                let known = !e.is_dir
-                    || self
-                        .folder_sizes
-                        .as_ref()
-                        .map(|m| m.contains_key(&e.name.to_lowercase()))
-                        .unwrap_or(false);
-                if known {
-                    s.push_str(&format!(" · {}", human_size(self.entry_size(e))));
-                }
-                if let Some(m) = e.modified {
-                    s.push_str(&format!(" · {}", humanize_age(m)));
-                }
-                s
-            });
+            let detail = if self.sel.len() > 1 {
+                // Multiple selected: count + combined size of known items.
+                let total: u64 = self
+                    .entries
+                    .iter()
+                    .filter(|e| self.sel.contains(&e.name))
+                    .map(|e| self.entry_size(e))
+                    .sum();
+                Some(format!("{} selected · {}", self.sel.len(), human_size(total)))
+            } else {
+                self.lead_entry().filter(|e| self.sel.contains(&e.name)).map(|e| {
+                    let mut s = e.name.clone();
+                    let known = !e.is_dir
+                        || self
+                            .folder_sizes
+                            .as_ref()
+                            .map(|m| m.contains_key(&e.name.to_lowercase()))
+                            .unwrap_or(false);
+                    if known {
+                        s.push_str(&format!(" · {}", human_size(self.entry_size(e))));
+                    }
+                    if let Some(m) = e.modified {
+                        s.push_str(&format!(" · {}", humanize_age(m)));
+                    }
+                    s
+                })
+            };
             let mut cancel_paste = false;
             let mut clear_err = false;
             egui::Panel::bottom("files_status").show(ui, |ui| {
@@ -1404,10 +1483,10 @@ impl SectorApp {
                             ui.separator();
                             ui.label(d);
                         }
-                        if self.clipboard.is_some() {
+                        if let Some(c) = &self.clipboard {
                             ui.separator();
-                            let cut = self.clipboard.as_ref().map(|c| c.cut).unwrap_or(false);
-                            ui.weak(if cut { "✂ 1 cut" } else { "⎘ 1 copied" });
+                            let (glyph, verb) = if c.cut { ("✂", "cut") } else { ("⎘", "copied") };
+                            ui.weak(format!("{glyph} {} {verb}", c.paths.len()));
                         }
                     }
                 });
@@ -1445,13 +1524,19 @@ impl SectorApp {
             let cur = self.current_dir.clone();
             let (sort_key, sort_asc) = (self.sort_key, self.sort_asc);
             let scroll_target = self.scroll_target.take();
-            // The path of a cut item (dimmed in the list).
-            let cut_path: Option<PathBuf> = self
+            // Paths of cut items (dimmed in the list).
+            let cut_paths: HashSet<PathBuf> = self
                 .clipboard
                 .as_ref()
                 .filter(|c| c.cut)
-                .and_then(|c| c.paths.first().cloned());
-            let mut new_selected = self.selected;
+                .map(|c| c.paths.iter().cloned().collect())
+                .unwrap_or_default();
+            // Selection set (taken out so the row closures can read it), plus the
+            // click intent + modifiers, applied after the table.
+            let sel = std::mem::take(&mut self.sel);
+            let mods = ui.ctx().input(|i| i.modifiers);
+            let mut click: Option<usize> = None;
+            let mut menu_row: Option<usize> = None;
             let mut nav_target: Option<PathBuf> = None;
             let mut new_sort: Option<SortKey> = None;
             let mut rename_req: Option<String> = None;
@@ -1515,8 +1600,8 @@ impl SectorApp {
                         // File-type color, shared with the City palette so the two
                         // views read the same. Folders keep the folder glyph.
                         let cat = (!e.is_dir).then(|| categorize(&e.name));
-                        let is_cut = cut_path.as_ref().map(|p| *p == cur.join(&e.name)).unwrap_or(false);
-                        row.set_selected(new_selected == Some(row.index()));
+                        let is_cut = cut_paths.contains(&cur.join(&e.name));
+                        row.set_selected(sel.contains(&e.name));
                         row.col(|ui| {
                             ui.horizontal(|ui| {
                                 ui.spacing_mut().item_spacing.x = 6.0;
@@ -1569,7 +1654,10 @@ impl SectorApp {
                         let full = cur.join(&e.name);
                         let resp = row.response();
                         if resp.clicked() {
-                            new_selected = Some(row.index());
+                            click = Some(row.index());
+                        }
+                        if resp.secondary_clicked() {
+                            menu_row = Some(row.index());
                         }
                         if resp.double_clicked() {
                             if e.is_dir {
@@ -1579,7 +1667,6 @@ impl SectorApp {
                             }
                         }
                         resp.context_menu(|ui| {
-                            new_selected = Some(row.index());
                             if ui.button("Open").clicked() {
                                 if e.is_dir {
                                     nav_target = Some(full.clone()); // enter it in SECTOR
@@ -1634,10 +1721,29 @@ impl SectorApp {
                     });
                 });
 
-            // Restore entries and apply deferred mutations.
+            // Restore entries + selection, then apply deferred mutations.
             self.entries = entries;
             self.folder_sizes = folder_sizes;
-            self.selected = new_selected;
+            self.sel = sel;
+            // Apply a click: Shift = range, Ctrl = toggle, plain = select one.
+            if let Some(i) = click {
+                if mods.shift {
+                    self.select_range_to(i);
+                } else if mods.ctrl {
+                    self.toggle_at(i);
+                } else {
+                    self.select_only(i);
+                }
+            }
+            // A right-click on an unselected row selects just it (keeps a
+            // multi-selection when right-clicking within it).
+            if let Some(i) = menu_row {
+                let in_sel =
+                    self.entries.get(i).map(|e| self.sel.contains(&e.name)).unwrap_or(false);
+                if !in_sel {
+                    self.select_only(i);
+                }
+            }
             if let Some(k) = new_sort {
                 if self.sort_key == k {
                     self.sort_asc = !self.sort_asc;
@@ -1664,7 +1770,8 @@ impl SectorApp {
             if props_req {
                 self.props_visible = true;
             }
-            // self.selected was just set to the right-clicked row above.
+            // The selection now reflects the right-clicked row (or a kept
+            // multi-selection); copy/cut act on all of it.
             if copy_req {
                 self.clip_selected(false);
             }
@@ -1687,11 +1794,8 @@ impl SectorApp {
             // on-disk changes show without a restart. Keep the same file selected
             // by name (the old index may no longer be valid after the re-read).
             if ui.input(|i| i.key_pressed(egui::Key::F5)) {
-                let keep = self
-                    .selected
-                    .and_then(|i| self.entries.get(i))
-                    .map(|e| e.name.clone());
-                self.selected = None;
+                let keep = self.lead_entry().map(|e| e.name.clone());
+                self.clear_selection();
                 if let Some(name) = keep {
                     self.select_after_reload = Some((self.current_dir.clone(), name));
                 }
@@ -1701,16 +1805,20 @@ impl SectorApp {
             if ui.input(|i| i.key_pressed(egui::Key::Backspace)) {
                 self.go_up();
             }
-            // F2 renames the selection; Ctrl+Shift+N makes a new folder.
+            // F2 renames the lead item; Ctrl+Shift+N makes a new folder.
             if ui.input(|i| i.key_pressed(egui::Key::F2)) {
-                if let Some(name) =
-                    self.selected.and_then(|i| self.entries.get(i)).map(|e| e.name.clone())
-                {
+                if let Some(name) = self.lead_entry().map(|e| e.name.clone()) {
                     self.open_rename(name);
                 }
             }
             if ui.input(|i| i.modifiers.ctrl && i.modifiers.shift && i.key_pressed(egui::Key::N)) {
                 self.open_new_folder();
+            }
+            // Ctrl+A selects everything in the folder.
+            if ui.input(|i| i.modifiers.ctrl && !i.modifiers.shift && i.key_pressed(egui::Key::A)) {
+                self.sel = self.entries.iter().map(|e| e.name.clone()).collect();
+                self.lead = self.entries.len().checked_sub(1);
+                self.anchor = Some(0);
             }
             // Ctrl+C copy, Ctrl+X cut, Ctrl+V paste (not Shift, to avoid clashing
             // with Ctrl+Shift+N).
@@ -1725,15 +1833,13 @@ impl SectorApp {
             }
             if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                 if ui.input(|i| i.modifiers.alt) {
-                    // Alt+Enter: show properties for the selection.
-                    if self.selected.is_some() {
+                    // Alt+Enter: show properties for the lead item.
+                    if self.lead.is_some() {
                         self.props_visible = true;
                     }
                 } else {
-                    let action = self
-                        .selected
-                        .and_then(|i| self.entries.get(i))
-                        .map(|e| (self.current_dir.join(&e.name), e.is_dir));
+                    let action =
+                        self.lead_entry().map(|e| (self.current_dir.join(&e.name), e.is_dir));
                     if let Some((full, is_dir)) = action {
                         if is_dir {
                             self.navigate_to(full);
@@ -1744,11 +1850,12 @@ impl SectorApp {
                 }
             }
 
-            // Move the selection with the keyboard (and scroll it into view).
+            // Move the lead with the keyboard (and scroll it into view). Holding
+            // Shift extends the selection from the anchor; otherwise select one.
             let n = self.entries.len();
             if n > 0 {
                 const PAGE: usize = 12;
-                let cur = self.selected;
+                let cur = self.lead;
                 let mut moved = cur;
                 ui.input(|i| {
                     use egui::Key;
@@ -1771,10 +1878,16 @@ impl SectorApp {
                         moved = Some(n - 1);
                     }
                 });
-                if moved != cur {
-                    self.selected = moved;
-                    self.scroll_target = moved;
-                    ui.ctx().request_repaint();
+                if let Some(m) = moved {
+                    if moved != cur {
+                        if ui.input(|i| i.modifiers.shift) {
+                            self.select_range_to(m);
+                        } else {
+                            self.select_only(m);
+                        }
+                        self.scroll_target = Some(m);
+                        ui.ctx().request_repaint();
+                    }
                 }
             }
         }
@@ -2333,17 +2446,25 @@ impl eframe::App for SectorApp {
         }
         if let Some(result) = paste_done {
             self.paste_job = None;
+            // A cut consumes the clipboard whatever the outcome: on partial
+            // failure some sources have already moved, so the remaining paths are
+            // stale and must not be re-pasted.
+            if paste_was_cut {
+                self.clipboard = None;
+            }
             match result {
                 Ok(name) => {
-                    if paste_was_cut {
-                        self.clipboard = None; // a cut is consumed by the paste
-                    }
                     // Refresh listing + tree, clear the filter so the pasted item
                     // is visible, and select it by name.
                     self.after_edit(name);
                     self.op_error = None;
                 }
-                Err(e) => self.op_error = Some(e),
+                Err(e) => {
+                    self.op_error = Some(e);
+                    // Some items may still have changed on disk — refresh the view.
+                    self.entries_dirty = true;
+                    self.sb_cache.clear();
+                }
             }
         }
 
