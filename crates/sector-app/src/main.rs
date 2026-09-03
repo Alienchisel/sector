@@ -1741,9 +1741,12 @@ impl SectorApp {
                     }
                 });
             };
-            // Right-aligned header, for the numeric/date columns.
+            // Right-aligned header, for the numeric/date columns. The leading
+            // add_space (right_to_left places it at the far right) keeps the text
+            // off the panel edge.
             let header_cell_r = |ui: &mut egui::Ui, label: String, out: &mut Option<SortKey>, k: SortKey| {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.add_space(8.0);
                     if ui
                         .add(egui::Label::new(egui::RichText::new(label).strong()).sense(Sense::click()))
                         .clicked()
@@ -1752,9 +1755,12 @@ impl SectorApp {
                     }
                 });
             };
-            // Right-aligned data cell wrapper.
+            // Right-aligned data cell wrapper (with the same right padding).
             let cell_r = |ui: &mut egui::Ui, add: &mut dyn FnMut(&mut egui::Ui)| {
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| add(ui));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.add_space(8.0);
+                    add(ui);
+                });
             };
 
             let mut table = TableBuilder::new(ui)
