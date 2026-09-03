@@ -84,22 +84,64 @@ fn joined_path(comps: &[&str]) -> String {
         .join(std::path::MAIN_SEPARATOR_STR)
 }
 
-/// The cache file path for a given scan root, or `None` if the cache dir is
-/// unavailable. Keyed by a hash of the (normalized) path. Pure — does NO
-/// filesystem I/O (it's called every frame in the City view); the cache dir is
-/// created lazily at save time by [`ensure_cache_dir`].
-fn cache_path_for(root: &str) -> Option<PathBuf> {
-    use std::hash::{Hash, Hasher};
-    let dir = dirs::cache_dir()?.join("sector");
-    // Normalize so "Y:" and "Y:\" (and case) map to the same cache key. Appending
-    // the separator (rather than stripping it) keeps existing "X:\" caches valid.
+/// Normalize a scan-root path into the cache key string, so `"Y:"`, `"Y:\"`, and
+/// `"y:\"` all map to the same cache entry. Also used to verify a loaded cache is
+/// really the folder we asked for.
+fn normalize_cache_key(root: &str) -> String {
     let mut key = root.trim().to_lowercase();
     if key.ends_with(':') {
         key.push('\\');
     }
+    key
+}
+
+/// The cache file path for a given scan root, or `None` if the cache dir is
+/// unavailable. Keyed by a hash of the (normalized) path. Pure — does NO
+/// filesystem I/O (it's called every frame in the City view); the cache dir is
+/// created lazily at save time.
+fn cache_path_for(root: &str) -> Option<PathBuf> {
+    use std::hash::{Hash, Hasher};
+    let dir = dirs::cache_dir()?.join("sector");
     let mut h = std::collections::hash_map::DefaultHasher::new();
-    key.hash(&mut h);
+    normalize_cache_key(root).hash(&mut h);
     Some(dir.join(format!("{:016x}.bin", h.finish())))
+}
+
+/// Keep the cache directory from growing without bound: if the total size of its
+/// `.bin` files exceeds `keep_bytes`, delete the oldest (by mtime) until under
+/// the cap. Never deletes `keep_path` (the file we just wrote). Best-effort.
+fn prune_cache_dir(dir: &std::path::Path, keep_path: &std::path::Path, keep_bytes: u64) {
+    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    let mut files: Vec<(PathBuf, u64, SystemTime)> = rd
+        .filter_map(|e| e.ok())
+        .filter_map(|e| {
+            let p = e.path();
+            if p.extension().map(|x| x == "bin").unwrap_or(false) {
+                let md = e.metadata().ok()?;
+                Some((p, md.len(), md.modified().unwrap_or(UNIX_EPOCH)))
+            } else {
+                None
+            }
+        })
+        .collect();
+    let total: u64 = files.iter().map(|(_, s, _)| *s).sum();
+    if total <= keep_bytes {
+        return;
+    }
+    files.sort_by_key(|(_, _, t)| *t); // oldest first
+    let mut over = total - keep_bytes;
+    for (p, sz, _) in files {
+        if over == 0 {
+            break;
+        }
+        if p == keep_path {
+            continue; // never evict the file we just wrote
+        }
+        if std::fs::remove_file(&p).is_ok() {
+            eprintln!("[sector] cache: pruned {} ({} bytes)", p.display(), sz);
+            over = over.saturating_sub(sz);
+        }
+    }
 }
 
 /// Rough "N ago" from a file-modified time.
@@ -406,6 +448,18 @@ impl SectorApp {
             eprintln!("[sector] load_cached: DESERIALIZE FAILED");
             return false;
         };
+        // Verify the cache is really THIS folder — guards against a (rare) hash-key
+        // collision or a mismatched/renamed file loading the wrong tree.
+        let cached_root = tree.node(Tree::ROOT).name.to_string();
+        if normalize_cache_key(&cached_root)
+            != normalize_cache_key(&self.current_dir.to_string_lossy())
+        {
+            eprintln!(
+                "[sector] load_cached: root mismatch — cached {cached_root:?} != {:?}",
+                self.current_dir
+            );
+            return false;
+        }
         eprintln!("[sector] load_cached: OK — {} nodes, {} files", tree.len(), cs.files);
         let tree = Arc::new(Mutex::new(tree));
         self.dominant = Some(tree.lock().expect("tree").dominant_categories());
@@ -1691,7 +1745,13 @@ impl eframe::App for SectorApp {
                             let _ = std::fs::create_dir_all(parent);
                         }
                         match std::fs::write(&cp, &bytes) {
-                            Ok(()) => eprintln!("[sector] cache saved: {} ({} bytes)", cp.display(), bytes.len()),
+                            Ok(()) => {
+                                eprintln!("[sector] cache saved: {} ({} bytes)", cp.display(), bytes.len());
+                                // Keep the cache dir bounded (1 GiB), newest-first.
+                                if let Some(parent) = cp.parent() {
+                                    prune_cache_dir(parent, &cp, 1_073_741_824);
+                                }
+                            }
                             Err(e) => eprintln!("[sector] cache SAVE (write) FAILED: {e}"),
                         }
                     }

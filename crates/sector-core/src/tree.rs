@@ -32,6 +32,14 @@ pub struct CacheStats {
     pub saved_unix: u64,
 }
 
+/// Cache file framing: a 4-byte magic + little-endian u16 version prefix the
+/// postcard body. `postcard` is not self-describing, so without this an old or
+/// foreign file could deserialize into a nonsense tree instead of failing; the
+/// header lets [`Tree::from_cache_bytes`] reject anything it doesn't recognize.
+/// Bump `CACHE_VERSION` whenever the body layout changes.
+const CACHE_MAGIC: [u8; 4] = *b"SECT";
+const CACHE_VERSION: u16 = 1;
+
 /// On-disk cache format (v1). Struct-of-arrays of only the essential per-node
 /// fields; `children`, `subtree_size`, and `file_count` are rebuilt on load.
 #[derive(Serialize, Deserialize)]
@@ -288,13 +296,26 @@ impl Tree {
             c.kind.push(if matches!(node.kind, NodeKind::File) { 1 } else { 0 });
             c.own_size.push(node.own_size);
         }
-        postcard::to_stdvec(&c)
+        let body = postcard::to_stdvec(&c)?;
+        let mut out = Vec::with_capacity(CACHE_MAGIC.len() + 2 + body.len());
+        out.extend_from_slice(&CACHE_MAGIC);
+        out.extend_from_slice(&CACHE_VERSION.to_le_bytes());
+        out.extend_from_slice(&body);
+        Ok(out)
     }
 
     /// Rebuild a tree (and its stats) from cache bytes. Returns `None` if the
     /// bytes are malformed or from an incompatible version.
     pub fn from_cache_bytes(bytes: &[u8]) -> Option<(Tree, CacheStats)> {
-        let c: TreeCacheV1 = postcard::from_bytes(bytes).ok()?;
+        // Reject anything without our magic + matching version (old/foreign files).
+        let header = CACHE_MAGIC.len() + 2;
+        if bytes.len() < header
+            || bytes[..CACHE_MAGIC.len()] != CACHE_MAGIC
+            || u16::from_le_bytes([bytes[4], bytes[5]]) != CACHE_VERSION
+        {
+            return None;
+        }
+        let c: TreeCacheV1 = postcard::from_bytes(&bytes[header..]).ok()?;
         let n = c.name.len();
         if n == 0 || c.parent.len() != n || c.kind.len() != n || c.own_size.len() != n {
             return None;
@@ -476,6 +497,16 @@ mod tests {
         assert_eq!(r.path_components(users), vec!["C:", "Users"]);
         assert_eq!(rs.bytes, 300);
         assert_eq!(rs.saved_unix, 42);
+
+        // Hardening: the framed format carries the magic and rejects anything
+        // else — empty, junk, a headerless body, or a corrupted magic.
+        assert!(bytes.starts_with(b"SECT"));
+        assert!(Tree::from_cache_bytes(&[]).is_none());
+        assert!(Tree::from_cache_bytes(b"not a sector cache").is_none());
+        assert!(Tree::from_cache_bytes(&bytes[6..]).is_none()); // raw postcard body
+        let mut bad = bytes.clone();
+        bad[0] = b'X';
+        assert!(Tree::from_cache_bytes(&bad).is_none());
     }
 
     #[test]
