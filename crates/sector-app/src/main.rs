@@ -37,6 +37,22 @@ enum View {
     City,
 }
 
+/// Clipboard contents for cut/copy/paste (E5). `cut` = move on paste; otherwise
+/// copy. Holds paths (a Vec for future multi-select; currently one).
+struct Clipboard {
+    paths: Vec<PathBuf>,
+    cut: bool,
+}
+
+/// A paste running on a background thread.
+struct PasteJob {
+    rx: Receiver<Result<String, String>>,
+    cancel: Arc<AtomicBool>,
+    cut: bool,
+    /// Short description for the status line (e.g. "Copying “movie.mkv”").
+    desc: String,
+}
+
 /// A pending name-entry dialog (E4): create a folder, or rename an entry.
 enum PromptKind {
     NewFolder,
@@ -361,6 +377,12 @@ struct SectorApp {
     status_summary: String,
     /// An open New-folder / Rename dialog (E4), if any.
     prompt: Option<NamePrompt>,
+    /// Cut/copy clipboard (E5).
+    clipboard: Option<Clipboard>,
+    /// A paste running in the background, if any.
+    paste_job: Option<PasteJob>,
+    /// Transient error from the last edit/paste, shown in the footer.
+    op_error: Option<String>,
     /// True while the address bar has (or just lost) focus — suppresses the file
     /// list's Enter/Backspace shortcuts so they don't fight the address bar.
     addr_active: bool,
@@ -432,6 +454,9 @@ impl Default for SectorApp {
             last_title: String::new(),
             status_summary: String::new(),
             prompt: None,
+            clipboard: None,
+            paste_job: None,
+            op_error: None,
             cache_mtime: None,
             addr_active: false,
             addr_editing: false,
@@ -667,6 +692,7 @@ impl SectorApp {
         self.entries_dirty = true;
         self.selected = None;
         self.filter.clear();
+        self.op_error = None;
         self.sync_addr();
         self.sb_reveal();
     }
@@ -1008,6 +1034,58 @@ impl SectorApp {
         Some(f)
     }
 
+    // ---- Cut / copy / paste (E5) ----
+
+    /// Put the current selection on the clipboard (`cut` = move on paste).
+    fn clip_selected(&mut self, cut: bool) {
+        if let Some(name) = self.selected.and_then(|i| self.entries.get(i)).map(|e| e.name.clone()) {
+            self.clipboard = Some(Clipboard { paths: vec![self.current_dir.join(&name)], cut });
+            self.op_error = None;
+        }
+    }
+
+    /// Start pasting the clipboard into the current folder (background thread).
+    fn start_paste(&mut self) {
+        if self.paste_job.is_some() {
+            return; // one paste at a time
+        }
+        let Some(clip) = &self.clipboard else { return };
+        let dest_dir = self.current_dir.clone();
+        let sources = clip.paths.clone();
+        let cut = clip.cut;
+
+        // Validate on the UI thread (fast) before spawning the worker.
+        for src in &sources {
+            if src.is_dir() && (dest_dir == *src || dest_dir.starts_with(src)) {
+                self.op_error = Some("Can't paste a folder into itself.".into());
+                return;
+            }
+            if cut && src.parent() == Some(dest_dir.as_path()) {
+                self.op_error = Some("It's already in this folder.".into());
+                return;
+            }
+        }
+
+        let desc = {
+            let name = sources
+                .first()
+                .and_then(|p| p.file_name())
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let n = sources.len();
+            let what = if n > 1 { format!("{n} items") } else { format!("“{name}”") };
+            format!("{} {what}…", if cut { "Moving" } else { "Copying" })
+        };
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = channel();
+        let (c2, s2, d2) = (Arc::clone(&cancel), sources, dest_dir);
+        std::thread::spawn(move || {
+            let _ = tx.send(run_paste(s2, d2, cut, c2));
+        });
+        self.op_error = None;
+        self.paste_job = Some(PasteJob { rx, cancel, cut, desc });
+    }
+
     // ---- Folder-tree sidebar (E1b.2) ----
 
     /// Expand every ancestor of `current_dir` so the tree reveals where you are.
@@ -1299,15 +1377,44 @@ impl SectorApp {
                 }
                 s
             });
+            let mut cancel_paste = false;
+            let mut clear_err = false;
             egui::Panel::bottom("files_status").show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.weak(&self.status_summary);
-                    if let Some(d) = detail {
-                        ui.separator();
-                        ui.label(d);
+                    // A running paste takes over the footer with a spinner + Cancel.
+                    if let Some(job) = &self.paste_job {
+                        ui.spinner();
+                        ui.label(&job.desc);
+                        if ui.button("Cancel").clicked() {
+                            cancel_paste = true;
+                        }
+                    } else if let Some(err) = &self.op_error {
+                        ui.colored_label(egui::Color32::from_rgb(224, 108, 108), format!("⚠ {err}"));
+                        if ui.button("✕").on_hover_text("Dismiss").clicked() {
+                            clear_err = true;
+                        }
+                    } else {
+                        ui.weak(&self.status_summary);
+                        if let Some(d) = detail {
+                            ui.separator();
+                            ui.label(d);
+                        }
+                        if self.clipboard.is_some() {
+                            ui.separator();
+                            let cut = self.clipboard.as_ref().map(|c| c.cut).unwrap_or(false);
+                            ui.weak(if cut { "✂ 1 cut" } else { "⎘ 1 copied" });
+                        }
                     }
                 });
             });
+            if cancel_paste {
+                if let Some(job) = &self.paste_job {
+                    job.cancel.store(true, Ordering::Relaxed);
+                }
+            }
+            if clear_err {
+                self.op_error = None;
+            }
         }
 
         egui::CentralPanel::default().show(ui, |ui| {
@@ -1333,12 +1440,22 @@ impl SectorApp {
             let cur = self.current_dir.clone();
             let (sort_key, sort_asc) = (self.sort_key, self.sort_asc);
             let scroll_target = self.scroll_target.take();
+            // The path of a cut item (dimmed in the list).
+            let cut_path: Option<PathBuf> = self
+                .clipboard
+                .as_ref()
+                .filter(|c| c.cut)
+                .and_then(|c| c.paths.first().cloned());
             let mut new_selected = self.selected;
             let mut nav_target: Option<PathBuf> = None;
             let mut new_sort: Option<SortKey> = None;
             let mut rename_req: Option<String> = None;
             let mut new_folder_req = false;
             let mut props_req = false;
+            let mut copy_req = false;
+            let mut cut_req = false;
+            let mut paste_req = false;
+            let can_paste = self.clipboard.is_some() && self.paste_job.is_none();
 
             let arrow = |k: SortKey| {
                 if k == sort_key {
@@ -1393,6 +1510,7 @@ impl SectorApp {
                         // File-type color, shared with the City palette so the two
                         // views read the same. Folders keep the folder glyph.
                         let cat = (!e.is_dir).then(|| categorize(&e.name));
+                        let is_cut = cut_path.as_ref().map(|p| *p == cur.join(&e.name)).unwrap_or(false);
                         row.set_selected(new_selected == Some(row.index()));
                         row.col(|ui| {
                             ui.horizontal(|ui| {
@@ -1405,7 +1523,12 @@ impl SectorApp {
                                         ui.colored_label(category_color(c), "●");
                                     }
                                 }
-                                ui.label(&e.name);
+                                // A cut item is dimmed until the paste completes.
+                                if is_cut {
+                                    ui.weak(&e.name);
+                                } else {
+                                    ui.label(&e.name);
+                                }
                             });
                         });
                         row.col(|ui| {
@@ -1476,6 +1599,19 @@ impl SectorApp {
                                 ui.close();
                             }
                             ui.separator();
+                            if ui.button("Copy").clicked() {
+                                copy_req = true;
+                                ui.close();
+                            }
+                            if ui.button("Cut").clicked() {
+                                cut_req = true;
+                                ui.close();
+                            }
+                            if ui.add_enabled(can_paste, egui::Button::new("Paste")).clicked() {
+                                paste_req = true;
+                                ui.close();
+                            }
+                            ui.separator();
                             if ui.button("Rename…").clicked() {
                                 rename_req = Some(e.name.clone());
                                 ui.close();
@@ -1523,6 +1659,16 @@ impl SectorApp {
             if props_req {
                 self.props_visible = true;
             }
+            // self.selected was just set to the right-clicked row above.
+            if copy_req {
+                self.clip_selected(false);
+            }
+            if cut_req {
+                self.clip_selected(true);
+            }
+            if paste_req {
+                self.start_paste();
+            }
         });
 
         // Keyboard parity with Explorer: F5 refreshes; arrows/Home/End/PageUp/Down
@@ -1560,6 +1706,17 @@ impl SectorApp {
             }
             if ui.input(|i| i.modifiers.ctrl && i.modifiers.shift && i.key_pressed(egui::Key::N)) {
                 self.open_new_folder();
+            }
+            // Ctrl+C copy, Ctrl+X cut, Ctrl+V paste (not Shift, to avoid clashing
+            // with Ctrl+Shift+N).
+            if ui.input(|i| i.modifiers.ctrl && !i.modifiers.shift && i.key_pressed(egui::Key::C)) {
+                self.clip_selected(false);
+            }
+            if ui.input(|i| i.modifiers.ctrl && !i.modifiers.shift && i.key_pressed(egui::Key::X)) {
+                self.clip_selected(true);
+            }
+            if ui.input(|i| i.modifiers.ctrl && !i.modifiers.shift && i.key_pressed(egui::Key::V)) {
+                self.start_paste();
             }
             if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                 if ui.input(|i| i.modifiers.alt) {
@@ -1873,6 +2030,108 @@ fn open_path(path: &std::path::Path) {
 #[cfg(not(target_os = "windows"))]
 fn open_path(_path: &std::path::Path) {}
 
+/// A non-clashing destination path in `dir` for `name`: `name`, else
+/// `name - Copy`, `name - Copy (2)`, … inserting the suffix before the
+/// extension. Guarantees a FRESH path — paste never overwrites existing data.
+fn unique_dest(dir: &Path, name: &str) -> PathBuf {
+    let first = dir.join(name);
+    if !first.exists() {
+        return first;
+    }
+    let p = Path::new(name);
+    let stem = p
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| name.to_string());
+    let ext = p.extension().map(|e| e.to_string_lossy().into_owned());
+    let make = |suffix: &str| -> PathBuf {
+        let n = match &ext {
+            Some(e) => format!("{stem}{suffix}.{e}"),
+            None => format!("{stem}{suffix}"),
+        };
+        dir.join(n)
+    };
+    let c = make(" - Copy");
+    if !c.exists() {
+        return c;
+    }
+    for i in 2..100_000 {
+        let c = make(&format!(" - Copy ({i})"));
+        if !c.exists() {
+            return c;
+        }
+    }
+    make(&format!(" - Copy ({})", now_unix()))
+}
+
+/// Recursively copy `src` to a fresh `dst`, aborting if `cancel` is set. Files
+/// use `fs::copy`; directories are created and their contents copied. Assumes
+/// `dst` does not already exist (see [`unique_dest`]).
+fn copy_any(src: &Path, dst: &Path, cancel: &AtomicBool) -> std::io::Result<()> {
+    if cancel.load(Ordering::Relaxed) {
+        return Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "cancelled"));
+    }
+    // symlink_metadata: classify the entry itself, don't follow a directory link.
+    let md = std::fs::symlink_metadata(src)?;
+    if md.is_dir() {
+        std::fs::create_dir(dst)?;
+        for entry in std::fs::read_dir(src)? {
+            let entry = entry?;
+            copy_any(&entry.path(), &dst.join(entry.file_name()), cancel)?;
+        }
+        Ok(())
+    } else {
+        std::fs::copy(src, dst).map(|_| ())
+    }
+}
+
+/// Remove a path whether it's a file or a directory tree (best-effort).
+fn remove_any(path: &Path) {
+    let _ = if path.is_dir() {
+        std::fs::remove_dir_all(path)
+    } else {
+        std::fs::remove_file(path)
+    };
+}
+
+/// Worker body for a paste: copy or move each source into `dest_dir` (each to a
+/// unique, non-overwriting destination). For Cut, tries an atomic rename first
+/// and falls back to copy-then-delete across volumes — the source is removed
+/// ONLY after its copy fully succeeds. On any failure the partial destination is
+/// cleaned up (always a fresh path). Returns the last pasted name.
+fn run_paste(
+    sources: Vec<PathBuf>,
+    dest_dir: PathBuf,
+    cut: bool,
+    cancel: Arc<AtomicBool>,
+) -> Result<String, String> {
+    let mut last = String::new();
+    for src in &sources {
+        let name = match src.file_name() {
+            Some(n) => n.to_string_lossy().into_owned(),
+            None => return Err("Invalid source path.".to_string()),
+        };
+        let dst = unique_dest(&dest_dir, &name);
+        let result: std::io::Result<()> = if cut {
+            match std::fs::rename(src, &dst) {
+                Ok(()) => Ok(()), // atomic, same volume
+                Err(_) => copy_any(src, &dst, &cancel).map(|()| {
+                    remove_any(src); // safe: the copy fully succeeded
+                }),
+            }
+        } else {
+            copy_any(src, &dst, &cancel)
+        };
+        if let Err(e) = result {
+            remove_any(&dst); // clean up the partial (fresh) destination
+            let verb = if cut { "Move" } else { "Copy" };
+            return Err(format!("{verb} failed: {e}"));
+        }
+        last = dst.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or(name);
+    }
+    Ok(last)
+}
+
 /// Enumerate drive roots for the folder-tree sidebar. Uses `GetLogicalDrives`
 /// (a kernel bitmask — no per-drive I/O), so a mapped-but-disconnected network
 /// drive can't stall the first paint the way probing `metadata()` on it would,
@@ -1985,6 +2244,37 @@ impl eframe::App for SectorApp {
             // subfolder sizes in the list.
             self.recompute_folder_sizes();
             self.refresh_status_summary();
+        }
+
+        // Poll a background paste (E5) for completion.
+        let mut paste_done: Option<Result<String, String>> = None;
+        let mut paste_was_cut = false;
+        if let Some(job) = &self.paste_job {
+            match job.rx.try_recv() {
+                Ok(r) => {
+                    paste_done = Some(r);
+                    paste_was_cut = job.cut;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => ctx.request_repaint(),
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    paste_done = Some(Err("Paste worker stopped unexpectedly.".into()));
+                }
+            }
+        }
+        if let Some(result) = paste_done {
+            self.paste_job = None;
+            match result {
+                Ok(name) => {
+                    if paste_was_cut {
+                        self.clipboard = None; // a cut is consumed by the paste
+                    }
+                    self.entries_dirty = true;
+                    self.sb_cache.clear();
+                    self.select_after_reload = Some((self.current_dir.clone(), name));
+                    self.op_error = None;
+                }
+                Err(e) => self.op_error = Some(e),
+            }
         }
 
         // ---- Shared nav: mode toggle + back/forward/up + address bar -------
@@ -2464,6 +2754,74 @@ impl eframe::App for SectorApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn scratch(tag: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let d = std::env::temp_dir().join(format!(
+            "sector-paste-{}-{}-{}",
+            tag,
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn unique_dest_never_clashes() {
+        let d = scratch("uniq");
+        assert_eq!(unique_dest(&d, "a.txt"), d.join("a.txt")); // free
+        std::fs::write(d.join("a.txt"), b"x").unwrap();
+        assert_eq!(unique_dest(&d, "a.txt"), d.join("a - Copy.txt")); // clash → suffix before ext
+        std::fs::write(d.join("a - Copy.txt"), b"x").unwrap();
+        assert_eq!(unique_dest(&d, "a.txt"), d.join("a - Copy (2).txt"));
+        // No-extension (folder) name.
+        std::fs::create_dir(d.join("dir")).unwrap();
+        assert_eq!(unique_dest(&d, "dir"), d.join("dir - Copy"));
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn paste_copy_preserves_source_and_never_overwrites() {
+        let d = scratch("copy");
+        // A folder tree to copy.
+        std::fs::create_dir(d.join("src")).unwrap();
+        std::fs::write(d.join("src/f.txt"), b"hello").unwrap();
+        std::fs::create_dir(d.join("src/sub")).unwrap();
+        std::fs::write(d.join("src/sub/g.bin"), vec![7u8; 10]).unwrap();
+        let dest = d.join("dest");
+        std::fs::create_dir(&dest).unwrap();
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let name = run_paste(vec![d.join("src")], dest.clone(), false, cancel.clone()).unwrap();
+        assert_eq!(name, "src");
+        assert!(d.join("src/f.txt").exists()); // source preserved (copy)
+        assert_eq!(std::fs::read(dest.join("src/f.txt")).unwrap(), b"hello");
+        assert!(dest.join("src/sub/g.bin").exists());
+
+        // Paste again → must NOT overwrite; lands as "src - Copy".
+        let name2 = run_paste(vec![d.join("src")], dest.clone(), false, cancel).unwrap();
+        assert_eq!(name2, "src - Copy");
+        assert!(dest.join("src/f.txt").exists()); // first copy untouched
+        assert!(dest.join("src - Copy/f.txt").exists());
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn paste_cut_moves_and_removes_source() {
+        let d = scratch("cut");
+        std::fs::write(d.join("m.txt"), b"data").unwrap();
+        let dest = d.join("dest");
+        std::fs::create_dir(&dest).unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let name = run_paste(vec![d.join("m.txt")], dest.clone(), true, cancel).unwrap();
+        assert_eq!(name, "m.txt");
+        assert!(!d.join("m.txt").exists()); // source gone (moved)
+        assert_eq!(std::fs::read(dest.join("m.txt")).unwrap(), b"data");
+        std::fs::remove_dir_all(&d).ok();
+    }
 
     #[test]
     fn datetime_known_values() {
