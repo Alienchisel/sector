@@ -476,3 +476,23 @@ address. It also removes the confusing dual-path state (Files at `C:\`, City at
 Files then toggling to City currently re-loads that folder's own cache rather than
 re-rooting the already-loaded parent tree. Correct and instant (per-folder cache),
 just not maximally clever; a find-node-by-path optimization can come later.
+
+## D19 — Layout: tree in Files only, City full-bleed
+
+**Decision.** The folder-tree sidebar (E1b.2) lives **only in the Files view**.
+The City view is **full-bleed** — no sidebar — and you navigate it in its own
+idiom (click a district to drill, breadcrumb to climb, address bar to jump).
+
+**Why.** *Tree = navigation; the Files/City toggle = representation.* They're
+orthogonal, so the tree doesn't make either content pane redundant — you still
+need one pane to draw the folder, and list-vs-city answer different questions:
+
+- **Files (list)** = *"what exactly is in here?"* — names, exact sizes, dates,
+  sortable, selectable; the surface you **work on** (Open / rename / delete).
+- **City** = *"where did the space and file-count go — what's the shape?"* — the
+  surface you **read**.
+
+Bolting a tree onto the City would make it a list-view's chrome wrapped around a
+picture, instead of a committed spatial map. Keeping the tree with the working
+view gives each mode a crisp reason to exist: **Files is for working, City is for
+seeing.** ("for now" — a later split/side-by-side layout isn't foreclosed.)
