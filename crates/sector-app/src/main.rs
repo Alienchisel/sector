@@ -3293,13 +3293,14 @@ impl eframe::App for SectorApp {
             let modal = egui::Modal::new(egui::Id::new("sector_delete_confirm")).show(&ctx, |ui| {
                 ui.set_width(380.0);
                 if permanent {
-                    ui.strong("Permanently delete?");
+                    ui.strong("Delete from network drive?");
                     ui.add_space(6.0);
                     ui.colored_label(
-                        egui::Color32::from_rgb(224, 108, 108),
+                        egui::Color32::from_rgb(230, 170, 80),
                         format!(
-                            "⚠ {what} on a network drive will be PERMANENTLY deleted — \
-                             network drives have no Recycle Bin, so this can't be undone."
+                            "⚠ {what} won't go to the Windows Recycle Bin. If your NAS keeps its \
+                             own (e.g. Synology's #recycle), it may be recoverable there — \
+                             otherwise this is permanent."
                         ),
                     );
                 } else {
@@ -3309,7 +3310,7 @@ impl eframe::App for SectorApp {
                 }
                 ui.add_space(10.0);
                 ui.horizontal(|ui| {
-                    let label = if permanent { "Delete permanently" } else { "Move to Recycle Bin" };
+                    let label = if permanent { "Delete" } else { "Move to Recycle Bin" };
                     if ui.button(label).clicked() {
                         confirm = true;
                     }
