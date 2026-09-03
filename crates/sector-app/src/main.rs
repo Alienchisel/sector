@@ -1295,8 +1295,25 @@ impl SectorApp {
         let mut navigate = false;
         ui.horizontal(|ui| {
             ui.add_space(depth as f32 * 12.0);
-            let tri = if open { "▾" } else { "▸" };
-            if ui.add(egui::Button::new(tri).frame(false)).clicked() {
+            // Painted disclosure triangle (a font glyph like ▸ renders as a
+            // missing-glyph box in egui's bundled font).
+            let (rect, resp) =
+                ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::click());
+            let c = rect.center();
+            let color = if resp.hovered() {
+                ui.visuals().strong_text_color()
+            } else {
+                ui.visuals().weak_text_color()
+            };
+            let pts = if open {
+                // pointing down
+                vec![c + Vec2::new(-4.0, -2.0), c + Vec2::new(4.0, -2.0), c + Vec2::new(0.0, 3.0)]
+            } else {
+                // pointing right
+                vec![c + Vec2::new(-2.0, -4.0), c + Vec2::new(-2.0, 4.0), c + Vec2::new(3.0, 0.0)]
+            };
+            ui.painter().add(egui::Shape::convex_polygon(pts, color, Stroke::NONE));
+            if resp.clicked() {
                 toggle = true;
             }
             if ui.selectable_label(is_current, format!("🗀 {name}")).clicked() {
