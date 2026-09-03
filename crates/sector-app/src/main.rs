@@ -216,6 +216,8 @@ struct SectorApp {
     sort_key: SortKey,
     sort_asc: bool,
     selected: Option<usize>,
+    /// When set, scroll the file table to this row next build (keyboard nav).
+    scroll_target: Option<usize>,
     /// True while the address bar has (or just lost) focus — suppresses the file
     /// list's Enter/Backspace shortcuts so they don't fight the address bar.
     addr_active: bool,
@@ -268,6 +270,7 @@ impl Default for SectorApp {
             sort_key: SortKey::Name,
             sort_asc: true,
             selected: None,
+            scroll_target: None,
             addr_active: false,
             sb_visible: true,
             sb_roots: Vec::new(),
@@ -724,6 +727,7 @@ impl SectorApp {
             let entries = std::mem::take(&mut self.entries);
             let cur = self.current_dir.clone();
             let (sort_key, sort_asc) = (self.sort_key, self.sort_asc);
+            let scroll_target = self.scroll_target.take();
             let mut new_selected = self.selected;
             let mut nav_target: Option<PathBuf> = None;
             let mut new_sort: Option<SortKey> = None;
@@ -748,13 +752,17 @@ impl SectorApp {
                 }
             };
 
-            TableBuilder::new(ui)
+            let mut table = TableBuilder::new(ui)
                 .striped(true)
                 .sense(Sense::click())
                 .column(Column::remainder().at_least(220.0).clip(true))
                 .column(Column::auto().at_least(90.0))
                 .column(Column::auto().at_least(90.0))
-                .column(Column::auto().at_least(90.0))
+                .column(Column::auto().at_least(90.0));
+            if let Some(row) = scroll_target {
+                table = table.scroll_to_row(row, None);
+            }
+            table
                 .header(22.0, |mut h| {
                     h.col(|ui| header_cell(ui, format!("Name{}", arrow(SortKey::Name)), &mut new_sort, SortKey::Name));
                     h.col(|ui| header_cell(ui, format!("Size{}", arrow(SortKey::Size)), &mut new_sort, SortKey::Size));
@@ -764,18 +772,36 @@ impl SectorApp {
                 .body(|body| {
                     body.rows(20.0, entries.len(), |mut row| {
                         let e = &entries[row.index()];
+                        // File-type color, shared with the City palette so the two
+                        // views read the same. Folders keep the folder glyph.
+                        let cat = (!e.is_dir).then(|| categorize(&e.name));
                         row.set_selected(new_selected == Some(row.index()));
                         row.col(|ui| {
-                            let icon = if e.is_dir { "📁" } else { "📄" };
-                            ui.label(format!("{icon}  {}", e.name));
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 6.0;
+                                match cat {
+                                    None => {
+                                        ui.label("📁");
+                                    }
+                                    Some(c) => {
+                                        ui.colored_label(category_color(c), "●");
+                                    }
+                                }
+                                ui.label(&e.name);
+                            });
                         });
                         row.col(|ui| {
                             if !e.is_dir {
                                 ui.monospace(human_size(e.size));
                             }
                         });
-                        row.col(|ui| {
-                            ui.label(entry_kind(e));
+                        row.col(|ui| match cat {
+                            None => {
+                                ui.weak("Folder");
+                            }
+                            Some(c) => {
+                                ui.colored_label(category_color(c), c.label());
+                            }
                         });
                         row.col(|ui| {
                             if let Some(m) = e.modified {
@@ -849,10 +875,17 @@ impl SectorApp {
             }
         });
 
-        // Keyboard parity with Explorer: Enter opens the selection, Backspace
-        // goes up — but never while the address bar owns the keyboard.
+        // Keyboard parity with Explorer: F5 refreshes; arrows/Home/End/PageUp/Down
+        // move the selection; Enter opens it; Backspace goes up — but never while
+        // the address bar owns the keyboard (F5 there would wipe in-progress text).
         let typing = self.addr_active || ui.ctx().memory(|m| m.focused()).is_some();
         if !typing {
+            // F5: re-read the current folder AND drop the (lazy) tree cache, so
+            // on-disk changes show without a restart.
+            if ui.input(|i| i.key_pressed(egui::Key::F5)) {
+                self.entries_dirty = true;
+                self.sb_cache.clear();
+            }
             if ui.input(|i| i.key_pressed(egui::Key::Backspace)) {
                 self.go_up();
             }
@@ -867,6 +900,40 @@ impl SectorApp {
                     } else {
                         open_path(&full);
                     }
+                }
+            }
+
+            // Move the selection with the keyboard (and scroll it into view).
+            let n = self.entries.len();
+            if n > 0 {
+                const PAGE: usize = 12;
+                let cur = self.selected;
+                let mut moved = cur;
+                ui.input(|i| {
+                    use egui::Key;
+                    if i.key_pressed(Key::ArrowDown) {
+                        moved = Some(cur.map_or(0, |c| (c + 1).min(n - 1)));
+                    }
+                    if i.key_pressed(Key::ArrowUp) {
+                        moved = Some(cur.map_or(0, |c| c.saturating_sub(1)));
+                    }
+                    if i.key_pressed(Key::PageDown) {
+                        moved = Some(cur.map_or(0, |c| (c + PAGE).min(n - 1)));
+                    }
+                    if i.key_pressed(Key::PageUp) {
+                        moved = Some(cur.map_or(0, |c| c.saturating_sub(PAGE)));
+                    }
+                    if i.key_pressed(Key::Home) {
+                        moved = Some(0);
+                    }
+                    if i.key_pressed(Key::End) {
+                        moved = Some(n - 1);
+                    }
+                });
+                if moved != cur {
+                    self.selected = moved;
+                    self.scroll_target = moved;
+                    ui.ctx().request_repaint();
                 }
             }
         }
