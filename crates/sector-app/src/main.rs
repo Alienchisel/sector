@@ -1246,7 +1246,25 @@ impl SectorApp {
         }
         let (tx, rx) = channel();
         std::thread::spawn(move || {
-            let result = trash::delete_all(&paths).map_err(|e| format!("Couldn't delete: {e}"));
+            let mut errors: Vec<String> = Vec::new();
+            for p in &paths {
+                // Network drives have no Recycle Bin — the trash op fails there,
+                // so delete permanently (the user confirmed a permanent delete).
+                let res: Result<(), String> = if is_network_path(p) {
+                    remove_any(p).map_err(|e| e.to_string())
+                } else {
+                    trash::delete(p).map_err(|e| e.to_string())
+                };
+                if let Err(e) = res {
+                    let name = p.file_name().map(|n| n.to_string_lossy().into_owned());
+                    errors.push(format!("{}: {e}", name.unwrap_or_default()));
+                }
+            }
+            let result = if errors.is_empty() {
+                Ok(())
+            } else {
+                Err(format!("Couldn't delete: {}", errors.join("; ")))
+            };
             let _ = tx.send(result);
         });
         self.op_error = None;
