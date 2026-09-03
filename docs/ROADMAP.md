@@ -229,16 +229,18 @@ toggle. Live per-folder navigation is the new spine; the cityscape (Steps 0–4)
 becomes the "City" mode. Built incrementally on the working visualizer,
 safest-first — destructive ops must be bulletproof (see D16, D1).
 
-- **E1 — Live navigation + list view  ☐** (read-only skeleton): browse folders
+- **E1 — Live navigation + list view** (read-only skeleton): browse folders
   live (`read_dir` the current folder), a details list (name, size, type, date),
   sortable; address bar, back/forward/up, folder-tree sidebar. *This is the new
-  default view.*
-- **E2 — List / City toggle  ☐**: switch the content area to the cityscape for
-  the current folder/drive (wraps today's scan+render+cache). Click a block →
-  navigate there. **Auto-load the cache** on opening a drive (instant big-picture)
-  with an explicit **Rescan** button to refresh (freshness strategy: D17).
-- **E3 — Read-only actions  ☐**: open (default app), reveal in Explorer, copy
-  path, properties.
+  default view.* — **E1a ✅** (data layer) · **E1b.1 ✅** (shell + list) ·
+  **E1b.2 ☐** (folder-tree sidebar — Files view only, per D19).
+- **E2 — List / City toggle  ✅**: one shared location (`current_dir`) drives both
+  views; the City visualizes the folder you're browsing — instant cache-load if
+  present, else a scan-prompt; drilling in the City syncs back to Files. See D18.
+- **E3 — Read-only actions  ✅**: double-click / Enter opens (default app for
+  files, in-app navigate for folders), right-click menu (Open · Reveal/Open in
+  Explorer · Copy path · Copy name), Backspace = up. *Properties dialog deferred
+  — needs a ShellExecute call via the `windows` crate.*
 - **E4 — Non-destructive edits  ☐**: new folder, rename.
 - **E5 — Destructive ops (careful)  ☐**: delete → Recycle Bin, copy/move with
   conflict handling, cut/paste — with confirmations and error handling.

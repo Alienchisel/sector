@@ -213,6 +213,9 @@ struct SectorApp {
     sort_key: SortKey,
     sort_asc: bool,
     selected: Option<usize>,
+    /// True while the address bar has (or just lost) focus — suppresses the file
+    /// list's Enter/Backspace shortcuts so they don't fight the address bar.
+    addr_active: bool,
     /// The path the loaded City tree is rooted at (its scan/cache-load target).
     city_root: Option<PathBuf>,
     /// The location the City view currently represents (root, or a drilled-in
@@ -253,6 +256,7 @@ impl Default for SectorApp {
             sort_key: SortKey::Name,
             sort_asc: true,
             selected: None,
+            addr_active: false,
             city_root: None,
             city_synced_dir: None,
         }
@@ -534,6 +538,9 @@ impl SectorApp {
             self.go_up();
         }
         let r = ui.add(egui::TextEdit::singleline(&mut self.addr_edit).desired_width(f32::INFINITY));
+        // Remember whether the address bar owns the keyboard this frame, so the
+        // file list won't also act on Enter/Backspace.
+        self.addr_active = r.has_focus() || r.lost_focus();
         if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
             let p = PathBuf::from(self.addr_edit.trim());
             self.navigate_to(p);
@@ -625,13 +632,44 @@ impl SectorApp {
                                 ui.weak(humanize_age(m));
                             }
                         });
+                        let full = cur.join(&e.name);
                         let resp = row.response();
                         if resp.clicked() {
                             new_selected = Some(row.index());
                         }
-                        if resp.double_clicked() && e.is_dir {
-                            nav_target = Some(cur.join(&e.name));
+                        if resp.double_clicked() {
+                            if e.is_dir {
+                                nav_target = Some(full.clone());
+                            } else {
+                                open_path(&full);
+                            }
                         }
+                        resp.context_menu(|ui| {
+                            new_selected = Some(row.index());
+                            if ui.button("Open").clicked() {
+                                if e.is_dir {
+                                    nav_target = Some(full.clone()); // enter it in SECTOR
+                                } else {
+                                    open_path(&full); // launch its default app
+                                }
+                                ui.close();
+                            }
+                            let reveal_label =
+                                if e.is_dir { "Open in Explorer" } else { "Reveal in Explorer" };
+                            if ui.button(reveal_label).clicked() {
+                                reveal_in_explorer(&full, e.is_dir);
+                                ui.close();
+                            }
+                            ui.separator();
+                            if ui.button("Copy path").clicked() {
+                                ui.ctx().copy_text(full.to_string_lossy().into_owned());
+                                ui.close();
+                            }
+                            if ui.button("Copy name").clicked() {
+                                ui.ctx().copy_text(e.name.clone());
+                                ui.close();
+                            }
+                        });
                     });
                 });
 
@@ -651,6 +689,28 @@ impl SectorApp {
                 self.navigate_to(t);
             }
         });
+
+        // Keyboard parity with Explorer: Enter opens the selection, Backspace
+        // goes up — but never while the address bar owns the keyboard.
+        let typing = self.addr_active || ui.ctx().memory(|m| m.focused()).is_some();
+        if !typing {
+            if ui.input(|i| i.key_pressed(egui::Key::Backspace)) {
+                self.go_up();
+            }
+            if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                let action = self
+                    .selected
+                    .and_then(|i| self.entries.get(i))
+                    .map(|e| (self.current_dir.join(&e.name), e.is_dir));
+                if let Some((full, is_dir)) = action {
+                    if is_dir {
+                        self.navigate_to(full);
+                    } else {
+                        open_path(&full);
+                    }
+                }
+            }
+        }
     }
 
     /// Ancestors of `root`, from the tree root down to `root` (for the breadcrumb).
@@ -892,6 +952,17 @@ fn reveal_in_explorer(path: &std::path::Path, is_dir: bool) {
 }
 #[cfg(not(target_os = "windows"))]
 fn reveal_in_explorer(_path: &std::path::Path, _is_dir: bool) {}
+
+/// Open a file/folder with its default handler — the double-click behaviour.
+/// `explorer <path>` shell-executes files (default app) and opens folders, with
+/// no console-window flash. (Some rare file types may need a fuller ShellExecute;
+/// that's a later upgrade.)
+#[cfg(target_os = "windows")]
+fn open_path(path: &std::path::Path) {
+    let _ = std::process::Command::new("explorer").arg(path.as_os_str()).spawn();
+}
+#[cfg(not(target_os = "windows"))]
+fn open_path(_path: &std::path::Path) {}
 
 /// Hand-drawn tooltip near the cursor. egui's widget tooltip anchors to the
 /// widget rect — our widget is the whole panel, so it would land in the corner;
