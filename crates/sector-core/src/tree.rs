@@ -206,6 +206,23 @@ impl Tree {
         (0..self.nodes.len() as u32).map(NodeId)
     }
 
+    /// Walk from `start` following `components` by name (ASCII-case-insensitive,
+    /// matching Windows), returning the node reached or `None` if the path leaves
+    /// the tree. Empty `components` returns `start`. Lets a caller locate the node
+    /// for a folder path within a scanned subtree (e.g. to read its size).
+    pub fn find_descendant(&self, start: NodeId, components: &[&str]) -> Option<NodeId> {
+        let mut cur = start;
+        for comp in components {
+            let next = self
+                .children(cur)
+                .iter()
+                .copied()
+                .find(|&c| self.node(c).name.eq_ignore_ascii_case(comp))?;
+            cur = next;
+        }
+        Some(cur)
+    }
+
     /// Reconstruct the path to `id` as a vector of components, root first.
     ///
     /// OS-agnostic: the caller joins these with the platform separator (`\\` on
@@ -507,6 +524,20 @@ mod tests {
         let mut bad = bytes.clone();
         bad[0] = b'X';
         assert!(Tree::from_cache_bytes(&bad).is_none());
+    }
+
+    #[test]
+    fn find_descendant_walks_by_name() {
+        let mut t = Tree::new("C:");
+        let users = t.add_child(Tree::ROOT, "Users", NodeKind::Dir, 0);
+        let docs = t.add_child(users, "Docs", NodeKind::Dir, 0);
+
+        assert_eq!(t.find_descendant(Tree::ROOT, &[]), Some(Tree::ROOT));
+        assert_eq!(t.find_descendant(Tree::ROOT, &["Users"]), Some(users));
+        // Case-insensitive (matches Windows).
+        assert_eq!(t.find_descendant(Tree::ROOT, &["users", "docs"]), Some(docs));
+        // A component that isn't there ends the walk.
+        assert_eq!(t.find_descendant(Tree::ROOT, &["Users", "Nope"]), None);
     }
 
     #[test]

@@ -260,6 +260,10 @@ struct SectorApp {
     selected: Option<usize>,
     /// When set, scroll the file table to this row next build (keyboard nav).
     scroll_target: Option<usize>,
+    /// Subtree sizes for the current folder's SUBFOLDERS (lowercased name → bytes),
+    /// derived from an in-memory scan tree that covers this folder — so the list's
+    /// Size column can show folder sizes. `None` when no scan covers it.
+    folder_sizes: Option<HashMap<String, u64>>,
     /// True while the address bar has (or just lost) focus — suppresses the file
     /// list's Enter/Backspace shortcuts so they don't fight the address bar.
     addr_active: bool,
@@ -313,6 +317,7 @@ impl Default for SectorApp {
             sort_asc: true,
             selected: None,
             scroll_target: None,
+            folder_sizes: None,
             addr_active: false,
             sb_visible: true,
             sb_roots: Vec::new(),
@@ -489,6 +494,7 @@ impl SectorApp {
             stats: Some(stats),
             started: Instant::now(),
         };
+        self.recompute_folder_sizes(); // the tree now covers this folder
         true
     }
 
@@ -565,6 +571,20 @@ impl SectorApp {
         }
     }
 
+    /// The size to sort/show for an entry: files use their own size; folders use
+    /// their scanned subtree size when one is known (else 0).
+    fn entry_size(&self, e: &Entry) -> u64 {
+        if e.is_dir {
+            self.folder_sizes
+                .as_ref()
+                .and_then(|m| m.get(&e.name.to_lowercase()))
+                .copied()
+                .unwrap_or(0)
+        } else {
+            e.size
+        }
+    }
+
     fn sort_entries(&self, es: &mut [Entry]) {
         let (key, asc) = (self.sort_key, self.sort_asc);
         es.sort_by(|a, b| {
@@ -572,7 +592,7 @@ impl SectorApp {
             b.is_dir.cmp(&a.is_dir).then_with(|| {
                 let o = match key {
                     SortKey::Name => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
-                    SortKey::Size => a.size.cmp(&b.size),
+                    SortKey::Size => self.entry_size(a).cmp(&self.entry_size(b)),
                     SortKey::Kind => entry_kind(a).cmp(&entry_kind(b)),
                     SortKey::Modified => a.modified.cmp(&b.modified),
                 };
@@ -586,6 +606,8 @@ impl SectorApp {
     }
 
     fn reload_entries(&mut self) {
+        // Refresh folder sizes first so the initial sort (by Size) can use them.
+        self.recompute_folder_sizes();
         match list_dir(&self.current_dir) {
             Ok(mut es) => {
                 self.sort_entries(&mut es);
@@ -599,6 +621,37 @@ impl SectorApp {
         }
         self.addr_edit = self.current_dir.to_string_lossy().into_owned();
         self.entries_dirty = false;
+    }
+
+    /// Recompute [`Self::folder_sizes`] for the current folder from an in-memory
+    /// scan tree that covers it (the City's loaded/cached tree). Cheap — a lock,
+    /// a shallow name-walk, and a small map over the immediate subfolders. Leaves
+    /// it `None` when no completed scan covers `current_dir`.
+    fn recompute_folder_sizes(&mut self) {
+        self.folder_sizes = self.compute_folder_sizes();
+    }
+
+    fn compute_folder_sizes(&self) -> Option<HashMap<String, u64>> {
+        let ScanState::Running { tree, stats: Some(_), .. } = &self.scan else {
+            return None;
+        };
+        let root = self.city_root.as_ref()?;
+        let rel = self.current_dir.strip_prefix(root).ok()?;
+        let comps: Vec<String> = rel
+            .components()
+            .filter_map(|c| c.as_os_str().to_str().map(str::to_owned))
+            .collect();
+        let refs: Vec<&str> = comps.iter().map(String::as_str).collect();
+        let t = tree.lock().ok()?;
+        let node = t.find_descendant(Tree::ROOT, &refs)?;
+        let mut map = HashMap::new();
+        for &child in t.children(node) {
+            let n = t.node(child);
+            if n.kind == NodeKind::Dir {
+                map.insert(n.name.to_lowercase(), n.subtree_size);
+            }
+        }
+        Some(map)
     }
 
     // ---- Folder-tree sidebar (E1b.2) ----
@@ -779,6 +832,7 @@ impl SectorApp {
             // Move entries out of self so the table closures don't fight the
             // borrow checker; deferred mutations are applied after.
             let entries = std::mem::take(&mut self.entries);
+            let folder_sizes = self.folder_sizes.take();
             let cur = self.current_dir.clone();
             let (sort_key, sort_asc) = (self.sort_key, self.sort_asc);
             let scroll_target = self.scroll_target.take();
@@ -845,7 +899,15 @@ impl SectorApp {
                             });
                         });
                         row.col(|ui| {
-                            if !e.is_dir {
+                            if e.is_dir {
+                                // Folder size from a covering scan, if we have one.
+                                if let Some(sz) = folder_sizes
+                                    .as_ref()
+                                    .and_then(|m| m.get(&e.name.to_lowercase()))
+                                {
+                                    ui.monospace(human_size(*sz));
+                                }
+                            } else {
                                 ui.monospace(human_size(e.size));
                             }
                         });
@@ -905,6 +967,7 @@ impl SectorApp {
 
             // Restore entries and apply deferred mutations.
             self.entries = entries;
+            self.folder_sizes = folder_sizes;
             self.selected = new_selected;
             if let Some(k) = new_sort {
                 if self.sort_key == k {
@@ -1348,6 +1411,9 @@ impl eframe::App for SectorApp {
                     }
                 }
             }
+            // The finished scan now covers the current folder — surface its
+            // subfolder sizes in the list.
+            self.recompute_folder_sizes();
         }
 
         // ---- Shared nav: mode toggle + back/forward/up + address bar -------
