@@ -1311,6 +1311,29 @@ impl SectorApp {
         }
     }
 
+    /// Width that fits the widest currently-visible tree row (indent + triangle +
+    /// name), clamped to a sane range. Used for double-click-the-divider-to-fit.
+    fn tree_fit_width(&mut self, ctx: &egui::Context) -> f32 {
+        let font = egui::FontId::proportional(14.0);
+        let visible = self.sb_visible_nodes();
+        let mut max_w = 150.0_f32;
+        for p in &visible {
+            let name = p
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| p.to_string_lossy().into_owned());
+            let depth = p.components().count().saturating_sub(2); // drive roots at 0
+            let text_w = ctx.fonts_mut(|f| {
+                f.layout_no_wrap(format!("📁 {name}"), font.clone(), egui::Color32::WHITE)
+                    .size()
+                    .x
+            });
+            let row_w = 22.0 + depth as f32 * 12.0 + text_w + 24.0; // triangle+indent+text+pad
+            max_w = max_w.max(row_w);
+        }
+        max_w.min(520.0)
+    }
+
     /// A folder's immediate subdirectories, cached (lazy — filled on first expand).
     fn sb_children(&mut self, path: &Path) -> Vec<PathBuf> {
         if let Some(c) = self.sb_cache.get(path) {
@@ -1626,7 +1649,8 @@ impl SectorApp {
         }
 
         if self.sb_visible {
-            egui::Panel::left("folder_tree")
+            let panel_id = egui::Id::new("folder_tree");
+            egui::Panel::left(panel_id)
                 .resizable(true)
                 .default_size(240.0)
                 .min_size(150.0)
@@ -1642,6 +1666,20 @@ impl SectorApp {
                         });
                 });
             self.tree_scroll = false; // one-shot: consumed by this render
+
+            // Double-click the divider → fit the tree to its widest visible row.
+            let resize_resp = ui.ctx().read_response(panel_id.with("__resize"));
+            if resize_resp.map(|r| r.double_clicked()).unwrap_or(false) {
+                let fit = self.tree_fit_width(&ui.ctx().clone());
+                if let Some(mut st) = egui::PanelState::load(ui.ctx(), panel_id) {
+                    st.outer_rect = egui::Rect::from_min_size(
+                        st.outer_rect.min,
+                        egui::vec2(fit, st.outer_rect.height()),
+                    );
+                    ui.ctx().data_mut(|d| d.insert_persisted(panel_id, st));
+                    ui.ctx().request_repaint();
+                }
+            }
         }
 
         // Status footer: folder totals (cached) + selection details.
@@ -2048,6 +2086,17 @@ impl SectorApp {
             }
             if ui.input(|i| i.key_pressed(egui::Key::Backspace)) {
                 self.go_up();
+            }
+            // Tab switches focus between the tree and the list (consume it so egui
+            // doesn't also use it for widget-focus traversal).
+            if self.sb_visible
+                && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Tab))
+            {
+                self.focus_pane =
+                    if self.focus_pane == Pane::Tree { Pane::List } else { Pane::Tree };
+                if self.focus_pane == Pane::Tree {
+                    self.tree_scroll = true; // bring the current node into view
+                }
             }
             // Alt+Left / Alt+Right: history back / forward (Explorer/browser style).
             if ui.input(|i| i.modifiers.alt && i.key_pressed(egui::Key::ArrowLeft)) {
