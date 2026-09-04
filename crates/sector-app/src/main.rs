@@ -284,6 +284,10 @@ fn main() -> eframe::Result<()> {
         Box::new(|cc| {
             // Dark theme so the bars match the night cityscape.
             cc.egui_ctx.set_visuals(egui::Visuals::dark());
+            // Don't make label text drag-to-select — in the file list it gives an
+            // I-beam cursor and intercepts hover over a filename, so hovering the
+            // text behaves differently from the rest of the row.
+            cc.egui_ctx.style_mut(|s| s.interaction.selectable_labels = false);
             if let Some(rs) = &cc.wgpu_render_state {
                 let info = rs.adapter.get_info();
                 eprintln!(
