@@ -287,7 +287,7 @@ fn main() -> eframe::Result<()> {
             // Don't make label text drag-to-select — in the file list it gives an
             // I-beam cursor and intercepts hover over a filename, so hovering the
             // text behaves differently from the rest of the row.
-            cc.egui_ctx.style_mut(|s| s.interaction.selectable_labels = false);
+            cc.egui_ctx.all_styles_mut(|s| s.interaction.selectable_labels = false);
             if let Some(rs) = &cc.wgpu_render_state {
                 let info = rs.adapter.get_info();
                 eprintln!(
