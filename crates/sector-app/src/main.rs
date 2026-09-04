@@ -172,7 +172,13 @@ fn joined_path(comps: &[&str]) -> String {
 /// `"y:\"` all map to the same cache entry. Also used to verify a loaded cache is
 /// really the folder we asked for.
 fn normalize_cache_key(root: &str) -> String {
-    let mut key = root.trim().to_lowercase();
+    let mut key = root.trim().replace('/', "\\").to_lowercase();
+    // "Y:\Media\" and "Y:\Media" are the same folder: drop trailing separators
+    // (but never below a bare "\\").
+    while key.len() > 1 && key.ends_with('\\') {
+        key.pop();
+    }
+    // …except a drive root, which is canonically "y:\" (not the drive-relative "y:").
     if key.ends_with(':') {
         key.push('\\');
     }
@@ -693,6 +699,12 @@ impl SectorApp {
         self.menu_target = None;
         self.city_root = Some(self.current_dir.clone());
         self.city_synced_dir = Some(self.current_dir.clone());
+        // A scan of the previous location may still be running (sync_city on a
+        // navigation lands here) — stop it, or it runs to completion into a tree
+        // nobody reads and its result is thrown away.
+        if let ScanState::Running { cancel, .. } = &self.scan {
+            cancel.store(true, Ordering::Relaxed);
+        }
         // No scanner thread; the dead channel is never polled because `stats`
         // is already `Some`.
         let (_tx, rx) = channel();
@@ -1005,9 +1017,12 @@ impl SectorApp {
     }
 
     fn compute_folder_sizes(&self) -> Option<HashMap<String, u64>> {
-        let ScanState::Running { tree, stats: Some(_), .. } = &self.scan else {
+        let ScanState::Running { tree, stats: Some(st), .. } = &self.scan else {
             return None;
         };
+        if st.cancelled {
+            return None; // a partial tree would show underestimates as if real
+        }
         let root = self.city_root.as_ref()?;
         // Relative components from the scan root to the current folder, compared
         // case-insensitively (Windows) since the tree walk is too. Lowercasing is
@@ -1091,9 +1106,14 @@ impl SectorApp {
         if reserved {
             return Err(format!("\"{base}\" is a name reserved by Windows."));
         }
+        // Windows compares names case-insensitively in *Unicode* ("élan" ==
+        // "Élan"), not just ASCII — match that, or the check can miss a clash
+        // that the filesystem will treat as the same name.
+        let lname = name.to_lowercase();
+        let lallow = allow.map(str::to_lowercase);
         let clashes = self.all_entries.iter().any(|e| {
-            e.name.eq_ignore_ascii_case(name)
-                && !allow.map(|a| e.name.eq_ignore_ascii_case(a)).unwrap_or(false)
+            let en = e.name.to_lowercase();
+            en == lname && lallow.as_deref() != Some(en.as_str())
         });
         if clashes {
             return Err("An item with that name already exists.".into());
@@ -1119,6 +1139,15 @@ impl SectorApp {
                 }
                 let src = self.current_dir.join(orig);
                 let dst = self.current_dir.join(&name);
+                // The listing we validated against can be stale (a file created
+                // since the last refresh), and `fs::rename` on Windows REPLACES
+                // an existing file — so re-check on disk right before renaming.
+                // A case-only rename ("foo" → "FOO") legitimately "exists" (it's
+                // the same file on NTFS) and is allowed through.
+                let case_only = name.to_lowercase() == orig.to_lowercase();
+                if !case_only && std::fs::symlink_metadata(&dst).is_ok() {
+                    return Err("An item with that name already exists.".into());
+                }
                 std::fs::rename(&src, &dst).map_err(|e| format!("Couldn't rename: {e}"))?;
                 self.after_edit(name);
             }
@@ -3530,7 +3559,13 @@ impl eframe::App for SectorApp {
                         if let Some(parent) = cp.parent() {
                             let _ = std::fs::create_dir_all(parent);
                         }
-                        match std::fs::write(&cp, &bytes) {
+                        // Write to a sibling temp file, then rename over the
+                        // final name: a crash/exit mid-write leaves a stray
+                        // .tmp, never a truncated .bin.
+                        let tmp = cp.with_extension("tmp");
+                        let written = std::fs::write(&tmp, &bytes)
+                            .and_then(|()| std::fs::rename(&tmp, &cp));
+                        match written {
                             Ok(()) => {
                                 eprintln!("[sector] cache saved: {} ({} bytes)", cp.display(), bytes.len());
                                 // Keep the cache dir bounded (1 GiB), newest-first.
@@ -3658,6 +3693,16 @@ mod tests {
         // + 13h 37m.
         let t2 = UNIX_EPOCH + Duration::from_secs(1_609_459_200 + 13 * 3600 + 37 * 60);
         assert_eq!(format_datetime(t2), "2021-01-01 13:37 UTC");
+    }
+
+    #[test]
+    fn cache_key_ignores_trailing_separators_and_case() {
+        assert_eq!(normalize_cache_key("Y:"), "y:\\");
+        assert_eq!(normalize_cache_key("Y:\\"), "y:\\");
+        assert_eq!(normalize_cache_key("Y:\\Media"), "y:\\media");
+        assert_eq!(normalize_cache_key("Y:\\Media\\"), "y:\\media"); // trailing sep
+        assert_eq!(normalize_cache_key("y:/media/"), "y:\\media"); // forward slashes
+        assert_eq!(normalize_cache_key("\\\\nas\\Media\\"), "\\\\nas\\media"); // UNC
     }
 
     #[test]

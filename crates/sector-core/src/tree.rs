@@ -210,18 +210,21 @@ impl Tree {
         (0..self.nodes.len() as u32).map(NodeId)
     }
 
-    /// Walk from `start` following `components` by name (ASCII-case-insensitive,
-    /// matching Windows), returning the node reached or `None` if the path leaves
-    /// the tree. Empty `components` returns `start`. Lets a caller locate the node
-    /// for a folder path within a scanned subtree (e.g. to read its size).
+    /// Walk from `start` following `components` by name — case-insensitive in
+    /// *Unicode* (NTFS treats "Élan" and "élan" as the same name; an ASCII-only
+    /// compare would miss that) — returning the node reached or `None` if the
+    /// path leaves the tree. Empty `components` returns `start`. Lets a caller
+    /// locate the node for a folder path within a scanned subtree (e.g. to read
+    /// its size).
     pub fn find_descendant(&self, start: NodeId, components: &[&str]) -> Option<NodeId> {
         let mut cur = start;
         for comp in components {
-            let next = self
-                .children(cur)
-                .iter()
-                .copied()
-                .find(|&c| self.node(c).name.eq_ignore_ascii_case(comp))?;
+            // Lowercase the wanted name once; compare children char-by-char
+            // without allocating (a folder can have 100k children).
+            let want = comp.to_lowercase();
+            let next = self.children(cur).iter().copied().find(|&c| {
+                self.node(c).name.chars().flat_map(char::to_lowercase).eq(want.chars())
+            })?;
             cur = next;
         }
         Some(cur)
@@ -341,6 +344,13 @@ impl Tree {
         if n == 0 || c.parent.len() != n || c.kind.len() != n || c.own_size.len() != n {
             return None;
         }
+        // Enforce the arena invariant on untrusted input: the root is its own
+        // parent, and every other node's parent precedes it. Without this, a
+        // corrupted file could index out of range (panic on load) or form a
+        // cycle (an infinite loop in `path_components`).
+        if c.parent[0] != 0 || (1..n).any(|i| c.parent[i] as usize >= i) {
+            return None;
+        }
         let mut nodes = Vec::with_capacity(n);
         for i in 0..n {
             let kind = if c.kind[i] == 1 { NodeKind::File } else { NodeKind::Dir };
@@ -364,12 +374,16 @@ impl Tree {
         Some((tree, c.stats))
     }
 
-    /// Save this tree to `path` in the cache format.
+    /// Save this tree to `path` in the cache format. Written to a sibling temp
+    /// file and renamed into place, so an interrupted save can't leave a
+    /// truncated cache behind.
     pub fn save_cache(&self, path: &std::path::Path, stats: CacheStats) -> std::io::Result<()> {
         let bytes = self
             .to_cache_bytes(stats)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        std::fs::write(path, bytes)
+        let tmp = path.with_extension("tmp");
+        std::fs::write(&tmp, bytes)?;
+        std::fs::rename(&tmp, path)
     }
 
     /// Load a cached tree from `path`, or `None` if missing/corrupt.
@@ -549,6 +563,45 @@ mod tests {
         assert_eq!(t.find_descendant(Tree::ROOT, &["users", "docs"]), Some(docs));
         // A component that isn't there ends the walk.
         assert_eq!(t.find_descendant(Tree::ROOT, &["Users", "Nope"]), None);
+    }
+
+    #[test]
+    fn find_descendant_is_unicode_case_insensitive() {
+        let mut t = Tree::new("Y:");
+        let elan = t.add_child(Tree::ROOT, "Élan", NodeKind::Dir, 0);
+        // A non-ASCII uppercase letter must still match its lowercase form.
+        assert_eq!(t.find_descendant(Tree::ROOT, &["élan"]), Some(elan));
+        assert_eq!(t.find_descendant(Tree::ROOT, &["ÉLAN"]), Some(elan));
+        assert_eq!(t.find_descendant(Tree::ROOT, &["elan"]), None); // not a match
+    }
+
+    #[test]
+    fn cache_rejects_broken_parent_links() {
+        let mut t = Tree::new("C:");
+        let users = t.add_child(Tree::ROOT, "Users", NodeKind::Dir, 0);
+        t.add_child(users, "a.txt", NodeKind::File, 100);
+        let stats = CacheStats { dirs: 1, files: 1, bytes: 100, saved_unix: 0, usn_journal_id: 0, usn_next: 0 };
+
+        // Forge caches with bad parent arrays via the same framing.
+        let forge = |parent: Vec<u32>| {
+            let c = TreeCacheV1 {
+                root_name: "C:".into(),
+                stats,
+                name: vec!["C:".into(), "Users".into(), "a.txt".into()],
+                parent,
+                kind: vec![0, 0, 1],
+                own_size: vec![0, 0, 100],
+            };
+            let body = postcard::to_stdvec(&c).unwrap();
+            let mut out = CACHE_MAGIC.to_vec();
+            out.extend_from_slice(&CACHE_VERSION.to_le_bytes());
+            out.extend_from_slice(&body);
+            out
+        };
+        assert!(Tree::from_cache_bytes(&forge(vec![0, 0, 1])).is_some()); // valid
+        assert!(Tree::from_cache_bytes(&forge(vec![0, 0, 7])).is_none()); // out of range → would panic
+        assert!(Tree::from_cache_bytes(&forge(vec![0, 2, 1])).is_none()); // cycle → would loop forever
+        assert!(Tree::from_cache_bytes(&forge(vec![1, 0, 1])).is_none()); // root not its own parent
     }
 
     #[test]
