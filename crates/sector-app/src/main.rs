@@ -2045,6 +2045,13 @@ impl SectorApp {
             if ui.input(|i| i.key_pressed(egui::Key::Backspace)) {
                 self.go_up();
             }
+            // Alt+Left / Alt+Right: history back / forward (Explorer/browser style).
+            if ui.input(|i| i.modifiers.alt && i.key_pressed(egui::Key::ArrowLeft)) {
+                self.go_back();
+            }
+            if ui.input(|i| i.modifiers.alt && i.key_pressed(egui::Key::ArrowRight)) {
+                self.go_forward();
+            }
             // F2 renames the target item; Ctrl+Shift+N makes a new folder.
             if ui.input(|i| i.key_pressed(egui::Key::F2)) {
                 if let Some(name) =
@@ -2153,11 +2160,13 @@ impl SectorApp {
     fn tree_keys(&mut self, ui: &egui::Ui) {
         use egui::Key;
         let (down, up, right, left, home, end) = ui.input(|i| {
+            // Alt+Left/Right are history back/forward, not collapse/expand.
+            let plain = !i.modifiers.alt;
             (
                 i.key_pressed(Key::ArrowDown),
                 i.key_pressed(Key::ArrowUp),
-                i.key_pressed(Key::ArrowRight),
-                i.key_pressed(Key::ArrowLeft),
+                plain && i.key_pressed(Key::ArrowRight),
+                plain && i.key_pressed(Key::ArrowLeft),
                 i.key_pressed(Key::Home),
                 i.key_pressed(Key::End),
             )
