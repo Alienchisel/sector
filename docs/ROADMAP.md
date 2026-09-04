@@ -48,7 +48,9 @@ drive type** (`GetDriveType`).
   scans are slower, and concurrency helps *more*); modest file count; per-dir
   concurrency (stats within one dir are serial — revisit if a wide-shallow tree
   starves the pool).
-- ☐ **1c** — drive-type routing (`GetDriveType`) [Windows]
+- ◐ **1c** — drive-type routing (`GetDriveType`) [Windows] — *detection* is
+  done (`GetDriveTypeW` → `is_network_path`, used to decide Recycle Bin vs
+  permanent delete); routing *scans* by type waits on an MFT path (1d).
 - ☐ **1d** — MFT/USN fast path for local NTFS [Windows]
 - ☐ **1e** — wire routing: `DRIVE_REMOTE`→walker, `DRIVE_FIXED` NTFS→MFT [Windows]
 
@@ -172,11 +174,14 @@ we later want true orbitable 3D or tile counts beyond the painter's comfort.
   (`D3D12SDKLayers.dll`), which is meaningfully slower. Benchmark rendering in
   `--release`; don't misread debug-layer overhead as a treemap perf problem.
 
-## Step 4 — Interaction + polish  ☐
+## Step 4 — Interaction + polish  ◐
 
-- Drill-down / zoom into folders; breadcrumb of the current path.
-- Hover tooltips (name, size, item count).
-- Color by file type and/or size (industrial palette per D13: steel/iron/brass,
+*The interaction half landed in Step 3a; what remains is the visual-identity
+and animation polish below.*
+
+- ☑ Drill-down / zoom into folders; breadcrumb of the current path.
+- ☑ Hover tooltips (name, size, item count).
+- ☑ Color by file type (industrial palette per D13: steel/iron/brass,
   sparing hazard accent). Primary channels: size = area, type = hue.
 - The full visual-identity pass (D13) — **weathered lit-metal surfaces** (matcap
   sheen + procedural noise + SDF bevel), industrial "machine shop" palette,
@@ -197,20 +202,22 @@ Deliberately *not* scheduled — captured so they don't distract us:
 - **"Complete" mode — scan all drives at once.** Enumerate every fixed + mapped
   drive and show them together (a metro area of cities, or a drive picker /
   combined root). Fits D9 (multiple drives are a normal case). User idea, 2026-09.
-- **Urban visual pass (D15).** Ground plinth, street-level shadows / ambient
-  occlusion, dusk atmosphere/haze, per-face lighting — lean into the cityscape.
+- ~~**Urban visual pass (D15).**~~ **Done** — see Step 3a.5 (plinth, shadows,
+  night palette, neon tops). Remaining: haze / atmosphere, ambient occlusion.
 - **Camera controls (later).** Much is achievable *within* 2.5D, no engine
   rebuild: pan (offset), zoom (scale), and **turntable orbit** (rotate the
   footprint x,y about center *before* the fixed iso projection) + tilt
   (parameterize projection). Only a free-flying *perspective* camera (fly-through,
   vanishing point) needs the true-3D wgpu upgrade (Step 3b). User idea, 2026-09.
-- **Reveal in Explorer (small, near-term; first D8 action).** Right-click a
+- ~~**Reveal in Explorer (small, near-term; first D8 action).**~~ **Done**
+  (Step 3a.5 in the City; E3 in Files). Kept for the original reasoning: Right-click a
   block → context menu → open its location in Windows Explorer (`explorer
   /select,<path>` for files, `explorer <path>` for folders). Left-click stays
   drill-down. cfg-gated to Windows. Extensible menu (later: copy path, open,
   delete-to-Recycle-Bin). User idea, 2026-09.
-- **File management (candidate future direction).** Growing from a pure
-  visualizer toward light file actions — "reveal in Explorer", delete to Recycle
+- ~~**File management (candidate future direction).**~~ **Superseded by D16 /
+  Phase E** — it is now the main road (E3–E5 shipped). Original note: growing
+  from a pure visualizer toward light file actions — "reveal in Explorer", delete to Recycle
   Bin, and potentially fuller browse/copy/move/rename. Not planned now, but a
   door we keep open (see README non-goals). AI/assistant features are *not* in
   this parking lot — they are a firm permanent non-goal.
@@ -240,8 +247,8 @@ safest-first — destructive ops must be bulletproof (see D16, D1).
   present, else a scan-prompt; drilling in the City syncs back to Files. See D18.
 - **E3 — Read-only actions  ✅**: double-click / Enter opens (default app for
   files, in-app navigate for folders), right-click menu (Open · Reveal/Open in
-  Explorer · Copy path · Copy name), Backspace = up. *Properties dialog deferred
-  — needs a ShellExecute call via the `windows` crate.*
+  Explorer · Copy path · Copy name), Backspace = up. **Properties/Details panel ✅** (in-app,
+  `Alt+Enter` / toolbar toggle: path, sizes, dates, attributes).
 - **E4 — Non-destructive edits  ✅**: New folder (Ctrl+Shift+N / ＋ button /
   context menu) and Rename (F2 / context menu), via a validated modal dialog
   (empty / invalid-char / reserved / duplicate checks; OS errors shown in-dialog,
@@ -255,11 +262,11 @@ safest-first — destructive ops must be bulletproof (see D16, D1).
   Shift, Ctrl+A) drives batch copy/cut/delete. **Delete → Recycle Bin** (Del /
   context menu) via the `trash` crate (IFileOperation), with a confirmation and a
   background worker. *Shift+Delete permanent-delete intentionally not offered.*
-- **E6 — Incremental freshness (D17)  ☐**: **local NTFS** — store last USN, read
+- **E6 — Incremental freshness (D17)  ◐**: **slice 1 ✅** — the cache stores a
+  USN watermark (journal id + next USN) at scan completion and, on reload,
+  reports the cached view as Current / Stale / Unknown (`sector-scan::usn`).
+  **Still open:** apply the deltas. **local NTFS** — store last USN, read
   the USN Change Journal on reload and apply deltas to the cached tree (near-
   instant "update"); build alongside the local MFT fast-path (Step 1d). **NAS** —
   no cheap incremental (no MFT/USN over SMB); refresh = re-walk, cached. Optional:
   live watching (`ReadDirectoryChangesW`/`notify`) to keep the open session fresh.
-
-**E1a (data layer, OS-agnostic, testable on Linux): a single-directory live
-listing** (name, size, is_dir, modified) — the foundation before the UI shell.

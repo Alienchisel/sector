@@ -1,58 +1,67 @@
 # SECTOR
 
-A fast, responsive, sleek **filesystem visualizer for Windows**. SECTOR scans a
-volume and draws it as an interactive treemap — every file and folder sized by
-the space it occupies — so you can see at a glance where your disk went and drill
-into it fluidly.
+A fast, keyboard-friendly **file explorer for Windows** with a **2.5D cityscape
+visualizer** built in. Browse local disks and mapped NAS/SMB shares as equals in
+a conventional two-pane explorer; flip any folder into an interactive isometric
+"city" — area = size, height = file count, color = file type — to see at a
+glance where your space went.
 
-Think WizTree's speed and SpaceSniffer's visual clarity, with a modern,
-GPU-rendered look.
+It began as a pure visualizer (think WizTree's speed and SpaceSniffer's visual
+clarity, with a modern GPU-rendered look) and pivoted to **explorer first,
+visualizer second** (DECISIONS D16). The cityscape is a lens on the folder you're
+browsing, not a separate tool.
 
 ## Goals
 
-- **Fast.** Full-volume scans that feel near-instant on NTFS, by reading the
-  Master File Table directly rather than walking directories file-by-file.
-- **Responsive.** Smooth pan, zoom, and drill-down over millions of entries,
-  rendered on the GPU.
-- **Sleek.** A **weathered industrial-metal** look — machine-shop steel, iron and
-  brass, "industrial production" as the governing metaphor — a precision
-  instrument, not a utilitarian tool dialog. See DECISIONS D13.
+- **Fast.** Folder browsing is live and instant (`read_dir` on demand). Whole-
+  tree scans use a highly concurrent directory walk that hides SMB latency, and
+  every completed scan is **cached** compactly so reopening even an 82 TB NAS
+  takes about a second. A direct NTFS MFT read for near-instant *local* full-
+  volume scans is planned (ROADMAP Step 1d) but not yet built.
+- **Responsive.** Smooth drill-down and hover over more than a million entries.
+- **Sleek.** An **industrial city** look — dusk palette, neon-lit block tops,
+  ground plinth and shadows; districts are type zones, the skyline is file
+  count. Industrial materials (steel, iron, brass) remain the vocabulary. See
+  DECISIONS D13 → D15.
 - **A scan worth watching.** SECTOR's signature: the map *builds visibly* as it
   scans — the satisfying *feeling* of the old defragmenters, in a modern style —
   turning even a slow NAS scan into the best part. See DECISIONS D12.
+- **Safe to work in.** File operations are grown safest-first: read-only
+  browsing → non-destructive edits → destructive ops last, with the Recycle Bin,
+  confirmations, and never-overwrite copy semantics. See DECISIONS D16.
 - **Native.** A single self-contained Windows executable. No runtime, no install
   ceremony.
 - **Sees every drive.** Local disks, external drives, **and mapped network
-  drives (NAS)** that have a drive letter — each scanned the best way for its
-  type.
+  drives (NAS)** — each handled the best way for its type, and none treated as
+  second-class. See DECISIONS D7, D9.
 
-## Non-goals (at least for now)
+## Non-goals
 
 - **No AI / assistant integration.** SECTOR will *not* embed an LLM, chat panel,
   or "ask about your files" agent. This is a firm, permanent exclusion — unlike
   the mpfiles project that inspired us, that direction is explicitly off the
-  table.
-- ~~Not a file manager~~ **Now becoming a file explorer (D16, 2026-09-02).**
-  SECTOR is pivoting to a **graphical file explorer first, visualizer second** —
-  live folder navigation as the spine, the cityscape as a toggled "City" mode.
-  Grown incrementally, safest-first (read-only browsing → non-destructive edits →
-  destructive ops last, with Recycle Bin + confirmations). See DECISIONS D16.
-- **Not cross-platform.** Windows only. We optimize for Windows internals (the
-  MFT) rather than a lowest-common-denominator portable scan.
+  table. See DECISIONS D8.
+- **Not cross-platform.** Windows only. We lean on Windows internals (USN, the
+  shell, the Recycle Bin) rather than a lowest-common-denominator portable
+  approach.
 - **Not shell-integrated.** No Explorer context-menu entries, no thumbnail
   providers, no OS shell hooks. SECTOR is a standalone window.
-- **Not a duplicate finder / cleaner suite.** Visualization first; feature
-  sprawl later, if ever.
+- **Not a duplicate finder / cleaner suite.** Feature sprawl later, if ever.
 
 ## Stack
 
 - **Language:** Rust
-- **UI:** [egui](https://github.com/emilk/egui) (via `eframe`)
-- **Treemap rendering:** custom [`wgpu`](https://github.com/gfx-rs/wgpu) paint
-  layer (GPU instancing) inside an egui paint callback
-- **Scanner:** routes by drive type — direct NTFS MFT / USN enumeration for
-  local NTFS volumes, and a highly concurrent directory walk for mapped network
-  drives (NAS) and other non-MFT volumes
+- **UI:** [egui](https://github.com/emilk/egui) (via `eframe`, wgpu renderer —
+  Vulkan on the reference machine)
+- **Cityscape rendering:** egui's painter (shaded isometric polygons, back-to-
+  front). A custom [`wgpu`](https://github.com/gfx-rs/wgpu) instanced draw is a
+  possible later upgrade (ROADMAP Step 3b) if true orbitable 3D or far larger
+  tile counts are wanted.
+- **Scanner:** a highly concurrent directory walk (`std::fs`, OS-agnostic) that
+  feeds an index-based arena tree; serves local and network drives alike today.
+  Local NTFS gets **USN change-journal freshness** checks on cached scans; a
+  direct MFT fast path is planned.
+- **Cache:** serde + postcard, roughly 22 bytes per node.
 
 See [DECISIONS.md](DECISIONS.md) for *why* these choices, and
-[ROADMAP.md](ROADMAP.md) for the build plan.
+[ROADMAP.md](ROADMAP.md) for the build plan and progress.

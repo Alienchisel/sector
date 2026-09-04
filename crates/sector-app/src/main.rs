@@ -1,10 +1,16 @@
-//! SECTOR — interactive treemap with a live "discovery" build (D12).
+//! SECTOR — a keyboard-friendly Windows file explorer with a built-in 2.5D
+//! cityscape visualizer (D16: explorer first, visualizer second).
 //!
-//! The scan runs on a background thread and writes into a shared tree; the UI
-//! reads that same tree and renders the treemap *as it grows*, so a long NAS
-//! scan fills in before your eyes instead of leaving a blank panel. When the
-//! scan finishes it "crystallizes" into the final layout. Drill down by clicking
-//! a folder, navigate with the breadcrumb, hover for name/size.
+//! **Files view** is the spine: a folder tree + a live, sortable file list over
+//! `current_dir`, with the usual operations (open, rename, new folder, cut /
+//! copy / paste, delete to the Recycle Bin) and a Details panel.
+//!
+//! **City view** visualizes that same folder (D18): a background scan writes
+//! into a shared tree and the UI renders it *as it grows* (D12, the live
+//! "discovery" build), then "crystallizes" into the final layout. Completed
+//! scans are cached, and on local NTFS the USN journal reports whether a cached
+//! view is still current (E6). Drill down by clicking a block, navigate with the
+//! breadcrumb, hover for name/size.
 //!
 //! Anti-"boiling" measure (v1): during a scan the layout is recomputed at most
 //! every `RELAYOUT_THROTTLE`, so the map settles in visible steps rather than

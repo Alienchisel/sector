@@ -1,4 +1,5 @@
-# SECTOR — a fast, sleek Windows filesystem visualizer.
+# SECTOR — a fast, keyboard-friendly Windows file explorer with a built-in
+# 2.5D cityscape visualizer.
 # See docs/README.md, docs/ROADMAP.md, docs/DECISIONS.md.
 [workspace]
 resolver = "2"

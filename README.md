@@ -15,13 +15,15 @@ went.
 
 - **Folder tree + file list**, fully keyboard-drivable. **Tab** switches panes;
   arrows move; **→/←** open/close tree folders; type letters to **jump**
-  (type-ahead) in either pane.
+  (type-ahead) in either pane. Drag the divider to resize the tree, or
+  **double-click it** to fit the widest visible row.
 - **Navigation** — a clickable breadcrumb (or **Edit** to type a path), plus
   **Back/Forward/Up** (`Alt+←` / `Alt+→` / `Backspace`) with history.
 - **List** — Name / Size / Type / Modified, sortable, virtualized for huge
   folders, file-type–colored. Folder sizes appear when a scan covers the folder.
 - **Filter** the current folder as you type, and a **hidden-files** toggle.
-- **Properties** panel (`Alt+Enter`) — path, sizes, dates, attributes.
+- **Details** panel (`Alt+Enter`, or the toolbar toggle) — path, sizes, dates,
+  attributes.
 - **Multi-select** — click / `Ctrl`-click / `Shift`-click / `Ctrl+A`.
 
 ### File operations
