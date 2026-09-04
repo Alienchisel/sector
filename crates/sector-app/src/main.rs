@@ -2100,6 +2100,7 @@ impl SectorApp {
 
             // Arrows drive whichever pane has focus. The tree only when it's shown.
             if self.focus_pane == Pane::Tree && self.sb_visible {
+                self.type_ahead_tree(ui);
                 self.tree_keys(ui);
             } else {
                 self.type_ahead_list(ui);
@@ -2210,10 +2211,11 @@ impl SectorApp {
         ui.ctx().request_repaint();
     }
 
-    /// Type-ahead in the file list: typing letters jumps to the first matching
-    /// name; repeating the same letter cycles through matches; the buffer resets
-    /// after a short pause. Uses egui Text events, so Ctrl-combos don't trigger it.
-    fn type_ahead_list(&mut self, ui: &egui::Ui) {
+    /// Update the type-ahead buffer from this frame's typed text (egui Text
+    /// events, so Ctrl-combos don't trigger it). Returns `(lowercased query,
+    /// is_repeat)` if a letter was typed this frame, else `None`. The buffer
+    /// resets after a short pause; `is_repeat` marks the same single letter again.
+    fn type_ahead_input(&mut self, ui: &egui::Ui) -> Option<(String, bool)> {
         let typed: String = ui.input(|i| {
             i.events
                 .iter()
@@ -2223,13 +2225,12 @@ impl SectorApp {
                 })
                 .collect()
         });
-        if typed.is_empty() || self.entries.is_empty() {
-            return;
+        if typed.is_empty() {
+            return None;
         }
         let typed = typed.to_lowercase();
         let now = Instant::now();
         let timed_out = now.duration_since(self.type_ahead_time) >= Duration::from_millis(900);
-        // Same single letter again (within the window) → cycle to the next match.
         let repeat = !timed_out
             && self.type_ahead.chars().count() == 1
             && typed.chars().count() == 1
@@ -2240,8 +2241,16 @@ impl SectorApp {
             self.type_ahead.push_str(&typed);
         }
         self.type_ahead_time = now;
+        Some((self.type_ahead.clone(), repeat))
+    }
 
-        let q = self.type_ahead.clone();
+    /// Type-ahead in the file list: jump to the first matching name; repeating a
+    /// letter cycles through matches.
+    fn type_ahead_list(&mut self, ui: &egui::Ui) {
+        if self.entries.is_empty() {
+            return;
+        }
+        let Some((q, repeat)) = self.type_ahead_input(ui) else { return };
         let n = self.entries.len();
         let start = if repeat { self.lead.map_or(0, |i| i + 1) } else { 0 };
         let hit = (0..n)
@@ -2251,6 +2260,35 @@ impl SectorApp {
             self.select_only(i);
             self.scroll_target = Some(i);
             self.focus_pane = Pane::List;
+            ui.ctx().request_repaint();
+        }
+    }
+
+    /// Type-ahead in the folder tree: jump to the next visible node (after the
+    /// current one, wrapping) whose name matches — so it cycles forward through
+    /// matches rather than yanking back to the top of the tree.
+    fn type_ahead_tree(&mut self, ui: &egui::Ui) {
+        let Some((q, _repeat)) = self.type_ahead_input(ui) else { return };
+        let visible = self.sb_visible_nodes();
+        let n = visible.len();
+        if n == 0 {
+            return;
+        }
+        let cur = visible.iter().position(|p| p == &self.current_dir);
+        let start = cur.map_or(0, |i| i + 1);
+        let name_of = |p: &Path| {
+            p.file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| p.to_string_lossy().into_owned())
+                .to_lowercase()
+        };
+        let hit = (0..n)
+            .map(|off| (start + off) % n)
+            .find(|&i| name_of(&visible[i]).starts_with(&q));
+        if let Some(i) = hit {
+            self.navigate_to(visible[i].clone());
+            self.tree_scroll = true;
+            self.focus_pane = Pane::Tree;
             ui.ctx().request_repaint();
         }
     }
