@@ -267,13 +267,7 @@ const RELAYOUT_THROTTLE: Duration = Duration::from_millis(600);
 const DEFAULT_THREADS: usize = 48;
 
 fn main() -> eframe::Result<()> {
-    // Silence egui-winit's benign "clipboard empty/not text" ERROR that fires on
-    // Ctrl+V (it reads the OS text clipboard for text fields; our file paste uses
-    // a separate in-app clipboard). RUST_LOG still overrides this default.
-    env_logger::Builder::from_env(
-        env_logger::Env::default().default_filter_or("info,egui_winit::clipboard=off"),
-    )
-    .init();
+    env_logger::init();
 
     let options = eframe::NativeOptions {
         renderer: eframe::Renderer::Wgpu,
