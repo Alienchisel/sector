@@ -925,6 +925,460 @@ fn category_color(cat: FileCategory) -> Color32 {
     }
 }
 
+impl Pane {
+    /// Keep the address bar showing the canonical current directory.
+    fn sync_addr(&mut self) {
+        self.addr_edit = self.current_dir.to_string_lossy().into_owned();
+    }
+
+    /// Switch the address bar to its text field, with the path selected so
+    /// typing replaces it (Edit button, Alt+D, Ctrl+L, F4).
+    fn begin_addr_edit(&mut self) {
+        self.addr_edit = self.current_dir.to_string_lossy().into_owned();
+        self.addr_editing = true;
+        self.addr_edit_focus = true;
+    }
+
+    /// The name of the item the cursor is on (to restore it when we return).
+    fn lead_name(&self) -> Option<String> {
+        self.lead_entry().map(|e| e.name.clone())
+    }
+
+    fn clear_selection(&mut self) {
+        self.sel.clear();
+        self.lead = None;
+        self.anchor = None;
+    }
+
+    /// Select exactly row `i` (plain click / arrow).
+    fn select_only(&mut self, i: usize) {
+        self.sel.clear();
+        if let Some(e) = self.entries.get(i) {
+            self.sel.insert(e.name.clone());
+            self.lead = Some(i);
+            self.anchor = Some(i);
+        }
+    }
+
+    /// Toggle row `i` in the selection (Ctrl+click).
+    fn toggle_at(&mut self, i: usize) {
+        if let Some(e) = self.entries.get(i) {
+            let name = e.name.clone();
+            if !self.sel.remove(&name) {
+                self.sel.insert(name);
+            }
+            self.lead = Some(i);
+            self.anchor = Some(i);
+        }
+    }
+
+    /// Select the inclusive range `anchor..=i` (Shift+click / Shift+arrow),
+    /// keeping `anchor` fixed and moving `lead` to `i`. If there's no anchor yet
+    /// (extending from an empty state), establish one at `i` so the next extend
+    /// grows the range instead of resetting it.
+    fn select_range_to(&mut self, i: usize) {
+        let a = self.anchor.unwrap_or(i);
+        self.anchor = Some(a);
+        let (lo, hi) = (a.min(i), a.max(i));
+        self.sel.clear();
+        for e in self.entries.iter().skip(lo).take(hi - lo + 1) {
+            self.sel.insert(e.name.clone());
+        }
+        self.lead = Some(i);
+    }
+
+    /// The item single-item ops (Open / Rename / Properties) should target: the
+    /// lead if it's actually selected, else the sole selected item, else none.
+    /// (Guards against Ctrl+click deselecting the lead but ops still hitting it.)
+    fn op_target(&self) -> Option<usize> {
+        if let Some(i) = self.lead {
+            if self.entries.get(i).is_some_and(|e| self.sel.contains(&e.name)) {
+                return Some(i);
+            }
+        }
+        if self.sel.len() == 1 {
+            let name = self.sel.iter().next()?;
+            return self.entries.iter().position(|e| &e.name == name);
+        }
+        None
+    }
+
+    fn lead_entry(&self) -> Option<&Entry> {
+        self.lead.and_then(|i| self.entries.get(i))
+    }
+
+    /// Selected entries' absolute paths, in listing order.
+    fn selected_paths(&self) -> Vec<PathBuf> {
+        self.entries
+            .iter()
+            .filter(|e| self.sel.contains(&e.name))
+            .map(|e| self.current_dir.join(&e.name))
+            .collect()
+    }
+
+    /// The size to sort/show for an entry: files use their own size; folders use
+    /// their scanned subtree size when one is known (else 0).
+    fn entry_size(&self, e: &Entry) -> u64 {
+        if e.is_dir {
+            self.folder_sizes
+                .as_ref()
+                .and_then(|m| m.get(&e.name.to_lowercase()))
+                .copied()
+                .unwrap_or(0)
+        } else {
+            e.size
+        }
+    }
+
+    fn sort_entries(&self, es: &mut [Entry]) {
+        let (key, asc) = (self.sort_key, self.sort_asc);
+        es.sort_by(|a, b| {
+            // Folders always first, then by the chosen key.
+            b.is_dir.cmp(&a.is_dir).then_with(|| {
+                let o = match key {
+                    SortKey::Name => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+                    SortKey::Size => self.entry_size(a).cmp(&self.entry_size(b)),
+                    SortKey::Kind => entry_kind(a).cmp(&entry_kind(b)),
+                    SortKey::Modified => a.modified.cmp(&b.modified),
+                };
+                if asc {
+                    o
+                } else {
+                    o.reverse()
+                }
+            })
+        });
+    }
+
+    /// Recompute the cached status-footer summary. O(n) over the listing, but
+    /// only when it (or folder sizes) changes — never per frame.
+    fn refresh_status_summary(&mut self) {
+        if self.entries_err.is_some() {
+            self.status_summary.clear();
+            return;
+        }
+        let n = self.entries.len();
+        let folders = self.entries.iter().filter(|e| e.is_dir).count();
+        let total: u64 = self.entries.iter().map(|e| self.entry_size(e)).sum();
+        // If a filter or the hidden toggle is narrowing the listing, lead with the
+        // shown-of-total count.
+        let hidden_or_filtered = n != self.all_entries.len();
+        let prefix = if hidden_or_filtered {
+            format!("{} of {} shown · ", commas(n as u64), commas(self.all_entries.len() as u64))
+        } else {
+            String::new()
+        };
+        let space = self
+            .drive_space
+            .map(|(free, total)| format!(" · {} free of {}", human_size(free), human_size(total)))
+            .unwrap_or_default();
+        self.status_summary = format!(
+            "{prefix}{} items · {} folders · {} files · {}{space}",
+            commas(n as u64),
+            commas(folders as u64),
+            commas((n - folders) as u64),
+            human_size(total),
+        );
+    }
+
+    /// "New folder", or "New folder (2)", … — the first name not already taken
+    /// (case-insensitively) in the current listing.
+    fn unique_new_folder_name(&self) -> String {
+        let taken =
+            |name: &str| self.all_entries.iter().any(|e| e.name.eq_ignore_ascii_case(name));
+        if !taken("New folder") {
+            return "New folder".to_string();
+        }
+        for i in 2..10_000 {
+            let cand = format!("New folder ({i})");
+            if !taken(&cand) {
+                return cand;
+            }
+        }
+        format!("New folder ({})", now_unix())
+    }
+
+    /// Validate `name` for the current folder; `allow` is the one existing name a
+    /// rename is allowed to keep (its own). Returns the trimmed name or an error.
+    fn validate_name<'a>(&self, name: &'a str, allow: Option<&str>) -> Result<&'a str, String> {
+        let name = validate_name_syntax(name)?;
+        // Windows compares names case-insensitively in *Unicode* ("élan" ==
+        // "Élan"), not just ASCII — match that, or the check can miss a clash
+        // that the filesystem will treat as the same name.
+        let lname = name.to_lowercase();
+        let lallow = allow.map(str::to_lowercase);
+        let clashes = self.all_entries.iter().any(|e| {
+            let en = e.name.to_lowercase();
+            en == lname && lallow.as_deref() != Some(en.as_str())
+        });
+        if clashes {
+            return Err("An item with that name already exists.".into());
+        }
+        Ok(name)
+    }
+
+    /// Update the type-ahead buffer from this frame's typed text (egui Text
+    /// events, so Ctrl-combos don't trigger it). Returns `(lowercased query,
+    /// is_repeat)` if a letter was typed this frame, else `None`. The buffer
+    /// resets after a short pause; `is_repeat` marks the same single letter again.
+    fn type_ahead_input(&mut self, ui: &egui::Ui) -> Option<(String, bool)> {
+        let typed: String = ui.input(|i| {
+            i.events
+                .iter()
+                .filter_map(|e| match e {
+                    egui::Event::Text(t) => Some(t.as_str()),
+                    _ => None,
+                })
+                .collect()
+        });
+        if typed.is_empty() {
+            return None;
+        }
+        let typed = typed.to_lowercase();
+        let now = Instant::now();
+        let timed_out = now.duration_since(self.type_ahead_time) >= Duration::from_millis(900);
+        let repeat = !timed_out
+            && self.type_ahead.chars().count() == 1
+            && typed.chars().count() == 1
+            && self.type_ahead == typed;
+        if timed_out {
+            self.type_ahead = typed;
+        } else if !repeat {
+            self.type_ahead.push_str(&typed);
+        }
+        self.type_ahead_time = now;
+        Some((self.type_ahead.clone(), repeat))
+    }
+
+    /// Returns whether the location actually changed.
+    fn navigate_to(&mut self, path: PathBuf) -> bool {
+        if path == self.current_dir {
+            self.entries_dirty = true;
+            return false;
+        }
+        let leaving = (self.current_dir.clone(), self.lead_name());
+        self.back_stack.push(leaving);
+        self.fwd_stack.clear();
+        self.current_dir = path;
+        self.entries_dirty = true;
+        self.clear_selection();
+        self.filter.clear();
+        self.sync_addr();
+        true
+    }
+
+    /// Jump to a history entry, returning the entry for where we were (folder +
+    /// item on the cursor) for the opposite stack. Once the folder loads, the
+    /// remembered item is re-selected and scrolled into view.
+    fn hop(&mut self, to: (PathBuf, Option<String>)) -> (PathBuf, Option<String>) {
+        let leaving = (self.current_dir.clone(), self.lead_name());
+        let (path, name) = to;
+        self.current_dir = path.clone();
+        self.entries_dirty = true;
+        self.clear_selection();
+        self.filter.clear();
+        self.sync_addr();
+        if let Some(n) = name {
+            self.select_after_reload = Some((path, n));
+        }
+        leaving
+    }
+
+    /// Refresh views after a successful edit, and select the affected item.
+    fn after_edit(&mut self, select_name: String) {
+        self.entries_dirty = true;
+        self.filter.clear(); // so the new/renamed item is visible
+        self.select_after_reload = Some((self.current_dir.clone(), select_name));
+    }
+
+    /// Refresh views after a background op touched `item`; if it lives in the
+    /// folder we're looking at, clear the filter and select it. (An op that
+    /// completed after you navigated elsewhere no longer reselects by name in
+    /// the wrong folder.)
+    fn after_op(&mut self, item: &Path) {
+        self.entries_dirty = true;
+        if item.parent() == Some(self.current_dir.as_path()) {
+            self.filter.clear();
+            self.select_after_reload = Some((self.current_dir.clone(), name_of(item)));
+        }
+    }
+
+    /// Re-read `current_dir`. (The app refreshes folder sizes from its scan
+    /// tree first — see `SectorApp::reload_entries`.)
+    fn reload_entries(&mut self, show_hidden: bool) {
+        self.drive_space = drive_space(&self.current_dir);
+        match list_dir(&self.current_dir) {
+            Ok(mut es) => {
+                self.sort_entries(&mut es);
+                self.all_entries = es;
+                self.entries_err = None;
+            }
+            Err(e) => {
+                self.all_entries.clear();
+                self.entries_err = Some(e.to_string());
+            }
+        }
+        self.apply_filter(show_hidden);
+        self.addr_edit = self.current_dir.to_string_lossy().into_owned();
+        self.entries_dirty = false;
+        // The folder itself, for Details when the tree has focus (one stat).
+        self.cur_entry = stat_entry(&self.current_dir).ok();
+        // Honor a pending select-by-name (from "up" or F5) — but only in the
+        // folder it was meant for, so a stale value can't select elsewhere.
+        if let Some((dir, name)) = self.select_after_reload.take() {
+            if dir == self.current_dir {
+                if let Some(i) = self
+                    .entries
+                    .iter()
+                    .position(|e| e.name.eq_ignore_ascii_case(&name))
+                {
+                    self.select_only(i);
+                    self.scroll_target = Some(i);
+                }
+            }
+        }
+        // (apply_filter already refreshed the status summary for the new listing.)
+    }
+
+    /// Rebuild the visible `entries` from `all_entries` by the hidden toggle and
+    /// the text filter, preserving the selection by name. Cheap re-clone; call it
+    /// whenever the filter or the hidden toggle changes.
+    fn apply_filter(&mut self, show_hidden: bool) {
+        let name_of = |i: Option<usize>| i.and_then(|i| self.entries.get(i)).map(|e| e.name.clone());
+        let (lead_name, anchor_name) = (name_of(self.lead), name_of(self.anchor));
+        let f = self.filter.trim().to_lowercase();
+        self.entries = self
+            .all_entries
+            .iter()
+            .filter(|e| {
+                (show_hidden || !e.is_hidden)
+                    && (f.is_empty() || e.name.to_lowercase().contains(&f))
+            })
+            .cloned()
+            .collect();
+        // Keep only selected names that are still visible; remap lead & anchor by
+        // their OWN names (don't collapse the range anchor into the lead).
+        let visible: HashSet<String> = self.entries.iter().map(|e| e.name.clone()).collect();
+        self.sel.retain(|n| visible.contains(n));
+        let pos = |n: Option<String>| n.and_then(|n| self.entries.iter().position(|e| e.name == n));
+        self.lead = pos(lead_name);
+        self.anchor = pos(anchor_name);
+        // NB: scrolling to the selection is done by the sort handler, not here —
+        // a filter keystroke shouldn't yank the viewport.
+        self.refresh_status_summary();
+    }
+
+    /// Back one step in history; `true` if there was somewhere to go.
+    fn go_back(&mut self) -> bool {
+        match self.back_stack.pop() {
+            Some(to) => {
+                let left = self.hop(to);
+                self.fwd_stack.push(left);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Forward one step in history; `true` if there was somewhere to go.
+    fn go_forward(&mut self) -> bool {
+        match self.fwd_stack.pop() {
+            Some(to) => {
+                let left = self.hop(to);
+                self.back_stack.push(left);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Up to the parent, re-selecting the folder we left once it loads;
+    /// `true` if there was a parent.
+    fn go_up(&mut self) -> bool {
+        let Some(parent) = self.current_dir.parent().map(|p| p.to_path_buf()) else {
+            return false;
+        };
+        let child = self.current_dir.file_name().map(|n| n.to_string_lossy().into_owned());
+        self.navigate_to(parent.clone());
+        if let Some(c) = child {
+            self.select_after_reload = Some((parent, c));
+        }
+        true
+    }
+
+    /// If the folder we're IN no longer exists (deleted, undone), step out to
+    /// its nearest surviving ancestor — in place, not as a history step.
+    /// `true` if we moved.
+    fn step_out_if_gone(&mut self) -> bool {
+        if std::fs::symlink_metadata(&self.current_dir).is_ok() {
+            return false;
+        }
+        let mut p = self.current_dir.clone();
+        while let Some(parent) = p.parent().map(Path::to_path_buf) {
+            p = parent;
+            if std::fs::symlink_metadata(&p).is_ok() {
+                break;
+            }
+        }
+        self.current_dir = p;
+        self.sync_addr();
+        self.clear_selection();
+        true
+    }
+
+    /// Type-ahead in the file list: jump to the first matching name; repeating a
+    /// letter cycles through matches. `true` if something was selected.
+    fn type_ahead_list(&mut self, ui: &egui::Ui) -> bool {
+        if self.entries.is_empty() {
+            return false;
+        }
+        let Some((q, repeat)) = self.type_ahead_input(ui) else { return false };
+        let n = self.entries.len();
+        let start = if repeat { self.lead.map_or(0, |i| i + 1) } else { 0 };
+        let hit = (0..n)
+            .map(|off| (start + off) % n)
+            .find(|&i| self.entries[i].name.to_lowercase().starts_with(&q));
+        if let Some(i) = hit {
+            self.select_only(i);
+            self.scroll_target = Some(i);
+            ui.ctx().request_repaint();
+        }
+        hit.is_some()
+    }
+}
+
+/// Syntactic validation of a file/folder name — no listing needed: empty,
+/// forbidden characters, reserved names, trailing dot. Returns the trimmed
+/// name or an error.
+fn validate_name_syntax(name: &str) -> Result<&str, String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("Name can't be empty.".into());
+    }
+    if name.contains(INVALID_NAME_CHARS) {
+        return Err("Name can't contain \\ / : * ? \" < > |".into());
+    }
+    if name == "." || name == ".." {
+        return Err("That name is reserved.".into());
+    }
+    if name.ends_with('.') {
+        // Windows drops a trailing dot, so "foo." would silently become "foo".
+        return Err("Name can't end with a dot.".into());
+    }
+    // Windows reserved device names (also when used as the base of an
+    // extension, e.g. "CON.txt"). A tailored message beats the raw OS error.
+    let base = name.split('.').next().unwrap_or(name).trim_end();
+    let up = base.to_ascii_uppercase();
+    let reserved = matches!(up.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || ((up.starts_with("COM") || up.starts_with("LPT"))
+            && up.len() == 4
+            && matches!(up.as_bytes()[3], b'1'..=b'9'));
+    if reserved {
+        return Err(format!("\"{base}\" is a name reserved by Windows."));
+    }
+    Ok(name)
+}
+
 impl SectorApp {
     fn start_scan(&mut self) {
         // Stop any scan already running.
@@ -1028,7 +1482,7 @@ impl SectorApp {
             started: Instant::now(),
         };
         self.recompute_folder_sizes(); // the tree now covers this folder
-        self.refresh_status_summary();
+        self.pane.refresh_status_summary();
     }
 
     /// No cityscape for the current folder: auto-scan it if that's a LOCAL,
@@ -1086,260 +1540,73 @@ impl SectorApp {
 
     // ---- Explorer navigation (E1) ----
 
-    /// Keep the address bar showing the canonical current directory.
-    fn sync_addr(&mut self) {
-        self.pane.addr_edit = self.pane.current_dir.to_string_lossy().into_owned();
-    }
+    // ---- Pane wrappers: the pane's own logic plus the app-level side effects
+    // (revealing the folder in the shared tree, dropping the tree cache, folder
+    // sizes from the scan tree, the focus flag). Call sites use these.
 
-    /// Switch the address bar to its text field, with the path selected so
-    /// typing replaces it (Edit button, Alt+D, Ctrl+L, F4).
-    fn begin_addr_edit(&mut self) {
-        self.pane.addr_edit = self.pane.current_dir.to_string_lossy().into_owned();
-        self.pane.addr_editing = true;
-        self.pane.addr_edit_focus = true;
+    fn after_nav(&mut self) {
+        self.op_error = None;
+        self.sb_reveal();
     }
 
     fn navigate_to(&mut self, path: PathBuf) {
-        if path == self.pane.current_dir {
-            self.pane.entries_dirty = true;
-            return;
+        if self.pane.navigate_to(path) {
+            self.after_nav();
         }
-        let leaving = (self.pane.current_dir.clone(), self.lead_name());
-        self.pane.back_stack.push(leaving);
-        self.pane.fwd_stack.clear();
-        self.pane.current_dir = path;
-        self.pane.entries_dirty = true;
-        self.clear_selection();
-        self.pane.filter.clear();
-        self.op_error = None;
-        self.sync_addr();
-        self.sb_reveal();
-    }
-
-    /// The name of the item the cursor is on (to restore it when we return).
-    fn lead_name(&self) -> Option<String> {
-        self.lead_entry().map(|e| e.name.clone())
-    }
-
-    /// Jump to a history entry, returning the entry for where we were (folder +
-    /// item on the cursor) for the opposite stack. Once the folder loads, the
-    /// remembered item is re-selected and scrolled into view.
-    fn hop(&mut self, to: (PathBuf, Option<String>)) -> (PathBuf, Option<String>) {
-        let leaving = (self.pane.current_dir.clone(), self.lead_name());
-        let (path, name) = to;
-        self.pane.current_dir = path.clone();
-        self.pane.entries_dirty = true;
-        self.clear_selection();
-        self.pane.filter.clear();
-        self.sync_addr();
-        self.sb_reveal();
-        if let Some(n) = name {
-            self.pane.select_after_reload = Some((path, n));
-        }
-        leaving
     }
 
     fn go_back(&mut self) {
-        if let Some(to) = self.pane.back_stack.pop() {
-            let left = self.hop(to);
-            self.pane.fwd_stack.push(left);
+        if self.pane.go_back() {
+            self.sb_reveal();
         }
     }
 
     fn go_forward(&mut self) {
-        if let Some(to) = self.pane.fwd_stack.pop() {
-            let left = self.hop(to);
-            self.pane.back_stack.push(left);
+        if self.pane.go_forward() {
+            self.sb_reveal();
         }
     }
 
     fn go_up(&mut self) {
-        if let Some(parent) = self.pane.current_dir.parent().map(|p| p.to_path_buf()) {
-            // Re-select the folder we're stepping out of, once the parent loads.
-            let child = self
-                .pane.current_dir
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned());
-            self.navigate_to(parent.clone());
-            if let Some(c) = child {
-                self.pane.select_after_reload = Some((parent, c));
-            }
+        if self.pane.go_up() {
+            self.after_nav();
+        }
+    }
+
+    fn step_out_if_gone(&mut self) {
+        if self.pane.step_out_if_gone() {
+            self.sb_reveal();
+        }
+    }
+
+    fn after_edit(&mut self, select_name: String) {
+        self.pane.after_edit(select_name);
+        self.sb_cache.clear(); // the folder tree may have changed
+    }
+
+    fn after_op(&mut self, item: &Path) {
+        self.pane.after_op(item);
+        self.sb_cache.clear();
+    }
+
+    fn reload_entries(&mut self) {
+        // Folder sizes first (from the City's scan tree) so a sort by Size can
+        // use them on the initial read.
+        self.recompute_folder_sizes();
+        self.pane.reload_entries(self.show_hidden);
+    }
+
+    fn apply_filter(&mut self) {
+        self.pane.apply_filter(self.show_hidden);
+    }
+
+    fn type_ahead_list(&mut self, ui: &egui::Ui) {
+        if self.pane.type_ahead_list(ui) {
+            self.focus_pane = Focus::List;
         }
     }
 
     // ---- Selection (multi-select) ----
-
-    fn clear_selection(&mut self) {
-        self.pane.sel.clear();
-        self.pane.lead = None;
-        self.pane.anchor = None;
-    }
-
-    /// Select exactly row `i` (plain click / arrow).
-    fn select_only(&mut self, i: usize) {
-        self.pane.sel.clear();
-        if let Some(e) = self.pane.entries.get(i) {
-            self.pane.sel.insert(e.name.clone());
-            self.pane.lead = Some(i);
-            self.pane.anchor = Some(i);
-        }
-    }
-
-    /// Toggle row `i` in the selection (Ctrl+click).
-    fn toggle_at(&mut self, i: usize) {
-        if let Some(e) = self.pane.entries.get(i) {
-            let name = e.name.clone();
-            if !self.pane.sel.remove(&name) {
-                self.pane.sel.insert(name);
-            }
-            self.pane.lead = Some(i);
-            self.pane.anchor = Some(i);
-        }
-    }
-
-    /// Select the inclusive range `anchor..=i` (Shift+click / Shift+arrow),
-    /// keeping `anchor` fixed and moving `lead` to `i`. If there's no anchor yet
-    /// (extending from an empty state), establish one at `i` so the next extend
-    /// grows the range instead of resetting it.
-    fn select_range_to(&mut self, i: usize) {
-        let a = self.pane.anchor.unwrap_or(i);
-        self.pane.anchor = Some(a);
-        let (lo, hi) = (a.min(i), a.max(i));
-        self.pane.sel.clear();
-        for e in self.pane.entries.iter().skip(lo).take(hi - lo + 1) {
-            self.pane.sel.insert(e.name.clone());
-        }
-        self.pane.lead = Some(i);
-    }
-
-    /// The item single-item ops (Open / Rename / Properties) should target: the
-    /// lead if it's actually selected, else the sole selected item, else none.
-    /// (Guards against Ctrl+click deselecting the lead but ops still hitting it.)
-    fn op_target(&self) -> Option<usize> {
-        if let Some(i) = self.pane.lead {
-            if self.pane.entries.get(i).is_some_and(|e| self.pane.sel.contains(&e.name)) {
-                return Some(i);
-            }
-        }
-        if self.pane.sel.len() == 1 {
-            let name = self.pane.sel.iter().next()?;
-            return self.pane.entries.iter().position(|e| &e.name == name);
-        }
-        None
-    }
-
-    fn lead_entry(&self) -> Option<&Entry> {
-        self.pane.lead.and_then(|i| self.pane.entries.get(i))
-    }
-
-    /// Selected entries' absolute paths, in listing order.
-    fn selected_paths(&self) -> Vec<PathBuf> {
-        self.pane.entries
-            .iter()
-            .filter(|e| self.pane.sel.contains(&e.name))
-            .map(|e| self.pane.current_dir.join(&e.name))
-            .collect()
-    }
-
-    /// The size to sort/show for an entry: files use their own size; folders use
-    /// their scanned subtree size when one is known (else 0).
-    fn entry_size(&self, e: &Entry) -> u64 {
-        if e.is_dir {
-            self.pane.folder_sizes
-                .as_ref()
-                .and_then(|m| m.get(&e.name.to_lowercase()))
-                .copied()
-                .unwrap_or(0)
-        } else {
-            e.size
-        }
-    }
-
-    fn sort_entries(&self, es: &mut [Entry]) {
-        let (key, asc) = (self.pane.sort_key, self.pane.sort_asc);
-        es.sort_by(|a, b| {
-            // Folders always first, then by the chosen key.
-            b.is_dir.cmp(&a.is_dir).then_with(|| {
-                let o = match key {
-                    SortKey::Name => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
-                    SortKey::Size => self.entry_size(a).cmp(&self.entry_size(b)),
-                    SortKey::Kind => entry_kind(a).cmp(&entry_kind(b)),
-                    SortKey::Modified => a.modified.cmp(&b.modified),
-                };
-                if asc {
-                    o
-                } else {
-                    o.reverse()
-                }
-            })
-        });
-    }
-
-    fn reload_entries(&mut self) {
-        self.pane.drive_space = drive_space(&self.pane.current_dir);
-        // Refresh folder sizes first so the initial sort (by Size) can use them.
-        self.recompute_folder_sizes();
-        match list_dir(&self.pane.current_dir) {
-            Ok(mut es) => {
-                self.sort_entries(&mut es);
-                self.pane.all_entries = es;
-                self.pane.entries_err = None;
-            }
-            Err(e) => {
-                self.pane.all_entries.clear();
-                self.pane.entries_err = Some(e.to_string());
-            }
-        }
-        self.apply_filter();
-        self.pane.addr_edit = self.pane.current_dir.to_string_lossy().into_owned();
-        self.pane.entries_dirty = false;
-        // The folder itself, for Details when the tree has focus (one stat).
-        self.pane.cur_entry = stat_entry(&self.pane.current_dir).ok();
-        // Honor a pending select-by-name (from "up" or F5) — but only in the
-        // folder it was meant for, so a stale value can't select elsewhere.
-        if let Some((dir, name)) = self.pane.select_after_reload.take() {
-            if dir == self.pane.current_dir {
-                if let Some(i) = self
-                    .pane.entries
-                    .iter()
-                    .position(|e| e.name.eq_ignore_ascii_case(&name))
-                {
-                    self.select_only(i);
-                    self.pane.scroll_target = Some(i);
-                }
-            }
-        }
-        // (apply_filter already refreshed the status summary for the new listing.)
-    }
-
-    /// Rebuild the visible `entries` from `all_entries` by the hidden toggle and
-    /// the text filter, preserving the selection by name. Cheap re-clone; call it
-    /// whenever the filter or the hidden toggle changes.
-    fn apply_filter(&mut self) {
-        let name_of = |i: Option<usize>| i.and_then(|i| self.pane.entries.get(i)).map(|e| e.name.clone());
-        let (lead_name, anchor_name) = (name_of(self.pane.lead), name_of(self.pane.anchor));
-        let show_hidden = self.show_hidden;
-        let f = self.pane.filter.trim().to_lowercase();
-        self.pane.entries = self
-            .pane.all_entries
-            .iter()
-            .filter(|e| {
-                (show_hidden || !e.is_hidden)
-                    && (f.is_empty() || e.name.to_lowercase().contains(&f))
-            })
-            .cloned()
-            .collect();
-        // Keep only selected names that are still visible; remap lead & anchor by
-        // their OWN names (don't collapse the range anchor into the lead).
-        let visible: HashSet<String> = self.pane.entries.iter().map(|e| e.name.clone()).collect();
-        self.pane.sel.retain(|n| visible.contains(n));
-        let pos = |n: Option<String>| n.and_then(|n| self.pane.entries.iter().position(|e| e.name == n));
-        self.pane.lead = pos(lead_name);
-        self.pane.anchor = pos(anchor_name);
-        // NB: scrolling to the selection is done by the sort handler, not here —
-        // a filter keystroke shouldn't yank the viewport.
-        self.refresh_status_summary();
-    }
 
     /// Recompute [`Self::folder_sizes`] for the current folder from an in-memory
     /// scan tree that covers it (the City's loaded/cached tree). Cheap — a lock,
@@ -1350,37 +1617,6 @@ impl SectorApp {
         self.pane.folder_sizes = self.compute_folder_sizes();
         let cur = self.pane.current_dir.clone();
         self.pane.cur_dir_size = self.scanned_subtree_size(&cur);
-    }
-
-    /// Recompute the cached status-footer summary. O(n) over the listing, but
-    /// only when it (or folder sizes) changes — never per frame.
-    fn refresh_status_summary(&mut self) {
-        if self.pane.entries_err.is_some() {
-            self.pane.status_summary.clear();
-            return;
-        }
-        let n = self.pane.entries.len();
-        let folders = self.pane.entries.iter().filter(|e| e.is_dir).count();
-        let total: u64 = self.pane.entries.iter().map(|e| self.entry_size(e)).sum();
-        // If a filter or the hidden toggle is narrowing the listing, lead with the
-        // shown-of-total count.
-        let hidden_or_filtered = n != self.pane.all_entries.len();
-        let prefix = if hidden_or_filtered {
-            format!("{} of {} shown · ", commas(n as u64), commas(self.pane.all_entries.len() as u64))
-        } else {
-            String::new()
-        };
-        let space = self
-            .pane.drive_space
-            .map(|(free, total)| format!(" · {} free of {}", human_size(free), human_size(total)))
-            .unwrap_or_default();
-        self.pane.status_summary = format!(
-            "{prefix}{} items · {} folders · {} files · {}{space}",
-            commas(n as u64),
-            commas(folders as u64),
-            commas((n - folders) as u64),
-            human_size(total),
-        );
     }
 
     fn compute_folder_sizes(&self) -> Option<HashMap<String, u64>> {
@@ -1471,76 +1707,8 @@ impl SectorApp {
     }
 
     fn open_new_folder(&mut self) {
-        let buf = self.unique_new_folder_name();
+        let buf = self.pane.unique_new_folder_name();
         self.prompt = Some(NamePrompt { kind: PromptKind::NewFolder, buf, error: None, focus: true });
-    }
-
-    /// "New folder", or "New folder (2)", … — the first name not already taken
-    /// (case-insensitively) in the current listing.
-    fn unique_new_folder_name(&self) -> String {
-        let taken =
-            |name: &str| self.pane.all_entries.iter().any(|e| e.name.eq_ignore_ascii_case(name));
-        if !taken("New folder") {
-            return "New folder".to_string();
-        }
-        for i in 2..10_000 {
-            let cand = format!("New folder ({i})");
-            if !taken(&cand) {
-                return cand;
-            }
-        }
-        format!("New folder ({})", now_unix())
-    }
-
-    /// Syntactic validation of a file/folder name — no listing needed: empty,
-    /// forbidden characters, reserved names, trailing dot. Returns the trimmed
-    /// name or an error.
-    fn validate_name_syntax(name: &str) -> Result<&str, String> {
-        let name = name.trim();
-        if name.is_empty() {
-            return Err("Name can't be empty.".into());
-        }
-        if name.contains(INVALID_NAME_CHARS) {
-            return Err("Name can't contain \\ / : * ? \" < > |".into());
-        }
-        if name == "." || name == ".." {
-            return Err("That name is reserved.".into());
-        }
-        if name.ends_with('.') {
-            // Windows drops a trailing dot, so "foo." would silently become "foo".
-            return Err("Name can't end with a dot.".into());
-        }
-        // Windows reserved device names (also when used as the base of an
-        // extension, e.g. "CON.txt"). A tailored message beats the raw OS error.
-        let base = name.split('.').next().unwrap_or(name).trim_end();
-        let up = base.to_ascii_uppercase();
-        let reserved = matches!(up.as_str(), "CON" | "PRN" | "AUX" | "NUL")
-            || ((up.starts_with("COM") || up.starts_with("LPT"))
-                && up.len() == 4
-                && matches!(up.as_bytes()[3], b'1'..=b'9'));
-        if reserved {
-            return Err(format!("\"{base}\" is a name reserved by Windows."));
-        }
-        Ok(name)
-    }
-
-    /// Validate `name` for the current folder; `allow` is the one existing name a
-    /// rename is allowed to keep (its own). Returns the trimmed name or an error.
-    fn validate_name<'a>(&self, name: &'a str, allow: Option<&str>) -> Result<&'a str, String> {
-        let name = Self::validate_name_syntax(name)?;
-        // Windows compares names case-insensitively in *Unicode* ("élan" ==
-        // "Élan"), not just ASCII — match that, or the check can miss a clash
-        // that the filesystem will treat as the same name.
-        let lname = name.to_lowercase();
-        let lallow = allow.map(str::to_lowercase);
-        let clashes = self.pane.all_entries.iter().any(|e| {
-            let en = e.name.to_lowercase();
-            en == lname && lallow.as_deref() != Some(en.as_str())
-        });
-        if clashes {
-            return Err("An item with that name already exists.".into());
-        }
-        Ok(name)
     }
 
     /// Apply a prompt's action to the filesystem. On success returns `Ok`; on a
@@ -1548,7 +1716,7 @@ impl SectorApp {
     fn commit_prompt(&mut self, prompt: &NamePrompt) -> Result<(), String> {
         match &prompt.kind {
             PromptKind::NewFolder => {
-                let name = self.validate_name(&prompt.buf, None)?.to_string();
+                let name = self.pane.validate_name(&prompt.buf, None)?.to_string();
                 let target = self.pane.current_dir.join(&name);
                 std::fs::create_dir(&target)
                     .map_err(|e| format!("Couldn't create the folder: {e}"))?;
@@ -1556,7 +1724,7 @@ impl SectorApp {
                 self.after_edit(name);
             }
             PromptKind::Rename { orig } => {
-                let name = self.validate_name(&prompt.buf, Some(orig))?.to_string();
+                let name = self.pane.validate_name(&prompt.buf, Some(orig))?.to_string();
                 if name == *orig {
                     return Ok(()); // no change — just close
                 }
@@ -1578,7 +1746,7 @@ impl SectorApp {
             PromptKind::RenameDir { dir } => {
                 // The folder we're IN: validate syntactically (its siblings aren't
                 // the current listing) and rely on the on-disk check below.
-                let name = Self::validate_name_syntax(&prompt.buf)?.to_string();
+                let name = validate_name_syntax(&prompt.buf)?.to_string();
                 let orig = dir
                     .file_name()
                     .map(|n| n.to_string_lossy().into_owned())
@@ -1606,7 +1774,7 @@ impl SectorApp {
                 }
                 if let Some(p) = reroot(&self.pane.current_dir, dir, &dst) {
                     self.pane.current_dir = p;
-                    self.sync_addr();
+                    self.pane.sync_addr();
                 }
                 self.sb_cache.clear();
                 self.pane.entries_dirty = true;
@@ -1616,20 +1784,12 @@ impl SectorApp {
         Ok(())
     }
 
-    /// Refresh views after a successful edit, and select the affected item.
-    fn after_edit(&mut self, select_name: String) {
-        self.pane.entries_dirty = true;
-        self.sb_cache.clear(); // the folder tree may have changed
-        self.pane.filter.clear(); // so the new/renamed item is visible
-        self.pane.select_after_reload = Some((self.pane.current_dir.clone(), select_name));
-    }
-
     /// Field list for the Details panel, or `None`. Describes the list's target
     /// item — or, when the tree has focus or nothing is selected, the folder
     /// you're IN (as Explorer's details pane does).
     fn selected_properties(&self) -> Option<Vec<(&'static str, String)>> {
         let tree_focus = self.focus_pane == Focus::Tree && self.sb_visible;
-        let item = if tree_focus { None } else { self.op_target().and_then(|i| self.pane.entries.get(i)) };
+        let item = if tree_focus { None } else { self.pane.op_target().and_then(|i| self.pane.entries.get(i)) };
         match item {
             Some(e) => {
                 let size = if e.is_dir {
@@ -1740,7 +1900,7 @@ impl SectorApp {
 
     /// Put the current selection (all selected items) on the clipboard.
     fn clip_selected(&mut self, cut: bool) {
-        let paths = self.selected_paths();
+        let paths = self.pane.selected_paths();
         if !paths.is_empty() {
             self.set_clipboard(paths, cut);
         }
@@ -1812,7 +1972,7 @@ impl SectorApp {
         if self.file_op_running() {
             return; // one background file operation at a time
         }
-        let paths = self.selected_paths();
+        let paths = self.pane.selected_paths();
         if !paths.is_empty() {
             self.confirm_delete = Some(paths);
         }
@@ -1889,38 +2049,6 @@ impl SectorApp {
         });
         self.op_error = None;
         self.undo_job = Some((rx, entry, redo));
-    }
-
-    /// Refresh views after a background op touched `item`; if it lives in the
-    /// folder we're looking at, clear the filter and select it. (An op that
-    /// completed after you navigated elsewhere no longer reselects by name in
-    /// the wrong folder.)
-    fn after_op(&mut self, item: &Path) {
-        self.pane.entries_dirty = true;
-        self.sb_cache.clear();
-        if item.parent() == Some(self.pane.current_dir.as_path()) {
-            self.pane.filter.clear();
-            self.pane.select_after_reload = Some((self.pane.current_dir.clone(), name_of(item)));
-        }
-    }
-
-    /// If the folder we're IN no longer exists (deleted, undone), step out to
-    /// its nearest surviving ancestor — in place, not as a history step.
-    fn step_out_if_gone(&mut self) {
-        if std::fs::symlink_metadata(&self.pane.current_dir).is_ok() {
-            return;
-        }
-        let mut p = self.pane.current_dir.clone();
-        while let Some(parent) = p.parent().map(Path::to_path_buf) {
-            p = parent;
-            if std::fs::symlink_metadata(&p).is_ok() {
-                break;
-            }
-        }
-        self.pane.current_dir = p;
-        self.sync_addr();
-        self.clear_selection();
-        self.sb_reveal();
     }
 
     // ---- Folder-tree sidebar (E1b.2) ----
@@ -2157,7 +2285,7 @@ impl SectorApp {
                 TreeAct::Props => {
                     self.navigate_to(path.clone());
                     self.reload_entries(); // Details describes this folder at once
-                    self.clear_selection();
+                    self.pane.clear_selection();
                     self.props_visible = true;
                 }
             }
@@ -2340,7 +2468,7 @@ impl SectorApp {
             }
             if bar.clicked() && !self.menu_open_at_start {
                 // (A click that merely dismissed a chevron menu doesn't count.)
-                self.begin_addr_edit();
+                self.pane.begin_addr_edit();
             }
             if let Some(p) = go {
                 self.navigate_to(p);
@@ -2509,11 +2637,11 @@ impl SectorApp {
                     .pane.entries
                     .iter()
                     .filter(|e| self.pane.sel.contains(&e.name))
-                    .map(|e| self.entry_size(e))
+                    .map(|e| self.pane.entry_size(e))
                     .sum();
                 Some(format!("{} selected · {}", self.pane.sel.len(), human_size(total)))
             } else {
-                self.lead_entry().filter(|e| self.pane.sel.contains(&e.name)).map(|e| {
+                self.pane.lead_entry().filter(|e| self.pane.sel.contains(&e.name)).map(|e| {
                     let mut s = e.name.clone();
                     let known = !e.is_dir
                         || self
@@ -2522,7 +2650,7 @@ impl SectorApp {
                             .map(|m| m.contains_key(&e.name.to_lowercase()))
                             .unwrap_or(false);
                     if known {
-                        s.push_str(&format!(" · {}", human_size(self.entry_size(e))));
+                        s.push_str(&format!(" · {}", human_size(self.pane.entry_size(e))));
                     }
                     if let Some(m) = e.modified {
                         s.push_str(&format!(" · {}", humanize_age(m)));
@@ -2639,7 +2767,7 @@ impl SectorApp {
             if let Some(a) = bg_act {
                 self.focus_pane = Focus::List;
                 match a {
-                    BgAct::Deselect => self.clear_selection(),
+                    BgAct::Deselect => self.pane.clear_selection(),
                     BgAct::Paste => self.start_paste(),
                     BgAct::NewFolder => self.open_new_folder(),
                     BgAct::SelectAll => {
@@ -2653,7 +2781,7 @@ impl SectorApp {
                     }
                     BgAct::Reveal => reveal_in_explorer(&self.pane.current_dir, true),
                     BgAct::Props => {
-                        self.clear_selection(); // Details then shows the folder itself
+                        self.pane.clear_selection(); // Details then shows the folder itself
                         self.props_visible = true;
                     }
                 }
@@ -3019,7 +3147,7 @@ impl SectorApp {
             }
             if let Some(i) = drag_start {
                 if !self.pane.entries.get(i).is_some_and(|e| self.pane.sel.contains(&e.name)) {
-                    self.select_only(i);
+                    self.pane.select_only(i);
                 }
                 self.focus_pane = Focus::List;
             }
@@ -3039,11 +3167,11 @@ impl SectorApp {
             // Apply a click: Shift = range, Ctrl = toggle, plain = select one.
             if let Some(i) = click {
                 if mods.shift {
-                    self.select_range_to(i);
+                    self.pane.select_range_to(i);
                 } else if mods.ctrl {
-                    self.toggle_at(i);
+                    self.pane.toggle_at(i);
                 } else {
-                    self.select_only(i);
+                    self.pane.select_only(i);
                 }
                 self.focus_pane = Focus::List; // keyboard now drives the list
             }
@@ -3053,7 +3181,7 @@ impl SectorApp {
                 let in_sel =
                     self.pane.entries.get(i).map(|e| self.pane.sel.contains(&e.name)).unwrap_or(false);
                 if !in_sel {
-                    self.select_only(i);
+                    self.pane.select_only(i);
                 }
             }
             if let Some(k) = new_sort {
@@ -3066,7 +3194,7 @@ impl SectorApp {
                 // Re-sort the full listing IN PLACE (no directory re-read), then
                 // re-apply the filter (which preserves the selection by name).
                 let mut es = std::mem::take(&mut self.pane.all_entries);
-                self.sort_entries(&mut es);
+                self.pane.sort_entries(&mut es);
                 self.pane.all_entries = es;
                 self.apply_filter();
                 self.pane.scroll_target = self.pane.lead; // keep the selection visible
@@ -3118,7 +3246,7 @@ impl SectorApp {
                     self.pane.filter.clear();
                     self.apply_filter();
                 } else if !self.pane.sel.is_empty() || self.pane.lead.is_some() {
-                    self.clear_selection();
+                    self.pane.clear_selection();
                 } else if self.props_visible {
                     self.props_visible = false;
                 }
@@ -3137,7 +3265,7 @@ impl SectorApp {
             }
             // Ctrl+Shift+C: copy the path(s) — the focused folder, or the selection.
             if ui.input(|i| i.modifiers.ctrl && i.modifiers.shift && i.key_pressed(egui::Key::C)) {
-                let paths = if tree_focus { vec![self.pane.current_dir.clone()] } else { self.selected_paths() };
+                let paths = if tree_focus { vec![self.pane.current_dir.clone()] } else { self.pane.selected_paths() };
                 if !paths.is_empty() {
                     let text: Vec<String> = paths.iter().map(|p| p.to_string_lossy().into_owned()).collect();
                     ui.ctx().copy_text(text.join("\n"));
@@ -3145,7 +3273,7 @@ impl SectorApp {
             }
             // Shift+F10: open the context menu on the list's target row.
             if !tree_focus && ui.input(|i| i.modifiers.shift && i.key_pressed(egui::Key::F10)) {
-                if let Some(i) = self.op_target().or(self.pane.lead) {
+                if let Some(i) = self.pane.op_target().or(self.pane.lead) {
                     self.pane.lead = Some(i);
                     self.pane.scroll_target = Some(i); // the row must be rendered to host it
                     self.pane.kbd_menu_req = true;
@@ -3154,7 +3282,7 @@ impl SectorApp {
             // Ctrl+Space: toggle the lead row in the selection (keyboard Ctrl+click).
             if !tree_focus && ui.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::Space)) {
                 if let Some(l) = self.pane.lead {
-                    self.toggle_at(l);
+                    self.pane.toggle_at(l);
                 }
             }
             // F5 / Ctrl+R: re-read the current folder AND drop the (lazy) tree
@@ -3164,8 +3292,8 @@ impl SectorApp {
                 i.key_pressed(egui::Key::F5) || (i.modifiers.ctrl && i.key_pressed(egui::Key::R))
             });
             if refresh {
-                let keep = self.lead_entry().map(|e| e.name.clone());
-                self.clear_selection();
+                let keep = self.pane.lead_entry().map(|e| e.name.clone());
+                self.pane.clear_selection();
                 if let Some(name) = keep {
                     self.pane.select_after_reload = Some((self.pane.current_dir.clone(), name));
                 }
@@ -3198,7 +3326,7 @@ impl SectorApp {
                 if tree_focus {
                     self.open_rename_dir();
                 } else if let Some(name) =
-                    self.op_target().and_then(|i| self.pane.entries.get(i)).map(|e| e.name.clone())
+                    self.pane.op_target().and_then(|i| self.pane.entries.get(i)).map(|e| e.name.clone())
                 {
                     self.open_rename(name);
                 }
@@ -3242,7 +3370,7 @@ impl SectorApp {
             if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                 if ui.input(|i| i.modifiers.alt) {
                     // Alt+Enter: Details for the focused folder, or the target item.
-                    if tree_focus || self.op_target().is_some() {
+                    if tree_focus || self.pane.op_target().is_some() {
                         self.props_visible = true;
                     }
                 } else if tree_focus {
@@ -3275,7 +3403,7 @@ impl SectorApp {
                     }
                 } else {
                     let action = self
-                        .op_target()
+                        .pane.op_target()
                         .and_then(|i| self.pane.entries.get(i))
                         .map(|e| (self.pane.current_dir.join(&e.name), e.is_dir));
                     if let Some((full, is_dir)) = action {
@@ -3328,14 +3456,14 @@ impl SectorApp {
                     if let Some(m) = moved {
                         if moved != cur {
                             if shift {
-                                self.select_range_to(m);
+                                self.pane.select_range_to(m);
                             } else if ctrl {
                                 // Ctrl+move: move the focus cursor only — then
                                 // Ctrl+Space toggles it (Explorer's model for a
                                 // non-contiguous selection by keyboard).
                                 self.pane.lead = Some(m);
                             } else {
-                                self.select_only(m);
+                                self.pane.select_only(m);
                             }
                             self.pane.scroll_target = Some(m);
                             ui.ctx().request_repaint();
@@ -3411,64 +3539,11 @@ impl SectorApp {
         ui.ctx().request_repaint();
     }
 
-    /// Update the type-ahead buffer from this frame's typed text (egui Text
-    /// events, so Ctrl-combos don't trigger it). Returns `(lowercased query,
-    /// is_repeat)` if a letter was typed this frame, else `None`. The buffer
-    /// resets after a short pause; `is_repeat` marks the same single letter again.
-    fn type_ahead_input(&mut self, ui: &egui::Ui) -> Option<(String, bool)> {
-        let typed: String = ui.input(|i| {
-            i.events
-                .iter()
-                .filter_map(|e| match e {
-                    egui::Event::Text(t) => Some(t.as_str()),
-                    _ => None,
-                })
-                .collect()
-        });
-        if typed.is_empty() {
-            return None;
-        }
-        let typed = typed.to_lowercase();
-        let now = Instant::now();
-        let timed_out = now.duration_since(self.pane.type_ahead_time) >= Duration::from_millis(900);
-        let repeat = !timed_out
-            && self.pane.type_ahead.chars().count() == 1
-            && typed.chars().count() == 1
-            && self.pane.type_ahead == typed;
-        if timed_out {
-            self.pane.type_ahead = typed;
-        } else if !repeat {
-            self.pane.type_ahead.push_str(&typed);
-        }
-        self.pane.type_ahead_time = now;
-        Some((self.pane.type_ahead.clone(), repeat))
-    }
-
-    /// Type-ahead in the file list: jump to the first matching name; repeating a
-    /// letter cycles through matches.
-    fn type_ahead_list(&mut self, ui: &egui::Ui) {
-        if self.pane.entries.is_empty() {
-            return;
-        }
-        let Some((q, repeat)) = self.type_ahead_input(ui) else { return };
-        let n = self.pane.entries.len();
-        let start = if repeat { self.pane.lead.map_or(0, |i| i + 1) } else { 0 };
-        let hit = (0..n)
-            .map(|off| (start + off) % n)
-            .find(|&i| self.pane.entries[i].name.to_lowercase().starts_with(&q));
-        if let Some(i) = hit {
-            self.select_only(i);
-            self.pane.scroll_target = Some(i);
-            self.focus_pane = Focus::List;
-            ui.ctx().request_repaint();
-        }
-    }
-
     /// Type-ahead in the folder tree: jump to the next visible node (after the
     /// current one, wrapping) whose name matches — so it cycles forward through
     /// matches rather than yanking back to the top of the tree.
     fn type_ahead_tree(&mut self, ui: &egui::Ui) {
-        let Some((q, _repeat)) = self.type_ahead_input(ui) else { return };
+        let Some((q, _repeat)) = self.pane.type_ahead_input(ui) else { return };
         let visible = self.sb_visible_nodes();
         let n = visible.len();
         if n == 0 {
@@ -4526,7 +4601,7 @@ impl eframe::App for SectorApp {
             // The finished scan now covers the current folder — surface its
             // subfolder sizes in the list.
             self.recompute_folder_sizes();
-            self.refresh_status_summary();
+            self.pane.refresh_status_summary();
         }
 
         // Poll a background paste (E5) for completion.
@@ -4599,7 +4674,7 @@ impl eframe::App for SectorApp {
             }
             match out.error {
                 None => {
-                    self.clear_selection(); // items are gone
+                    self.pane.clear_selection(); // items are gone
                     self.op_error = None;
                     // If the folder we were IN is gone (tree-focused Delete), step
                     // out to its parent.
@@ -4641,7 +4716,7 @@ impl eframe::App for SectorApp {
                     if let UndoOp::Rename { from, to } = &entry.op {
                         if let Some(p) = reroot(&self.pane.current_dir, from, to) {
                             self.pane.current_dir = p;
-                            self.sync_addr();
+                            self.pane.sync_addr();
                             self.sb_reveal();
                         }
                     }
@@ -4679,7 +4754,7 @@ impl eframe::App for SectorApp {
                     || (i.modifiers.ctrl && i.key_pressed(egui::Key::L))
             })
         {
-            self.begin_addr_edit();
+            self.pane.begin_addr_edit();
         }
 
         // Inbound drag-and-drop (from Explorer or any app): files dropped on the
