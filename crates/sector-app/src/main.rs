@@ -4483,8 +4483,7 @@ impl eframe::App for SectorApp {
         // ---- Top strip: identity + view mode + shared navigation -----------
         egui::Panel::top("mode").show(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.strong(sector_core::APP_NAME);
-                ui.separator();
+                // (No app-name label here: the window title already says SECTOR.)
                 ui.selectable_value(&mut self.view, View::List, "Files");
                 ui.selectable_value(&mut self.view, View::City, "City");
                 ui.separator();
