@@ -121,6 +121,60 @@ impl UndoOp {
 
 /// How many operations Undo remembers.
 const UNDO_CAP: usize = 50;
+/// How many folders the Back/Forward history menus list.
+const HISTORY_MENU: usize = 12;
+
+/// A deferred action from the folder tree's context menu (acts on THAT folder).
+enum TreeAct {
+    Open,
+    Toggle,
+    Reveal,
+    CopyPath,
+    Clip(bool),
+    Paste,
+    Delete,
+    Rename,
+    NewFolder,
+    Props,
+}
+
+/// A deferred action from the file list's background (empty-space) menu.
+enum BgAct {
+    Deselect,
+    Paste,
+    NewFolder,
+    SelectAll,
+    Refresh,
+    Reveal,
+    Props,
+}
+
+/// If `path` is `from` or inside it, the same path under `to`. Used to follow
+/// the folder we're in when it (or an ancestor) is renamed.
+fn reroot(path: &Path, from: &Path, to: &Path) -> Option<PathBuf> {
+    let rest = path.strip_prefix(from).ok()?;
+    Some(if rest.as_os_str().is_empty() { to.to_path_buf() } else { to.join(rest) })
+}
+
+/// Hover text for a list row: the full (unclipped) name plus the essentials.
+fn row_tooltip(e: &Entry, sizes: Option<&HashMap<String, u64>>) -> String {
+    let mut s = e.name.clone();
+    if e.is_dir {
+        match sizes.and_then(|m| m.get(&e.name.to_lowercase())) {
+            Some(sz) => s.push_str(&format!("\nFolder · {}", human_size(*sz))),
+            None => s.push_str("\nFolder"),
+        }
+    } else {
+        s.push_str(&format!("\n{} · {}", categorize(&e.name).label(), human_size(e.size)));
+    }
+    if let Some(m) = e.modified {
+        s.push_str(&format!("\nModified {} ({})", format_datetime(m), humanize_age(m)));
+    }
+    if e.is_symlink {
+        s.push_str("\nLink / reparse point");
+    }
+    s
+}
 
 /// The last path component for messages (or the whole path for a root).
 fn name_of(p: &Path) -> String {
@@ -1233,7 +1287,12 @@ impl SectorApp {
 
     /// F2 with the folder tree focused: rename the folder you're in.
     fn open_rename_dir(&mut self) {
-        let dir = self.current_dir.clone();
+        let d = self.current_dir.clone();
+        self.open_rename_dir_at(d);
+    }
+
+    /// Rename any folder (tree context menu, or the one you're in).
+    fn open_rename_dir_at(&mut self, dir: PathBuf) {
         let Some(name) = dir.file_name().map(|n| n.to_string_lossy().into_owned()) else {
             return; // a drive root has no name to edit
         };
@@ -1255,11 +1314,17 @@ impl SectorApp {
 
     /// Delete with the tree focused: the folder you're in (never a drive root).
     fn request_delete_current_dir(&mut self) {
+        let d = self.current_dir.clone();
+        self.request_delete_dir(d);
+    }
+
+    /// Ask to delete one folder (tree context menu / tree-focused Delete).
+    fn request_delete_dir(&mut self, dir: PathBuf) {
         if self.file_op_running() {
             return; // one background file operation at a time
         }
-        if self.current_dir.parent().is_some() {
-            self.confirm_delete = Some(vec![self.current_dir.clone()]);
+        if dir.parent().is_some() {
+            self.confirm_delete = Some(vec![dir]);
         }
     }
 
@@ -1389,12 +1454,15 @@ impl SectorApp {
                 }
                 std::fs::rename(dir, &dst).map_err(|e| format!("Couldn't rename: {e}"))?;
                 self.push_undo(UndoOp::Rename { from: dst.clone(), to: dir.clone() });
-                // Follow the folder to its new name — in place, not a history step.
+                // Follow the folder to its new name if we're in it (or inside
+                // it) — in place, not a history step.
                 if self.sb_expanded.remove(dir) {
                     self.sb_expanded.insert(dst.clone());
                 }
-                self.current_dir = dst;
-                self.sync_addr();
+                if let Some(p) = reroot(&self.current_dir, dir, &dst) {
+                    self.current_dir = p;
+                    self.sync_addr();
+                }
                 self.sb_cache.clear();
                 self.entries_dirty = true;
                 self.sb_reveal();
@@ -1411,21 +1479,27 @@ impl SectorApp {
         self.select_after_reload = Some((self.current_dir.clone(), select_name));
     }
 
-    /// Field list for the Details panel, or `None`. With the folder tree
-    /// focused it describes the folder you're IN; otherwise the list's target.
+    /// Field list for the Details panel, or `None`. Describes the list's target
+    /// item — or, when the tree has focus or nothing is selected, the folder
+    /// you're IN (as Explorer's details pane does).
     fn selected_properties(&self) -> Option<Vec<(&'static str, String)>> {
-        if self.focus_pane == Pane::Tree && self.sb_visible {
-            let e = self.cur_entry.as_ref()?;
-            let location = self.current_dir.parent().unwrap_or(&self.current_dir).to_path_buf();
-            return Some(self.properties_of(e, &location, self.cur_dir_size));
+        let tree_focus = self.focus_pane == Pane::Tree && self.sb_visible;
+        let item = if tree_focus { None } else { self.op_target().and_then(|i| self.entries.get(i)) };
+        match item {
+            Some(e) => {
+                let size = if e.is_dir {
+                    self.folder_sizes.as_ref().and_then(|m| m.get(&e.name.to_lowercase())).copied()
+                } else {
+                    None
+                };
+                Some(self.properties_of(e, &self.current_dir, size))
+            }
+            None => {
+                let e = self.cur_entry.as_ref()?;
+                let location = self.current_dir.parent().unwrap_or(&self.current_dir).to_path_buf();
+                Some(self.properties_of(e, &location, self.cur_dir_size))
+            }
         }
-        let e = self.entries.get(self.op_target()?)?;
-        let size = if e.is_dir {
-            self.folder_sizes.as_ref().and_then(|m| m.get(&e.name.to_lowercase())).copied()
-        } else {
-            None
-        };
-        Some(self.properties_of(e, &self.current_dir, size))
     }
 
     /// The scanned subtree size of `dir`, if the City's completed (not
@@ -1518,11 +1592,16 @@ impl SectorApp {
 
     /// Start pasting the clipboard into the current folder (background thread).
     fn start_paste(&mut self) {
+        let dest = self.current_dir.clone();
+        self.start_paste_into(dest);
+    }
+
+    /// Start pasting the clipboard into `dest_dir` (background thread).
+    fn start_paste_into(&mut self, dest_dir: PathBuf) {
         if self.file_op_running() {
             return; // one background file operation at a time
         }
         let Some(clip) = &self.clipboard else { return };
-        let dest_dir = self.current_dir.clone();
         let sources = clip.paths.clone();
         let cut = clip.cut;
 
@@ -1838,6 +1917,55 @@ impl SectorApp {
             }
         }
 
+        // Right-click: act on THIS folder (not necessarily the current one).
+        let is_root = path.parent().is_none();
+        let can_paste = self.clipboard.is_some() && !self.file_op_running();
+        let mut act: Option<TreeAct> = None;
+        resp.context_menu(|ui| {
+            let mut item = |ui: &mut egui::Ui, enabled: bool, label: &str, a: TreeAct| {
+                if ui.add_enabled(enabled, egui::Button::new(label)).clicked() {
+                    act = Some(a);
+                    ui.close();
+                }
+            };
+            item(ui, true, "Open", TreeAct::Open);
+            item(ui, true, if open { "Collapse" } else { "Expand" }, TreeAct::Toggle);
+            item(ui, true, "Open in Explorer", TreeAct::Reveal);
+            item(ui, true, "Copy path", TreeAct::CopyPath);
+            ui.separator();
+            item(ui, !is_root, "Copy", TreeAct::Clip(false));
+            item(ui, !is_root, "Cut", TreeAct::Clip(true));
+            item(ui, can_paste, "Paste into", TreeAct::Paste);
+            item(ui, !is_root, "Delete", TreeAct::Delete);
+            ui.separator();
+            item(ui, !is_root, "Rename…", TreeAct::Rename);
+            item(ui, true, "New folder…", TreeAct::NewFolder);
+            ui.separator();
+            item(ui, true, "Properties", TreeAct::Props);
+        });
+        if let Some(a) = act {
+            self.focus_pane = Pane::Tree;
+            match a {
+                TreeAct::Open => navigate = true,
+                TreeAct::Toggle => toggle = true,
+                TreeAct::Reveal => reveal_in_explorer(&path, true),
+                TreeAct::CopyPath => ui.ctx().copy_text(path.to_string_lossy().into_owned()),
+                TreeAct::Clip(cut) => self.set_clipboard(vec![path.clone()], cut),
+                TreeAct::Paste => self.start_paste_into(path.clone()),
+                TreeAct::Delete => self.request_delete_dir(path.clone()),
+                TreeAct::Rename => self.open_rename_dir_at(path.clone()),
+                TreeAct::NewFolder => {
+                    self.navigate_to(path.clone());
+                    self.open_new_folder();
+                }
+                TreeAct::Props => {
+                    self.navigate_to(path.clone());
+                    self.clear_selection();
+                    self.props_visible = true;
+                }
+            }
+        }
+
         if toggle {
             if open {
                 self.sb_expanded.remove(&path);
@@ -1873,10 +2001,41 @@ impl SectorApp {
     /// The shared navigation strip: back / forward / up + the address bar. Drives
     /// `current_dir`, which BOTH views follow (E2).
     fn nav_bar(&mut self, ui: &mut egui::Ui) {
-        if ui.add_enabled(!self.back_stack.is_empty(), egui::Button::new("◀")).on_hover_text("Back").clicked() {
+        // Back / Forward: a click steps once; a right-click lists the history so
+        // you can jump straight to a folder (browser-style).
+        let (mut back_n, mut fwd_n) = (0usize, 0usize);
+        let back = ui
+            .add_enabled(!self.back_stack.is_empty(), egui::Button::new("◀"))
+            .on_hover_text("Back (right-click for history)");
+        if back.clicked() {
+            back_n = 1;
+        }
+        back.context_menu(|ui| {
+            for (n, (p, _)) in self.back_stack.iter().rev().take(HISTORY_MENU).enumerate() {
+                if ui.button(p.to_string_lossy().into_owned()).clicked() {
+                    back_n = n + 1;
+                    ui.close();
+                }
+            }
+        });
+        let fwd = ui
+            .add_enabled(!self.fwd_stack.is_empty(), egui::Button::new("▶"))
+            .on_hover_text("Forward (right-click for history)");
+        if fwd.clicked() {
+            fwd_n = 1;
+        }
+        fwd.context_menu(|ui| {
+            for (n, (p, _)) in self.fwd_stack.iter().rev().take(HISTORY_MENU).enumerate() {
+                if ui.button(p.to_string_lossy().into_owned()).clicked() {
+                    fwd_n = n + 1;
+                    ui.close();
+                }
+            }
+        });
+        for _ in 0..back_n {
             self.go_back();
         }
-        if ui.add_enabled(!self.fwd_stack.is_empty(), egui::Button::new("▶")).on_hover_text("Forward").clicked() {
+        for _ in 0..fwd_n {
             self.go_forward();
         }
         if ui
@@ -1933,14 +2092,39 @@ impl SectorApp {
             let last = segs.len().saturating_sub(1);
             ui.spacing_mut().item_spacing.x = 2.0;
             for (i, (label, path)) in segs.iter().enumerate() {
-                if i > 0 {
-                    ui.weak("›");
-                }
                 if i == last {
                     ui.strong(label); // current folder — not a link
                 } else if ui.add(egui::Button::new(label).frame(false)).clicked() {
                     go = Some(path.clone());
                 }
+                // The chevron after a segment lists that folder's subfolders, so
+                // you can step sideways into a sibling without going up first.
+                let chev = ui.add(egui::Button::new("›").frame(false).small());
+                let pid = egui::Popup::default_response_id(&chev);
+                let kids = (chev.clicked() || egui::Popup::is_id_open(ui.ctx(), pid))
+                    .then(|| self.sb_children(path));
+                egui::Popup::menu(&chev).show(|ui| {
+                    ui.set_min_width(160.0);
+                    match kids.as_deref() {
+                        Some([]) | None => {
+                            ui.weak("(no subfolders)");
+                        }
+                        Some(list) => {
+                            const CAP: usize = 200;
+                            egui::ScrollArea::vertical().max_height(420.0).show(ui, |ui| {
+                                for k in list.iter().take(CAP) {
+                                    if ui.button(name_of(k)).clicked() {
+                                        go = Some(k.clone());
+                                        ui.close();
+                                    }
+                                }
+                                if list.len() > CAP {
+                                    ui.weak(format!("… {} more", list.len() - CAP));
+                                }
+                            });
+                        }
+                    }
+                });
             }
             if ui.button("Edit").on_hover_text("Edit the path as text (Alt+D, Ctrl+L, F4)").clicked() {
                 self.begin_addr_edit();
@@ -2194,6 +2378,55 @@ impl SectorApp {
         }
 
         egui::CentralPanel::default().show(ui, |ui| {
+            // The list background, registered FIRST so the rows (added later) sit
+            // on top of it: a click on empty space deselects, a right-click opens
+            // the folder's own menu (Paste / New folder / …). Present even when
+            // the folder is empty or unreadable.
+            let bg = ui.interact(ui.max_rect(), egui::Id::new("files_bg"), Sense::click());
+            let mut bg_act: Option<BgAct> = None;
+            if bg.clicked() {
+                bg_act = Some(BgAct::Deselect);
+            }
+            let can_paste_here = self.clipboard.is_some() && !self.file_op_running();
+            bg.context_menu(|ui| {
+                let mut item = |ui: &mut egui::Ui, enabled: bool, label: &str, a: BgAct| {
+                    if ui.add_enabled(enabled, egui::Button::new(label)).clicked() {
+                        bg_act = Some(a);
+                        ui.close();
+                    }
+                };
+                item(ui, can_paste_here, "Paste", BgAct::Paste);
+                item(ui, true, "New folder…", BgAct::NewFolder);
+                ui.separator();
+                item(ui, true, "Select all", BgAct::SelectAll);
+                item(ui, true, "Refresh", BgAct::Refresh);
+                ui.separator();
+                item(ui, true, "Open in Explorer", BgAct::Reveal);
+                item(ui, true, "Properties", BgAct::Props);
+            });
+            if let Some(a) = bg_act {
+                self.focus_pane = Pane::List;
+                match a {
+                    BgAct::Deselect => self.clear_selection(),
+                    BgAct::Paste => self.start_paste(),
+                    BgAct::NewFolder => self.open_new_folder(),
+                    BgAct::SelectAll => {
+                        self.sel = self.entries.iter().map(|e| e.name.clone()).collect();
+                        self.lead = self.entries.len().checked_sub(1);
+                        self.anchor = Some(0);
+                    }
+                    BgAct::Refresh => {
+                        self.entries_dirty = true;
+                        self.sb_cache.clear();
+                    }
+                    BgAct::Reveal => reveal_in_explorer(&self.current_dir, true),
+                    BgAct::Props => {
+                        self.clear_selection(); // Details then shows the folder itself
+                        self.props_visible = true;
+                    }
+                }
+            }
+
             if let Some(err) = self.entries_err.clone() {
                 ui.centered_and_justified(|ui| {
                     ui.weak(format!("⚠  {err}"));
@@ -2377,7 +2610,8 @@ impl SectorApp {
                             });
                         });
                         let full = cur.join(&e.name);
-                        let resp = row.response();
+                        // Hover: the full (unclipped) name + essentials, like Explorer.
+                        let resp = row.response().on_hover_text(row_tooltip(e, folder_sizes.as_ref()));
                         if resp.clicked() {
                             click = Some(row.index());
                         }
@@ -3992,8 +4226,8 @@ impl eframe::App for SectorApp {
                     self.op_error = None;
                     // Follow the folder we're IN if the undo renamed it.
                     if let UndoOp::Rename { from, to } = &op {
-                        if self.current_dir == *from {
-                            self.current_dir = to.clone();
+                        if let Some(p) = reroot(&self.current_dir, from, to) {
+                            self.current_dir = p;
                             self.sync_addr();
                             self.sb_reveal();
                         }
@@ -4034,6 +4268,22 @@ impl eframe::App for SectorApp {
             })
         {
             self.begin_addr_edit();
+        }
+
+        // Mouse side buttons (browser-style Back / Forward), in both views.
+        if self.prompt.is_none() && self.confirm_delete.is_none() {
+            let (back, fwd) = ctx.input(|i| {
+                (
+                    i.pointer.button_pressed(egui::PointerButton::Extra1),
+                    i.pointer.button_pressed(egui::PointerButton::Extra2),
+                )
+            });
+            if back {
+                self.go_back();
+            }
+            if fwd {
+                self.go_forward();
+            }
         }
 
         if self.view == View::List {
@@ -4850,6 +5100,15 @@ mod tests {
         app.go_forward();
         assert_eq!(app.current_dir, PathBuf::from("/b"));
         assert_eq!(app.back_stack, vec![(PathBuf::from("/a"), None)]); // cursor wasn't restored yet (no reload) — recorded as-is
+    }
+
+    #[test]
+    fn reroot_follows_renames() {
+        let (from, to) = (Path::new("/x/old"), Path::new("/x/new"));
+        assert_eq!(reroot(Path::new("/x/old"), from, to), Some(PathBuf::from("/x/new"))); // the folder itself
+        assert_eq!(reroot(Path::new("/x/old/a/b"), from, to), Some(PathBuf::from("/x/new/a/b"))); // inside it
+        assert_eq!(reroot(Path::new("/x/older"), from, to), None); // a sibling with a common prefix is NOT inside
+        assert_eq!(reroot(Path::new("/y"), from, to), None);
     }
 
     #[test]
