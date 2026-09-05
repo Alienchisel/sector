@@ -2185,7 +2185,20 @@ impl SectorApp {
             }
         } else {
             self.addr_active = false;
-            // Clickable breadcrumb, then a pencil to switch to the text field.
+            // The bar itself, registered FIRST so the segments (added later) sit
+            // on top: a click on its empty space switches to the text field, as
+            // in Explorer. A faint hover fill + I-beam cursor make that visible.
+            let bar = ui.interact(
+                ui.available_rect_before_wrap(),
+                egui::Id::new("addr_bar_bg"),
+                Sense::click(),
+            );
+            if bar.hovered() {
+                ui.painter().rect_filled(bar.rect, 4.0_f32, ui.visuals().widgets.hovered.weak_bg_fill);
+                ui.ctx().set_cursor_icon(egui::CursorIcon::Text);
+            }
+            let bar = bar.on_hover_text("Click to edit the path (Alt+D, Ctrl+L, F4)");
+            // Clickable breadcrumb.
             let mut go: Option<PathBuf> = None;
             let segs = breadcrumb_segments(&self.current_dir);
             let last = segs.len().saturating_sub(1);
@@ -2225,7 +2238,7 @@ impl SectorApp {
                     }
                 });
             }
-            if ui.button("Edit").on_hover_text("Edit the path as text (Alt+D, Ctrl+L, F4)").clicked() {
+            if bar.clicked() {
                 self.begin_addr_edit();
             }
             if let Some(p) = go {
