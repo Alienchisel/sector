@@ -54,7 +54,8 @@ enum View {
 }
 
 /// Clipboard contents for cut/copy/paste (E5). `cut` = move on paste; otherwise
-/// copy. Holds paths (a Vec for future multi-select; currently one).
+/// copy. On Windows this MIRRORS the system file clipboard (see
+/// [`sys_clipboard`]), so it also holds files cut/copied in Explorer.
 struct Clipboard {
     paths: Vec<PathBuf>,
     cut: bool,
@@ -419,6 +420,9 @@ struct SectorApp {
     prompt: Option<NamePrompt>,
     /// Cut/copy clipboard (E5).
     clipboard: Option<Clipboard>,
+    /// Last seen Windows clipboard sequence number — when it changes, the
+    /// system clipboard is re-read into `clipboard` (cheap to poll per frame).
+    clip_seq: u32,
     /// A paste running in the background, if any.
     paste_job: Option<PasteJob>,
     /// Paths awaiting delete confirmation (the modal is up), if any.
@@ -524,6 +528,7 @@ impl Default for SectorApp {
             status_summary: String::new(),
             prompt: None,
             clipboard: None,
+            clip_seq: 0,
             paste_job: None,
             confirm_delete: None,
             delete_job: None,
@@ -1106,8 +1111,7 @@ impl SectorApp {
     /// clipboard (never a drive root).
     fn clip_current_dir(&mut self, cut: bool) {
         if self.current_dir.parent().is_some() {
-            self.clipboard = Some(Clipboard { paths: vec![self.current_dir.clone()], cut });
-            self.op_error = None;
+            self.set_clipboard(vec![self.current_dir.clone()], cut);
         }
     }
 
@@ -1354,12 +1358,21 @@ impl SectorApp {
 
     // ---- Cut / copy / paste (E5) ----
 
+    /// Put `paths` on the clipboard — ours AND the Windows file clipboard, so
+    /// Explorer (and any other app) can paste them, and sees a Cut as a cut.
+    fn set_clipboard(&mut self, paths: Vec<PathBuf>, cut: bool) {
+        if !sys_clipboard::write(&paths, cut) {
+            eprintln!("[sector] clipboard: system clipboard unavailable — kept internally");
+        }
+        self.clipboard = Some(Clipboard { paths, cut });
+        self.op_error = None;
+    }
+
     /// Put the current selection (all selected items) on the clipboard.
     fn clip_selected(&mut self, cut: bool) {
         let paths = self.selected_paths();
         if !paths.is_empty() {
-            self.clipboard = Some(Clipboard { paths, cut });
-            self.op_error = None;
+            self.set_clipboard(paths, cut);
         }
     }
 
@@ -3156,6 +3169,237 @@ fn is_network_path(_path: &Path) -> bool {
     false
 }
 
+/// The Windows file clipboard — `CF_HDROP` plus the "Preferred DropEffect"
+/// flag — so Cut/Copy/Paste interoperate with Explorer and other apps. The
+/// `DROPFILES` encode/decode is pure and unit-tested on Linux; only the
+/// clipboard calls are Windows-specific (raw Win32, like the rest of the app).
+/// Non-Windows builds get inert stubs so the app still checks and tests there.
+mod sys_clipboard {
+    #![cfg_attr(not(windows), allow(dead_code))]
+    use std::path::PathBuf;
+
+    /// Files on the clipboard, and whether they were Cut (= move on paste).
+    pub struct Files {
+        pub paths: Vec<PathBuf>,
+        pub cut: bool,
+    }
+
+    /// `DROPFILES` header: offset to the list, drop point (x, y), non-client
+    /// flag, wide-char flag — followed by NUL-terminated paths and a final NUL.
+    const HEADER: usize = 20;
+    const DROPEFFECT_COPY: u32 = 1;
+    const DROPEFFECT_MOVE: u32 = 2;
+
+    /// Build a `CF_HDROP` payload (UTF-16 paths).
+    pub fn hdrop_encode(paths: &[PathBuf]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(HEADER + 64 * paths.len());
+        out.extend_from_slice(&(HEADER as u32).to_le_bytes()); // pFiles
+        out.extend_from_slice(&0i32.to_le_bytes()); // pt.x
+        out.extend_from_slice(&0i32.to_le_bytes()); // pt.y
+        out.extend_from_slice(&0i32.to_le_bytes()); // fNC
+        out.extend_from_slice(&1i32.to_le_bytes()); // fWide
+        for p in paths {
+            for u in p.to_string_lossy().encode_utf16() {
+                out.extend_from_slice(&u.to_le_bytes());
+            }
+            out.extend_from_slice(&0u16.to_le_bytes());
+        }
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out
+    }
+
+    /// Parse a `CF_HDROP` payload (wide or, from an old app, ANSI).
+    pub fn hdrop_decode(bytes: &[u8]) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        if bytes.len() < HEADER {
+            return out;
+        }
+        let u32_at = |i: usize| u32::from_le_bytes([bytes[i], bytes[i + 1], bytes[i + 2], bytes[i + 3]]);
+        let start = u32_at(0) as usize;
+        let wide = u32_at(16) != 0;
+        if start > bytes.len() {
+            return out;
+        }
+        if wide {
+            let units: Vec<u16> =
+                bytes[start..].chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+            for s in units.split(|&u| u == 0) {
+                if s.is_empty() {
+                    break; // the double NUL
+                }
+                out.push(PathBuf::from(String::from_utf16_lossy(s)));
+            }
+        } else {
+            for s in bytes[start..].split(|&b| b == 0) {
+                if s.is_empty() {
+                    break;
+                }
+                out.push(PathBuf::from(s.iter().map(|&b| b as char).collect::<String>()));
+            }
+        }
+        out
+    }
+
+    #[cfg(windows)]
+    mod imp {
+        use super::{hdrop_decode, hdrop_encode, Files, DROPEFFECT_COPY, DROPEFFECT_MOVE};
+        use std::ffi::c_void;
+        use std::os::windows::ffi::OsStrExt;
+        use std::path::PathBuf;
+
+        const CF_HDROP: u32 = 15;
+        const GMEM_MOVEABLE: u32 = 0x0002;
+
+        #[link(name = "user32")]
+        extern "system" {
+            fn OpenClipboard(hwnd: *mut c_void) -> i32;
+            fn CloseClipboard() -> i32;
+            fn EmptyClipboard() -> i32;
+            fn GetClipboardData(format: u32) -> *mut c_void;
+            fn SetClipboardData(format: u32, h: *mut c_void) -> *mut c_void;
+            fn IsClipboardFormatAvailable(format: u32) -> i32;
+            fn RegisterClipboardFormatW(name: *const u16) -> u32;
+            fn GetClipboardSequenceNumber() -> u32;
+        }
+        extern "system" {
+            fn GlobalAlloc(flags: u32, bytes: usize) -> *mut c_void;
+            fn GlobalLock(h: *mut c_void) -> *mut c_void;
+            fn GlobalUnlock(h: *mut c_void) -> i32;
+            fn GlobalSize(h: *mut c_void) -> usize;
+            fn GlobalFree(h: *mut c_void) -> *mut c_void;
+        }
+
+        /// Holds the clipboard open; closes it on drop. Retries briefly — another
+        /// app may have it open for a moment.
+        struct Open;
+        impl Open {
+            fn new() -> Option<Self> {
+                for _ in 0..4 {
+                    if unsafe { OpenClipboard(std::ptr::null_mut()) } != 0 {
+                        return Some(Open);
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                None
+            }
+        }
+        impl Drop for Open {
+            fn drop(&mut self) {
+                unsafe { CloseClipboard() };
+            }
+        }
+
+        /// The registered "Preferred DropEffect" format (0 if registration fails,
+        /// which `GetClipboardData` then simply doesn't find).
+        fn effect_format() -> u32 {
+            let name: Vec<u16> = std::ffi::OsStr::new("Preferred DropEffect")
+                .encode_wide()
+                .chain(std::iter::once(0))
+                .collect();
+            unsafe { RegisterClipboardFormatW(name.as_ptr()) }
+        }
+
+        /// Copy a clipboard handle's bytes out (clipboard must be open).
+        fn global_bytes(h: *mut c_void) -> Option<Vec<u8>> {
+            if h.is_null() {
+                return None;
+            }
+            unsafe {
+                let p = GlobalLock(h) as *const u8;
+                if p.is_null() {
+                    return None;
+                }
+                let v = std::slice::from_raw_parts(p, GlobalSize(h)).to_vec();
+                GlobalUnlock(h);
+                Some(v)
+            }
+        }
+
+        /// Bytes → a fresh movable global block. Ownership passes to the system
+        /// on a successful `SetClipboardData`; the caller frees it otherwise.
+        fn global_from(bytes: &[u8]) -> *mut c_void {
+            unsafe {
+                let h = GlobalAlloc(GMEM_MOVEABLE, bytes.len());
+                if h.is_null() {
+                    return h;
+                }
+                let p = GlobalLock(h) as *mut u8;
+                if p.is_null() {
+                    GlobalFree(h);
+                    return std::ptr::null_mut();
+                }
+                std::ptr::copy_nonoverlapping(bytes.as_ptr(), p, bytes.len());
+                GlobalUnlock(h);
+                h
+            }
+        }
+
+        pub fn sequence() -> u32 {
+            unsafe { GetClipboardSequenceNumber() }
+        }
+
+        pub fn read() -> Option<Files> {
+            if unsafe { IsClipboardFormatAvailable(CF_HDROP) } == 0 {
+                return None; // cheap pre-check, no open needed
+            }
+            let _open = Open::new()?;
+            let paths = hdrop_decode(&global_bytes(unsafe { GetClipboardData(CF_HDROP) })?);
+            if paths.is_empty() {
+                return None;
+            }
+            let effect = global_bytes(unsafe { GetClipboardData(effect_format()) })
+                .filter(|b| b.len() >= 4)
+                .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                .unwrap_or(DROPEFFECT_COPY);
+            // Explorer marks a Cut as MOVE (2) and a Copy as COPY|LINK (5).
+            let cut = effect & DROPEFFECT_MOVE != 0 && effect & DROPEFFECT_COPY == 0;
+            Some(Files { paths, cut })
+        }
+
+        pub fn write(paths: &[PathBuf], cut: bool) -> bool {
+            let Some(_open) = Open::new() else { return false };
+            unsafe { EmptyClipboard() };
+            let h = global_from(&hdrop_encode(paths));
+            if h.is_null() {
+                return false;
+            }
+            if unsafe { SetClipboardData(CF_HDROP, h) }.is_null() {
+                unsafe { GlobalFree(h) };
+                return false;
+            }
+            let effect = if cut { DROPEFFECT_MOVE } else { DROPEFFECT_COPY };
+            let e = global_from(&effect.to_le_bytes());
+            if !e.is_null() && unsafe { SetClipboardData(effect_format(), e) }.is_null() {
+                unsafe { GlobalFree(e) };
+            }
+            true
+        }
+
+        pub fn clear() {
+            if let Some(_open) = Open::new() {
+                unsafe { EmptyClipboard() };
+            }
+        }
+    }
+    #[cfg(windows)]
+    pub use imp::{clear, read, sequence, write};
+
+    #[cfg(not(windows))]
+    pub fn sequence() -> u32 {
+        0
+    }
+    #[cfg(not(windows))]
+    pub fn read() -> Option<Files> {
+        None
+    }
+    #[cfg(not(windows))]
+    pub fn write(_paths: &[PathBuf], _cut: bool) -> bool {
+        false
+    }
+    #[cfg(not(windows))]
+    pub fn clear() {}
+}
+
 /// Hand-drawn tooltip near the cursor. egui's widget tooltip anchors to the
 /// widget rect — our widget is the whole panel, so it would land in the corner;
 /// we draw our own at the pointer instead.
@@ -3200,6 +3444,16 @@ impl eframe::App for SectorApp {
         if title != self.last_title {
             ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
             self.last_title = title;
+        }
+
+        // Mirror the Windows file clipboard: files cut/copied in Explorer (or by
+        // us) become our clipboard; anything else on it (text…) clears ours,
+        // as in Explorer. The sequence number makes this a trivial per-frame
+        // check; the clipboard is only opened when it actually changed.
+        let seq = sys_clipboard::sequence();
+        if seq != self.clip_seq {
+            self.clip_seq = seq;
+            self.clipboard = sys_clipboard::read().map(|f| Clipboard { paths: f.paths, cut: f.cut });
         }
 
         // Poll the background scan for completion.
@@ -3291,6 +3545,7 @@ impl eframe::App for SectorApp {
             // stale and must not be re-pasted.
             if paste_was_cut {
                 self.clipboard = None;
+                sys_clipboard::clear(); // Explorer does the same after a cut is pasted
             }
             match result {
                 Ok(name) => {
@@ -4030,6 +4285,39 @@ mod tests {
         assert!(!d.join("m.txt").exists()); // source gone (moved)
         assert_eq!(std::fs::read(dest.join("m.txt")).unwrap(), b"data");
         std::fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn hdrop_round_trip() {
+        use super::sys_clipboard::{hdrop_decode, hdrop_encode};
+        let paths = vec![
+            PathBuf::from(r"C:\Users\me\photo élan.jpg"), // non-ASCII survives UTF-16
+            PathBuf::from(r"\\nas\Media\Manga"),
+        ];
+        let bytes = hdrop_encode(&paths);
+        // DROPFILES header: pFiles = 20, fWide = 1.
+        assert_eq!(&bytes[0..4], &20u32.to_le_bytes());
+        assert_eq!(&bytes[16..20], &1i32.to_le_bytes());
+        assert!(bytes.ends_with(&[0, 0, 0, 0])); // "…\0" then the final "\0"
+        assert_eq!(hdrop_decode(&bytes), paths);
+
+        // Empty list still has a valid header + terminator, and decodes to nothing.
+        assert!(hdrop_decode(&hdrop_encode(&[])).is_empty());
+        // Garbage is rejected, not panicked on.
+        assert!(hdrop_decode(&[1, 2, 3]).is_empty());
+        assert!(hdrop_decode(&[200, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0]).is_empty());
+    }
+
+    #[test]
+    fn hdrop_decodes_ansi_lists() {
+        use super::sys_clipboard::hdrop_decode;
+        // An ANSI (fWide = 0) payload from an old app: "C:\a\0D:\b\0\0".
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&20u32.to_le_bytes());
+        bytes.extend_from_slice(&[0u8; 12]); // pt, fNC
+        bytes.extend_from_slice(&0i32.to_le_bytes()); // fWide = 0
+        bytes.extend_from_slice(b"C:\\a\0D:\\b\0\0");
+        assert_eq!(hdrop_decode(&bytes), vec![PathBuf::from(r"C:\a"), PathBuf::from(r"D:\b")]);
     }
 
     #[test]

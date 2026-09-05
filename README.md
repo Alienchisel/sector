@@ -38,9 +38,11 @@ went.
   **Reveal in Explorer**, **Copy path** (`Ctrl+Shift+C`) **/ name**.
 - **New folder** (`Ctrl+Shift+N`) and **Rename** (`F2`) — validated (bad chars,
   reserved names, duplicates), extension preserved on rename.
-- **Cut / Copy / Paste** (`Ctrl+X/C/V`) — runs in the background, **never
-  overwrites** (auto-renames to "… - Copy"), a cut source is removed only after
-  its copy succeeds, cross-volume moves fall back to copy-then-delete.
+- **Cut / Copy / Paste** (`Ctrl+X/C/V`) — shares the **Windows clipboard** with
+  Explorer, so files copied or cut there paste here and vice versa. Runs in the
+  background, **never overwrites** (auto-renames to "… - Copy"), a cut source is
+  removed only after its copy succeeds, cross-volume moves fall back to
+  copy-then-delete.
 - **Delete** (`Del`) → the **Recycle Bin** on local drives, with a confirmation.
   Network drives have no Windows Recycle Bin, so those delete for real (and are
   caught by your NAS's own recycle bin, e.g. Synology's `#recycle`, if enabled) —

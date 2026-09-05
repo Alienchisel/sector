@@ -262,6 +262,9 @@ safest-first — destructive ops must be bulletproof (see D16, D1).
   Shift, Ctrl+A) drives batch copy/cut/delete. **Delete → Recycle Bin** (Del /
   context menu) via the `trash` crate (IFileOperation), with a confirmation and a
   background worker. *Shift+Delete permanent-delete intentionally not offered.*
+  **System clipboard ✅** — Cut/Copy write `CF_HDROP` + "Preferred DropEffect"
+  to the Windows clipboard and the app mirrors it (via the clipboard sequence
+  number), so it interoperates with Explorer in both directions.
 - **E6 — Incremental freshness (D17)  ◐**: **slice 1 ✅** — the cache stores a
   USN watermark (journal id + next USN) at scan completion and, on reload,
   reports the cached view as Current / Stale / Unknown (`sector-scan::usn`).
