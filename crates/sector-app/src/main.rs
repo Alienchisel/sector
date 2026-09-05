@@ -138,6 +138,22 @@ enum TreeAct {
     Props,
 }
 
+/// The egui drag-and-drop payload for an internal drag: the paths being
+/// dragged (the selection, or the single row the drag started on).
+struct DragFiles {
+    paths: Vec<PathBuf>,
+}
+
+impl DragFiles {
+    /// Can these be dropped INTO `dest`? Not onto one of themselves (or inside
+    /// one), and not back into the folder they're already in (a no-op).
+    fn can_drop_into(&self, dest: &Path) -> bool {
+        let onto_self = self.paths.iter().any(|s| dest.starts_with(s));
+        let same_folder = self.paths.iter().all(|s| s.parent() == Some(dest));
+        !onto_self && !same_folder
+    }
+}
+
 /// A deferred action from the file list's background (empty-space) menu.
 enum BgAct {
     Deselect,
@@ -1915,6 +1931,21 @@ impl SectorApp {
             egui::FontId::proportional(14.0),
             text_col,
         );
+        // Drop target for an internal drag (Ctrl = copy): any folder that isn't
+        // one of the dragged items (or inside one) or their current folder.
+        let mut dropped: Option<Vec<PathBuf>> = None;
+        if let Some(p) = resp.dnd_hover_payload::<DragFiles>() {
+            if p.can_drop_into(&path) {
+                painter.rect_stroke(rect, 2.0_f32, Stroke::new(2.0, sel_fg), egui::StrokeKind::Inside);
+                if let Some(p) = resp.dnd_release_payload::<DragFiles>() {
+                    dropped = Some(p.paths.clone());
+                }
+            }
+        }
+        if let Some(paths) = dropped {
+            let copy = ui.ctx().input(|i| i.modifiers.ctrl);
+            self.start_transfer(paths, path.clone(), !copy);
+        }
         if resp.hovered() {
             ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
         }
@@ -2478,6 +2509,10 @@ impl SectorApp {
             let list_focus = !(self.focus_pane == Pane::Tree && self.sb_visible);
             let lead_color = ui.visuals().selection.stroke.color;
             let (kbd_req, kbd_open) = (self.kbd_menu_req, self.kbd_menu_open);
+            // Internal drag-and-drop bookkeeping (applied after the table).
+            let mut drag_start: Option<usize> = None;
+            let mut drop_target: Option<(PathBuf, Vec<PathBuf>)> = None;
+            let mut drop_hover_rect: Option<Rect> = None;
             let mut click: Option<usize> = None;
             let mut menu_row: Option<usize> = None;
             let mut nav_target: Option<PathBuf> = None;
@@ -2539,7 +2574,7 @@ impl SectorApp {
             let mut table = TableBuilder::new(ui)
                 .striped(true)
                 .resizable(true) // drag the header separators; widths persist
-                .sense(Sense::click())
+                .sense(Sense::click_and_drag()) // rows are drag sources
                 .column(Column::remainder().at_least(220.0).clip(true))
                 .column(Column::auto().at_least(90.0))
                 .column(Column::auto().at_least(90.0))
@@ -2625,6 +2660,28 @@ impl SectorApp {
                         let full = cur.join(&e.name);
                         // Hover: the full (unclipped) name + essentials, like Explorer.
                         let resp = row.response().on_hover_text(row_tooltip(e, folder_sizes.as_ref()));
+                        // Drag source: dragging a selected row drags the whole
+                        // selection; dragging an unselected row drags just it.
+                        if resp.drag_started() {
+                            let paths: Vec<PathBuf> = if sel.contains(&e.name) {
+                                entries.iter().filter(|x| sel.contains(&x.name)).map(|x| cur.join(&x.name)).collect()
+                            } else {
+                                vec![full.clone()]
+                            };
+                            egui::DragAndDrop::set_payload(&resp.ctx, DragFiles { paths });
+                            drag_start = Some(row_index);
+                        }
+                        // Drop target: a folder row (not one being dragged).
+                        if e.is_dir {
+                            if let Some(p) = resp.dnd_hover_payload::<DragFiles>() {
+                                if p.can_drop_into(&full) {
+                                    drop_hover_rect = Some(resp.rect);
+                                    if let Some(p) = resp.dnd_release_payload::<DragFiles>() {
+                                        drop_target = Some((full.clone(), p.paths.clone()));
+                                    }
+                                }
+                            }
+                        }
                         if resp.clicked() {
                             click = Some(row.index());
                         }
@@ -2709,6 +2766,21 @@ impl SectorApp {
             self.entries = entries;
             self.folder_sizes = folder_sizes;
             self.sel = sel;
+            // Drag-and-drop: highlight the hovered folder row; select the row a
+            // drag started on (Explorer does); perform a drop (Ctrl = copy).
+            if let Some(r) = drop_hover_rect {
+                ui.painter().rect_stroke(r, 3.0_f32, Stroke::new(2.0, lead_color), egui::StrokeKind::Inside);
+            }
+            if let Some(i) = drag_start {
+                if !self.entries.get(i).is_some_and(|e| self.sel.contains(&e.name)) {
+                    self.select_only(i);
+                }
+                self.focus_pane = Pane::List;
+            }
+            if let Some((dest, paths)) = drop_target {
+                let copy = ui.ctx().input(|i| i.modifiers.ctrl);
+                self.start_transfer(paths, dest, !copy);
+            }
             // Keyboard context menu: the request was consumed by the lead row
             // this frame; once the menu closes, stop anchoring to it.
             if self.kbd_menu_req {
@@ -4822,6 +4894,33 @@ impl eframe::App for SectorApp {
             }
         }
 
+        // Internal drag in progress: a badge follows the pointer saying what a
+        // drop will do (Ctrl switches move → copy), with a matching cursor.
+        if let Some(p) = egui::DragAndDrop::payload::<DragFiles>(&ctx) {
+            let (down, released) = ctx.input(|i| (i.pointer.any_down(), i.pointer.any_released()));
+            if !down && !released {
+                // Released last frame onto nothing that took it: drop the payload
+                // so the badge can't linger.
+                egui::DragAndDrop::clear_payload(&ctx);
+            } else if let Some(pos) = ctx.pointer_latest_pos() {
+                let copy = ctx.input(|i| i.modifiers.ctrl);
+                let n = p.paths.len();
+                let what = if n == 1 { name_of(&p.paths[0]) } else { format!("{n} items") };
+                let text = format!("{} {what}", if copy { "Copy" } else { "Move" });
+                let painter = ctx.layer_painter(egui::LayerId::new(
+                    egui::Order::Tooltip,
+                    egui::Id::new("sector_drag_badge"),
+                ));
+                let galley = painter.layout_no_wrap(text, egui::FontId::proportional(13.0), Color32::WHITE);
+                let pad = Vec2::new(8.0, 5.0);
+                let bg = Rect::from_min_size(pos + Vec2::new(16.0, 16.0), galley.size() + pad * 2.0);
+                painter.rect_filled(bg, 5.0_f32, Color32::from_rgba_unmultiplied(12, 16, 28, 235));
+                painter.galley(bg.min + pad, galley, Color32::WHITE);
+                ctx.set_cursor_icon(if copy { egui::CursorIcon::Copy } else { egui::CursorIcon::Grabbing });
+                ctx.request_repaint();
+            }
+        }
+
         // Drop overlay: while files hover over the window, tint it and say what
         // a drop will do. Foreground layer, so it sits over every panel.
         if self.drop_hover > 0 {
@@ -5153,6 +5252,19 @@ mod tests {
         app.go_forward();
         assert_eq!(app.current_dir, PathBuf::from("/b"));
         assert_eq!(app.back_stack, vec![(PathBuf::from("/a"), None)]); // cursor wasn't restored yet (no reload) — recorded as-is
+    }
+
+    #[test]
+    fn drag_payload_refuses_self_and_same_folder_drops() {
+        let d = DragFiles { paths: vec![PathBuf::from("/a/x"), PathBuf::from("/a/y.txt")] };
+        assert!(d.can_drop_into(Path::new("/b"))); // elsewhere
+        assert!(d.can_drop_into(Path::new("/a/z"))); // a sibling folder
+        assert!(!d.can_drop_into(Path::new("/a"))); // where they already are — a no-op
+        assert!(!d.can_drop_into(Path::new("/a/x"))); // onto one of themselves
+        assert!(!d.can_drop_into(Path::new("/a/x/deep"))); // inside one of themselves
+        // Items from different folders: /a is no longer "where they all are".
+        let d2 = DragFiles { paths: vec![PathBuf::from("/a/x"), PathBuf::from("/c/y")] };
+        assert!(d2.can_drop_into(Path::new("/a")));
     }
 
     #[test]

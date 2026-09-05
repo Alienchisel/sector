@@ -273,7 +273,10 @@ safest-first — destructive ops must be bulletproof (see D16, D1).
   any app) are copied into the current folder via the paste engine, with a
   full-window drop overlay. Copy only: the OS drag owns the keyboard, and
   winit reports no drop position, so it's the current folder rather than a
-  row. *Outbound drag (to Explorer) needs OLE and is not done.*
+  row. **Internal drag-and-drop ✅** — rows drag the selection (egui's
+  payload API); folder rows and tree nodes accept drops: move, or copy with
+  Ctrl; refuses drops onto/inside a dragged item or back into its own folder.
+  *Outbound drag (to Explorer) needs OLE and is not done.*
 - **E6 — Incremental freshness (D17)  ◐**: **slice 1 ✅** — the cache stores a
   USN watermark (journal id + next USN) at scan completion and, on reload,
   reports the cached view as Current / Stale / Unknown (`sector-scan::usn`).
