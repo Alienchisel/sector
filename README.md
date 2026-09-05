@@ -56,6 +56,9 @@ went.
   Network drives have no Windows Recycle Bin, so those delete for real (and are
   caught by your NAS's own recycle bin, e.g. Synology's `#recycle`, if enabled) —
   the dialog says so.
+- **Drag and drop in** — drop files from Explorer (or any app) onto the window
+  to copy them into the current folder. Always a copy, never a move, and
+  undoable.
 - **Undo** (`Ctrl+Z`, or the footer button) — reverses the last rename, new
   folder, paste (copy or move, even a partial one), or delete (restored from the
   Recycle Bin). Never overwrites: an undo that would collide stops and says so.

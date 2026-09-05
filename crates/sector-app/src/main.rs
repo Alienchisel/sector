@@ -599,6 +599,9 @@ struct SectorApp {
     /// The scanned subtree size of `current_dir` (with `folder_sizes`), for the
     /// tree-focused Details — recomputed with the folder sizes, not per frame.
     cur_dir_size: Option<u64>,
+    /// Files currently being dragged over the window (from Explorer or any
+    /// app), for the drop overlay. 0 when nothing is hovering.
+    drop_hover: usize,
     /// Was a popup/menu open when this frame began? A popup closed by Esc is
     /// already gone by the time the shortcuts run, so without this the same
     /// Esc would go on to clear the selection.
@@ -701,6 +704,7 @@ impl Default for SectorApp {
             kbd_menu_open: false,
             cur_entry: None,
             cur_dir_size: None,
+            drop_hover: 0,
             menu_open_at_start: false,
             sb_visible: true,
             focus_pane: Pane::List,
@@ -1598,12 +1602,21 @@ impl SectorApp {
 
     /// Start pasting the clipboard into `dest_dir` (background thread).
     fn start_paste_into(&mut self, dest_dir: PathBuf) {
+        let Some(clip) = &self.clipboard else { return };
+        let (sources, cut) = (clip.paths.clone(), clip.cut);
+        self.start_transfer(sources, dest_dir, cut);
+    }
+
+    /// Copy (or move, if `cut`) `sources` into `dest_dir` on a background
+    /// thread — the engine behind Paste and inbound drag-and-drop.
+    fn start_transfer(&mut self, sources: Vec<PathBuf>, dest_dir: PathBuf, cut: bool) {
         if self.file_op_running() {
+            self.op_error = Some("Wait for the current file operation to finish.".into());
             return; // one background file operation at a time
         }
-        let Some(clip) = &self.clipboard else { return };
-        let sources = clip.paths.clone();
-        let cut = clip.cut;
+        if sources.is_empty() {
+            return;
+        }
 
         // Validate on the UI thread (fast) before spawning the worker. Compare
         // CANONICAL paths so case differences and junction/mapped-drive aliases
@@ -4270,6 +4283,22 @@ impl eframe::App for SectorApp {
             self.begin_addr_edit();
         }
 
+        // Inbound drag-and-drop (from Explorer or any app): files dropped on the
+        // window are COPIED into the folder you're looking at. Never a move —
+        // the OS drag owns the keyboard, so Shift/Ctrl can't be read reliably,
+        // and a copy is the safe default (and undoable). winit reports the
+        // files but not the drop position, so the target is the current folder
+        // rather than a row under the pointer.
+        let dropped: Vec<PathBuf> = ctx.input(|i| {
+            use egui::DroppedFile as _; // the `path()` accessor
+            i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).collect()
+        });
+        if !dropped.is_empty() && self.prompt.is_none() && self.confirm_delete.is_none() {
+            let dest = self.current_dir.clone();
+            self.start_transfer(dropped, dest, false);
+        }
+        self.drop_hover = ctx.input(|i| i.raw.hovered_files.len());
+
         // Mouse side buttons (browser-style Back / Forward), in both views.
         if self.prompt.is_none() && self.confirm_delete.is_none() {
             let (back, fwd) = ctx.input(|i| {
@@ -4793,6 +4822,32 @@ impl eframe::App for SectorApp {
             } else {
                 self.prompt = Some(prompt); // still open
             }
+        }
+
+        // Drop overlay: while files hover over the window, tint it and say what
+        // a drop will do. Foreground layer, so it sits over every panel.
+        if self.drop_hover > 0 {
+            let painter = ctx.layer_painter(egui::LayerId::new(
+                egui::Order::Foreground,
+                egui::Id::new("sector_drop_overlay"),
+            ));
+            let r = ctx.content_rect().shrink(6.0);
+            painter.rect_filled(r, 8.0_f32, Color32::from_rgba_unmultiplied(40, 90, 160, 70));
+            painter.rect_stroke(
+                r,
+                8.0_f32,
+                Stroke::new(2.0, Color32::from_rgb(120, 180, 255)),
+                egui::StrokeKind::Inside,
+            );
+            let n = self.drop_hover;
+            let what = if n == 1 { "1 item".to_string() } else { format!("{n} items") };
+            let text = format!("Drop to copy {what} into {}", self.current_dir.display());
+            let galley = painter.layout_no_wrap(text, egui::FontId::proportional(20.0), Color32::WHITE);
+            let pad = Vec2::new(18.0, 12.0);
+            let bg = Rect::from_center_size(r.center(), galley.size() + pad * 2.0);
+            painter.rect_filled(bg, 8.0_f32, Color32::from_rgba_unmultiplied(12, 16, 28, 230));
+            painter.galley(bg.min + pad, galley, Color32::WHITE);
+            ctx.request_repaint();
         }
 
         // Kick off the queued cache write now that this frame's render (and its
