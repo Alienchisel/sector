@@ -2650,7 +2650,12 @@ impl SectorApp {
                 .striped(true)
                 .resizable(true) // drag the header separators; widths persist
                 .sense(Sense::click_and_drag()) // rows are drag sources
-                .column(Column::remainder().at_least(220.0).clip(true))
+                // Name is the flexible column and must stay NON-resizable: a
+                // resizable column keeps its stored width, so it wouldn't shrink
+                // when the list narrows (e.g. the Details panel opens) and the
+                // other columns would be pushed off the edge. Resize the others;
+                // Name absorbs the difference.
+                .column(Column::remainder().at_least(220.0).clip(true).resizable(false))
                 .column(Column::auto().at_least(90.0))
                 .column(Column::auto().at_least(90.0))
                 .column(Column::auto().at_least(90.0));
