@@ -688,7 +688,13 @@ struct SectorApp {
 
     // Cached layout tiles + the derived cityscape + the state they're for.
     tiles: Vec<Tile>,
+    /// World-space blocks (stage 1) — rebuilt with the layout.
+    blocks: Vec<Block3>,
+    /// The projected scene (stage 2) — rebuilt when the blocks or the camera change.
     scape: Scape,
+    camera: Camera,
+    /// The camera `scape` was projected with.
+    last_camera: Camera,
     last_layout: Instant,
     last_root: NodeId,
     last_size: Vec2,
@@ -796,7 +802,10 @@ impl Default for SectorApp {
             // spacing than full-Kowloon, taller towers than dusk.
             opts: LayoutOptions { max_depth: 16, min_tile: 7.0, padding: 1.2 },
             tiles: Vec::new(),
+            blocks: Vec::new(),
             scape: Scape::default(),
+            camera: Camera::default(),
+            last_camera: Camera::default(),
             last_layout: Instant::now(),
             last_root: Tree::ROOT,
             last_size: Vec2::ZERO,
@@ -3576,42 +3585,120 @@ impl SectorApp {
 
 }
 
-/// One extruded block (a leaf tile), pre-projected to screen space.
+/// One extruded block (a leaf tile) in WORLD space: its footprint on the
+/// layout plane, its height, and its colour — before any camera. Built by
+/// [`build_blocks`]; [`project_scene`] turns these into screen quads.
+struct Block3 {
+    node: NodeId,
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+    /// Height above the plane (0 = a flat chip).
+    z: f64,
+    color: Color32,
+}
+
+/// A projected block: its top, the (≤ 2) side faces that face the camera with
+/// their shade factor, and its ground shadow — all in screen space.
 struct IsoBlock {
     node: NodeId,
     top: [Pos2; 4],
-    right: [Pos2; 4],
-    front: [Pos2; 4],
+    sides: Vec<([Pos2; 4], f32)>,
     shadow: [Pos2; 4],
     color: Color32,
 }
 
-/// The whole scene: a ground plinth plus the blocks, all pre-projected.
+/// The whole scene: a ground plinth plus the blocks, all pre-projected and in
+/// back-to-front order.
 struct Scape {
     plinth_top: [Pos2; 4],
-    plinth_right: [Pos2; 4],
-    plinth_front: [Pos2; 4],
+    plinth_sides: Vec<([Pos2; 4], Color32)>,
     blocks: Vec<IsoBlock>,
 }
 
 impl Default for Scape {
     fn default() -> Self {
-        let z = [Pos2::ZERO; 4];
-        Scape { plinth_top: z, plinth_right: z, plinth_front: z, blocks: Vec::new() }
+        Scape { plinth_top: [Pos2::ZERO; 4], plinth_sides: Vec::new(), blocks: Vec::new() }
     }
 }
 
-// Dimetric projection: x→right, y→left, z→up.
+/// The City camera. Today a 2.5D dimetric projection with a turntable (`yaw`),
+/// `tilt` (how much the ground plane is foreshortened), `zoom` and a screen
+/// `pan`. A perspective fly-through (FSN, Step 3b) replaces [`Camera::view`]
+/// and the projection stage; the world-space blocks stay as they are.
+#[derive(Clone, Copy, PartialEq)]
+struct Camera {
+    /// Turntable rotation of the plane about its centre, radians.
+    yaw: f64,
+    /// Ground-plane foreshortening — the dimetric "y" factor (0.25 = the
+    /// classic look; smaller = flatter, larger = more top-down).
+    tilt: f64,
+    zoom: f64,
+    pan: Vec2,
+}
+
+impl Default for Camera {
+    fn default() -> Self {
+        Camera { yaw: 0.0, tilt: ISO_AY, zoom: 1.0, pan: Vec2::ZERO }
+    }
+}
+
+impl Camera {
+    /// A plane point rotated about the plane centre by `yaw`.
+    fn rotate(&self, x: f64, y: f64) -> (f64, f64) {
+        let c = PLANE / 2.0;
+        let (s, k) = self.yaw.sin_cos();
+        let (dx, dy) = (x - c, y - c);
+        (c + dx * k - dy * s, c + dx * s + dy * k)
+    }
+
+    /// A world direction rotated by `yaw` (for face visibility and shading).
+    fn rotate_dir(&self, nx: f64, ny: f64) -> (f64, f64) {
+        let (s, k) = self.yaw.sin_cos();
+        (nx * k - ny * s, nx * s + ny * k)
+    }
+
+    /// The inverse of [`Self::rotate_dir`]: a view-frame direction in world terms.
+    fn unrotate_dir(&self, vx: f64, vy: f64) -> (f64, f64) {
+        let (s, k) = self.yaw.sin_cos();
+        (vx * k + vy * s, -vx * s + vy * k)
+    }
+
+    /// World (x, y on the plane, z up) → unscaled view coordinates. The viewer
+    /// looks in from the rotated +x+y side; x' grows right, y' grows down.
+    fn view(&self, x: f64, y: f64, z: f64) -> (f64, f64) {
+        let (rx, ry) = self.rotate(x, y);
+        ((rx - ry) * ISO_AX, (rx + ry) * self.tilt - z)
+    }
+
+    /// Painter's-order depth of a plane point: larger = nearer the viewer.
+    fn depth(&self, x: f64, y: f64) -> f64 {
+        let (rx, ry) = self.rotate(x, y);
+        rx + ry
+    }
+
+    /// Does a vertical face with outward normal (nx, ny) face the viewer?
+    fn faces_viewer(&self, nx: f64, ny: f64) -> bool {
+        let (rx, ry) = self.rotate_dir(nx, ny);
+        rx + ry > 1e-9
+    }
+
+    /// Side-face shade: a face turned toward +x' (the classic "right" face)
+    /// gets F_RIGHT, one toward +y' ("front") F_FRONT; rotation blends them.
+    fn side_shade(&self, nx: f64, ny: f64) -> f32 {
+        let (rx, _) = self.rotate_dir(nx, ny);
+        F_FRONT + (F_RIGHT - F_FRONT) * rx.clamp(0.0, 1.0) as f32
+    }
+}
+
+// Dimetric projection constants: x→right, y→left, z→up.
 const ISO_AX: f64 = 0.5;
 const ISO_AY: f64 = 0.25;
 const PLANE: f64 = 1000.0; // ground-plane size the treemap is laid out on
 const PLINTH_TH: f64 = 26.0;
 const SHADOW_EXPAND: f64 = 2.5;
 const SHADOW_OFF: f64 = 0.4;
-
-fn iso(x: f64, y: f64, z: f64) -> (f64, f64) {
-    ((x - y) * ISO_AX, (x + y) * ISO_AY - z)
-}
 
 fn shade(c: Color32, f: f32) -> Color32 {
     let m = |v: u8| (v as f32 * f).clamp(0.0, 255.0) as u8;
@@ -3636,29 +3723,38 @@ fn point_in_quad(p: Pos2, q: &[Pos2; 4]) -> bool {
     true
 }
 
-/// A block is hit if the cursor is over ANY of its visible faces (top or the two
-/// sides) — so tall slender towers select from their bulk, not just the tiny top.
+/// A block is hit if the cursor is over ANY of its visible faces (top or a
+/// side) — so tall slender towers select from their bulk, not just the tiny top.
 fn point_in_block(p: Pos2, b: &IsoBlock) -> bool {
-    point_in_quad(p, &b.top) || point_in_quad(p, &b.right) || point_in_quad(p, &b.front)
+    point_in_quad(p, &b.top) || b.sides.iter().any(|(q, _)| point_in_quad(p, q))
 }
 
-/// Turn layout tiles into a projected cityscape: keep leaf tiles, extrude each by
-/// its file count, add a ground plinth + per-block ground shadow, fit to `panel`,
-/// sort back-to-front for correct painter's-order occlusion.
-#[allow(clippy::too_many_arguments)]
-fn build_scape(
+/// The four vertical faces of an axis-aligned footprint: (corner a, corner b,
+/// outward normal), a→b ordered so the face quad (a, b, b↑, a↑) is convex.
+fn box_sides(x: f64, y: f64, w: f64, h: f64) -> [((f64, f64), (f64, f64), (f64, f64)); 4] {
+    [
+        ((x + w, y), (x + w, y + h), (1.0, 0.0)), // +x ("right" at yaw 0)
+        ((x, y + h), (x + w, y + h), (0.0, 1.0)), // +y ("front" at yaw 0)
+        ((x, y), (x, y + h), (-1.0, 0.0)),        // −x
+        ((x, y), (x + w, y), (0.0, -1.0)),        // −y
+    ]
+}
+
+/// Stage 1 — WORLD space. Leaf tiles become blocks: area = bytes (the tile),
+/// height ∝ log(file count), colour = dominant type; heights are scaled by
+/// `reveal` (the cache-load "rise"). No camera involved.
+fn build_blocks(
     tree: &Tree,
     tiles: &[Tile],
     dominant: Option<&[FileCategory]>,
-    panel: Rect,
     reveal: f32,
     // Optional per-node file counts (for replay's partial state); falls back to
     // the tree's final counts when `None`.
     file_counts: Option<&[u64]>,
-) -> Scape {
+) -> Vec<Block3> {
     use std::collections::HashSet;
     let rendered: HashSet<usize> = tiles.iter().map(|t| t.node.index()).collect();
-    let mut leaves: Vec<&Tile> = tiles
+    let leaves: Vec<&Tile> = tiles
         .iter()
         .filter(|t| {
             t.depth > 0
@@ -3669,7 +3765,7 @@ fn build_scape(
         })
         .collect();
     if leaves.is_empty() {
-        return Scape::default();
+        return Vec::new();
     }
 
     // Height ∝ log(file count): files stay flat chips, folders of many files rise
@@ -3694,56 +3790,12 @@ fn build_scape(
         }
     };
 
-    // Fit: project every corner (blocks + plinth) to find bounds, then center.
-    let (mut minx, mut miny, mut maxx, mut maxy) = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
-    let mut ext = |x: f64, y: f64, z: f64| {
-        let (sx, sy) = iso(x, y, z);
-        minx = minx.min(sx);
-        maxx = maxx.max(sx);
-        miny = miny.min(sy);
-        maxy = maxy.max(sy);
-    };
-    for t in &leaves {
-        let (x, y, w, h) = (t.rect.x as f64, t.rect.y as f64, t.rect.w as f64, t.rect.h as f64);
-        let hz = height(t);
-        ext(x, y, hz);
-        ext(x + w, y + h, hz);
-        ext(x + w, y + h, 0.0);
-    }
-    for &(cx, cy) in &[(0.0, 0.0), (PLANE, PLANE), (PLANE, 0.0), (0.0, PLANE)] {
-        ext(cx, cy, 0.0);
-        ext(cx, cy, -PLINTH_TH);
-    }
-
-    let pw = (maxx - minx).max(1.0);
-    let ph = (maxy - miny).max(1.0);
-    let s = ((panel.width() as f64 * 0.96) / pw).min((panel.height() as f64 * 0.96) / ph);
-    let ox = panel.center().x as f64 - (minx + maxx) / 2.0 * s;
-    let oy = panel.center().y as f64 - (miny + maxy) / 2.0 * s;
-    let tr = |wx: f64, wy: f64, wz: f64| -> Pos2 {
-        let (sx, sy) = iso(wx, wy, wz);
-        Pos2::new((sx * s + ox) as f32, (sy * s + oy) as f32)
-    };
-
-    let plinth_top = [tr(0.0, 0.0, 0.0), tr(PLANE, 0.0, 0.0), tr(PLANE, PLANE, 0.0), tr(0.0, PLANE, 0.0)];
-    let plinth_right = [tr(PLANE, 0.0, 0.0), tr(PLANE, PLANE, 0.0), tr(PLANE, PLANE, -PLINTH_TH), tr(PLANE, 0.0, -PLINTH_TH)];
-    let plinth_front = [tr(0.0, PLANE, 0.0), tr(PLANE, PLANE, 0.0), tr(PLANE, PLANE, -PLINTH_TH), tr(0.0, PLANE, -PLINTH_TH)];
-
-    // Back-to-front: far (small x+y) first.
-    leaves.sort_by(|a, b| {
-        (a.rect.x + a.rect.y)
-            .partial_cmp(&(b.rect.x + b.rect.y))
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-
-    let blocks = leaves
+    leaves
         .iter()
         .filter_map(|t| {
-            let (x, y, w, h) = (t.rect.x as f64, t.rect.y as f64, t.rect.w as f64, t.rect.h as f64);
             // Discovery reveal: blocks appear in the order they were found (arena
-            // index = scan order), each rising in its final spot — the closest
-            // honest representation of "added one at a time" from a cached tree.
-            let hz = if reveal >= 1.0 {
+            // index = scan order), each rising in its final spot.
+            let z = if reveal >= 1.0 {
                 height(t)
             } else {
                 let p = (t.node.index() as f64 / tree.len().max(1) as f64).clamp(0.0, 1.0);
@@ -3766,25 +3818,90 @@ fn build_scape(
                     }
                 }
             };
-            // Ground shadow: footprint expanded and offset by height (tall→long).
-            let (e, off) = (SHADOW_EXPAND, hz * SHADOW_OFF);
-            Some(IsoBlock {
+            Some(Block3 {
                 node: t.node,
-                top: [tr(x, y, hz), tr(x + w, y, hz), tr(x + w, y + h, hz), tr(x, y + h, hz)],
-                right: [tr(x + w, y, 0.0), tr(x + w, y + h, 0.0), tr(x + w, y + h, hz), tr(x + w, y, hz)],
-                front: [tr(x, y + h, 0.0), tr(x + w, y + h, 0.0), tr(x + w, y + h, hz), tr(x, y + h, hz)],
-                shadow: [
-                    tr(x - e + off, y - e + off, 0.0),
-                    tr(x + w + e + off, y - e + off, 0.0),
-                    tr(x + w + e + off, y + h + e + off, 0.0),
-                    tr(x - e + off, y + h + e + off, 0.0),
-                ],
+                x: t.rect.x as f64,
+                y: t.rect.y as f64,
+                w: t.rect.w as f64,
+                h: t.rect.h as f64,
+                z,
                 color,
             })
         })
+        .collect()
+}
+
+/// Stage 2 — SCREEN space. Project the blocks through `cam`, fitted to
+/// `panel`, sorted back-to-front, with the plinth and per-block shadows.
+fn project_scene(blocks: &[Block3], cam: &Camera, panel: Rect) -> Scape {
+    // Fit with a yaw-INVARIANT bound (the plane's bounding circle, the tallest
+    // block, the plinth), so orbiting doesn't make the city breathe. At yaw 0
+    // it equals the exact bound; at other angles the city sits a little
+    // smaller, never overflowing.
+    let max_z = blocks.iter().map(|b| b.z).fold(0.0, f64::max);
+    let (cx, cy) = cam.view(PLANE / 2.0, PLANE / 2.0, 0.0);
+    let (minx, maxx) = (cx - PLANE * ISO_AX, cx + PLANE * ISO_AX);
+    let (miny, maxy) = (cy - PLANE * cam.tilt - max_z, cy + PLANE * cam.tilt + PLINTH_TH);
+    let pw = (maxx - minx).max(1.0);
+    let ph = (maxy - miny).max(1.0);
+    let s = ((panel.width() as f64 * 0.96) / pw).min((panel.height() as f64 * 0.96) / ph) * cam.zoom;
+    let ox = panel.center().x as f64 - (minx + maxx) / 2.0 * s + cam.pan.x as f64;
+    let oy = panel.center().y as f64 - (miny + maxy) / 2.0 * s + cam.pan.y as f64;
+    let tr = |x: f64, y: f64, z: f64| -> Pos2 {
+        let (vx, vy) = cam.view(x, y, z);
+        Pos2::new((vx * s + ox) as f32, (vy * s + oy) as f32)
+    };
+
+    // The ground plinth: its top and whichever sides face the camera.
+    let plinth_top = [tr(0.0, 0.0, 0.0), tr(PLANE, 0.0, 0.0), tr(PLANE, PLANE, 0.0), tr(0.0, PLANE, 0.0)];
+    let plinth_sides = box_sides(0.0, 0.0, PLANE, PLANE)
+        .into_iter()
+        .filter(|(_, _, n)| cam.faces_viewer(n.0, n.1))
+        .map(|(a, b, n)| {
+            let quad = [tr(a.0, a.1, 0.0), tr(b.0, b.1, 0.0), tr(b.0, b.1, -PLINTH_TH), tr(a.0, a.1, -PLINTH_TH)];
+            let color = if cam.rotate_dir(n.0, n.1).0 > 0.5 { PLINTH_R } else { PLINTH_F };
+            (quad, color)
+        })
         .collect();
 
-    Scape { plinth_top, plinth_right, plinth_front, blocks }
+    // Back-to-front by each footprint's FAR corner (its minimum view depth):
+    // the classic isometric painter's order for non-overlapping tiles, and
+    // exactly the old `x + y` of the min corner at yaw 0.
+    let far = |b: &Block3| {
+        [(b.x, b.y), (b.x + b.w, b.y), (b.x, b.y + b.h), (b.x + b.w, b.y + b.h)]
+            .into_iter()
+            .map(|(x, y)| cam.depth(x, y))
+            .fold(f64::INFINITY, f64::min)
+    };
+    let mut order: Vec<&Block3> = blocks.iter().collect();
+    order.sort_by(|a, b| far(a).partial_cmp(&far(b)).unwrap_or(std::cmp::Ordering::Equal));
+    let blocks = order
+        .iter()
+        .map(|b| {
+            let (x, y, w, h, z) = (b.x, b.y, b.w, b.h, b.z);
+            let top = [tr(x, y, z), tr(x + w, y, z), tr(x + w, y + h, z), tr(x, y + h, z)];
+            let sides = box_sides(x, y, w, h)
+                .into_iter()
+                .filter(|(_, _, n)| cam.faces_viewer(n.0, n.1))
+                .map(|(a, c, n)| {
+                    ([tr(a.0, a.1, 0.0), tr(c.0, c.1, 0.0), tr(c.0, c.1, z), tr(a.0, a.1, z)], cam.side_shade(n.0, n.1))
+                })
+                .collect();
+            // Ground shadow: footprint expanded, offset toward the viewer by the
+            // height (tall → long). The offset is a view-frame direction.
+            let e = SHADOW_EXPAND;
+            let (dx, dy) = cam.unrotate_dir(z * SHADOW_OFF, z * SHADOW_OFF);
+            let shadow = [
+                tr(x - e + dx, y - e + dy, 0.0),
+                tr(x + w + e + dx, y - e + dy, 0.0),
+                tr(x + w + e + dx, y + h + e + dy, 0.0),
+                tr(x - e + dx, y + h + e + dy, 0.0),
+            ];
+            IsoBlock { node: b.node, top, sides, shadow, color: b.color }
+        })
+        .collect();
+
+    Scape { plinth_top, plinth_sides, blocks }
 }
 
 /// Open a path's location in Windows Explorer (files get selected; folders open).
@@ -4882,6 +4999,11 @@ impl eframe::App for SectorApp {
                         Freshness::Unknown => {}
                     }
                 });
+                if self.camera != Camera::default()
+                    && ui.button("Reset view").on_hover_text("Back to the default angle, zoom and position").clicked()
+                {
+                    self.camera = Camera::default();
+                }
                 if let ScanState::Running { cancel, stats: None, .. } = &self.scan {
                     if ui.button("Cancel").clicked() {
                         cancel.store(true, Ordering::Relaxed);
@@ -4958,7 +5080,7 @@ impl eframe::App for SectorApp {
                     ui.colored_label(category_color(cat), format!("■ {}", cat.label()));
                 }
                 ui.separator();
-                ui.weak("area = size · height = file count · hover for details · click to drill in");
+                ui.weak("area = size · height = file count · hover for details · click to drill in · drag to orbit · Shift+drag to pan · wheel to zoom");
             });
         });
 
@@ -4976,8 +5098,28 @@ impl eframe::App for SectorApp {
             // right-click context menu — which egui keys on this id — stays open
             // across frames instead of flashing shut.
             let area = ui.available_rect_before_wrap();
-            let response = ui.interact(area, egui::Id::new("sector_canvas"), Sense::click());
+            let response = ui.interact(area, egui::Id::new("sector_canvas"), Sense::click_and_drag());
             let painter = ui.painter_at(area);
+
+            // Camera: drag orbits (turntable) and tilts; Shift+drag or a
+            // middle-button drag pans; the wheel zooms (Ctrl+wheel stays the UI
+            // zoom). A click (no drag) still drills in.
+            let mid = response.dragged_by(egui::PointerButton::Middle);
+            if response.dragged_by(egui::PointerButton::Primary) || mid {
+                let d = response.drag_delta();
+                if mid || ctx.input(|i| i.modifiers.shift) {
+                    self.camera.pan += d;
+                } else {
+                    self.camera.yaw += d.x as f64 * 0.008;
+                    self.camera.tilt = (self.camera.tilt - d.y as f64 * 0.0015).clamp(0.08, 0.6);
+                }
+            }
+            if response.hovered() {
+                let (scroll, ctrl) = ctx.input(|i| (i.smooth_scroll_delta.y, i.modifiers.ctrl));
+                if scroll != 0.0 && !ctrl {
+                    self.camera.zoom = (self.camera.zoom * (1.0 + scroll as f64 * 0.0015)).clamp(0.3, 8.0);
+                }
+            }
 
             // Backspace goes up a level (ignored while typing in the path box).
             if self.root != Tree::ROOT
@@ -5019,8 +5161,9 @@ impl eframe::App for SectorApp {
                     let k = (((reveal as f64) * t.len() as f64) as usize).max(1);
                     let (sizes, counts) = t.partial_metrics(k);
                     let tiles = layout_partial(&t, self.root, plane, &self.opts, k, &sizes);
-                    self.scape =
-                        build_scape(&t, &tiles, self.dominant.as_deref(), area, 1.0, Some(&counts));
+                    self.blocks = build_blocks(&t, &tiles, self.dominant.as_deref(), 1.0, Some(&counts));
+                    self.scape = project_scene(&self.blocks, &self.camera, area);
+                    self.last_camera = self.camera;
                     drop(t);
                     self.last_layout = Instant::now();
                     self.last_size = area.size();
@@ -5040,8 +5183,9 @@ impl eframe::App for SectorApp {
                 if need {
                     let t = tree.lock().unwrap_or_else(|e| e.into_inner());
                     self.tiles = layout(&t, self.root, plane, &self.opts);
-                    self.scape =
-                        build_scape(&t, &self.tiles, self.dominant.as_deref(), area, rev, None);
+                    self.blocks = build_blocks(&t, &self.tiles, self.dominant.as_deref(), rev, None);
+                    self.scape = project_scene(&self.blocks, &self.camera, area);
+                    self.last_camera = self.camera;
                     drop(t);
                     self.last_layout = Instant::now();
                     self.last_root = self.root;
@@ -5052,12 +5196,18 @@ impl eframe::App for SectorApp {
             if reveal >= 1.0 {
                 self.reveal_start = None; // animation complete
             }
+            // The camera moved but the blocks didn't: re-project only (cheap).
+            if self.camera != self.last_camera {
+                self.scape = project_scene(&self.blocks, &self.camera, area);
+                self.last_camera = self.camera;
+            }
 
             // Night sky + ground plinth (behind the city).
             painter.rect_filled(area, 0.0_f32, BG);
             let edge = Stroke::new(0.5, BORDER);
-            painter.add(Shape::convex_polygon(self.scape.plinth_right.to_vec(), PLINTH_R, edge));
-            painter.add(Shape::convex_polygon(self.scape.plinth_front.to_vec(), PLINTH_F, edge));
+            for (q, c) in &self.scape.plinth_sides {
+                painter.add(Shape::convex_polygon(q.to_vec(), *c, edge));
+            }
             painter.add(Shape::convex_polygon(self.scape.plinth_top.to_vec(), PLINTH_TOP, edge));
 
             // Topmost (nearest) block under the cursor.
@@ -5070,8 +5220,9 @@ impl eframe::App for SectorApp {
             // occlude it correctly instead of it floating over everything.
             for (i, b) in self.scape.blocks.iter().enumerate() {
                 painter.add(Shape::convex_polygon(b.shadow.to_vec(), SHADOW, Stroke::NONE));
-                painter.add(Shape::convex_polygon(b.right.to_vec(), shade(b.color, F_RIGHT), edge));
-                painter.add(Shape::convex_polygon(b.front.to_vec(), shade(b.color, F_FRONT), edge));
+                for (q, f) in &b.sides {
+                    painter.add(Shape::convex_polygon(q.to_vec(), shade(b.color, *f), edge));
+                }
                 painter.add(Shape::convex_polygon(b.top.to_vec(), shade(b.color, F_TOP), edge));
                 if Some(i) == hovered {
                     // Halo outline: a dark stroke under a bright one, so the
@@ -5079,11 +5230,12 @@ impl eframe::App for SectorApp {
                     // orange video, or the light Document tiles).
                     let dark = Stroke::new(3.2, Color32::from_black_alpha(190));
                     let bright = Stroke::new(1.6, Color32::WHITE);
-                    let faces = [&b.right, &b.front, &b.top];
-                    for f in faces {
+                    let faces: Vec<&[Pos2; 4]> =
+                        b.sides.iter().map(|(q, _)| q).chain(std::iter::once(&b.top)).collect();
+                    for f in &faces {
                         painter.add(Shape::convex_polygon(f.to_vec(), Color32::TRANSPARENT, dark));
                     }
-                    for f in faces {
+                    for f in &faces {
                         painter.add(Shape::convex_polygon(f.to_vec(), Color32::TRANSPARENT, bright));
                     }
                 }

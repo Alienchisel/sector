@@ -204,11 +204,14 @@ Deliberately *not* scheduled — captured so they don't distract us:
   combined root). Fits D9 (multiple drives are a normal case). User idea, 2026-09.
 - ~~**Urban visual pass (D15).**~~ **Done** — see Step 3a.5 (plinth, shadows,
   night palette, neon tops). Remaining: haze / atmosphere, ambient occlusion.
-- **Camera controls (later).** Much is achievable *within* 2.5D, no engine
-  rebuild: pan (offset), zoom (scale), and **turntable orbit** (rotate the
-  footprint x,y about center *before* the fixed iso projection) + tilt
-  (parameterize projection). Only a free-flying *perspective* camera (fly-through,
-  vanishing point) needs the true-3D wgpu upgrade (Step 3b). User idea, 2026-09.
+- ~~**Camera controls (later).**~~ **Done (2026-09-05)** via the scene/camera
+  split: the City is built in two stages — world-space blocks (`build_blocks`)
+  and a projection (`project_scene`) through a `Camera` (turntable yaw, tilt,
+  zoom, pan). Drag orbits/tilts, Shift- or middle-drag pans, wheel zooms,
+  "Reset view" restores. The fit is yaw-invariant so orbiting doesn't rescale.
+  Only a free-flying *perspective* camera (fly-through, vanishing point — the
+  FSN direction) still needs the true-3D wgpu upgrade (Step 3b), which now
+  replaces just `Camera::view` + the projection/draw stage.
 - ~~**Reveal in Explorer (small, near-term; first D8 action).**~~ **Done**
   (Step 3a.5 in the City; E3 in Files). Kept for the original reasoning: Right-click a
   block → context menu → open its location in Windows Explorer (`explorer
