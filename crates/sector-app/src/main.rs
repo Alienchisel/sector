@@ -2138,7 +2138,7 @@ impl SectorApp {
             self.go_forward();
         }
         if ui
-            .add_enabled(self.current_dir.parent().is_some(), egui::Button::new("↑"))
+            .add_enabled(self.current_dir.parent().is_some(), egui::Button::new("⬆"))
             .on_hover_text("Up")
             .clicked()
         {
@@ -2453,13 +2453,13 @@ impl SectorApp {
                         }
                         if let Some(e) = self.undo.last() {
                             ui.separator();
-                            if ui.small_button(format!("↶ Undo {}", e.label)).on_hover_text("Ctrl+Z").clicked() {
+                            if ui.small_button(format!("↺ Undo {}", e.label)).on_hover_text("Ctrl+Z").clicked() {
                                 undo_req = true;
                             }
                         }
                         if let Some(e) = self.redo.last() {
                             ui.separator();
-                            if ui.small_button(format!("↷ Redo {}", e.label)).on_hover_text("Ctrl+Y").clicked() {
+                            if ui.small_button(format!("↻ Redo {}", e.label)).on_hover_text("Ctrl+Y").clicked() {
                                 redo_req = true;
                             }
                         }
@@ -2600,11 +2600,13 @@ impl SectorApp {
             let can_paste = self.clipboard.is_some() && !self.file_op_running();
 
             let arrow = |k: SortKey| {
+                // ⏶/⏷ (not ▲/▼): the latter exist only in the monospace font
+                // and render as boxes in a proportional label.
                 if k == sort_key {
                     if sort_asc {
-                        " ▲"
+                        " ⏶"
                     } else {
-                        " ▼"
+                        " ⏷"
                     }
                 } else {
                     ""
@@ -2689,7 +2691,11 @@ impl SectorApp {
                                         ui.label("📁");
                                     }
                                     Some(c) => {
-                                        ui.colored_label(category_color(c), "●");
+                                        // Painted, not a glyph: "●" isn't in egui's
+                                        // proportional fonts (it rendered as a box).
+                                        let (r, _) =
+                                            ui.allocate_exact_size(Vec2::new(10.0, 10.0), Sense::hover());
+                                        ui.painter().circle_filled(r.center(), 4.0, category_color(c));
                                     }
                                 }
                                 // A cut item is dimmed until the paste completes.
@@ -4647,7 +4653,7 @@ impl eframe::App for SectorApp {
                     Some(st) => {
                         let t = tree.lock().unwrap_or_else(|e| e.into_inner());
                         ui.horizontal_wrapped(|ui| {
-                            if self.root != Tree::ROOT && ui.button("↑ Up").clicked() {
+                            if self.root != Tree::ROOT && ui.button("⬆ Up").clicked() {
                                 self.root = t.node(self.root).parent;
                             }
                             for (i, id) in Self::breadcrumb(&t, self.root).into_iter().enumerate() {
