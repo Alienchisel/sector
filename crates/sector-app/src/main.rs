@@ -627,6 +627,7 @@ impl SectorApp {
         self.tiles.clear();
         self.scape = Scape::default();
         self.crystallize = false;
+        self.reveal_start = None; // a leftover cache-load animation must not drive a live scan
         self.dominant = None;
         self.menu_target = None;
         self.city_root = Some(self.current_dir.clone());
@@ -1094,6 +1095,10 @@ impl SectorApp {
         }
         if name == "." || name == ".." {
             return Err("That name is reserved.".into());
+        }
+        if name.ends_with('.') {
+            // Windows drops a trailing dot, so "foo." would silently become "foo".
+            return Err("Name can't end with a dot.".into());
         }
         // Windows reserved device names (also when used as the base of an
         // extension, e.g. "CON.txt"). A tailored message beats the raw OS error.
@@ -2649,8 +2654,12 @@ fn open_path(_path: &std::path::Path) {}
 /// `name - Copy`, `name - Copy (2)`, … inserting the suffix before the
 /// extension. Guarantees a FRESH path — paste never overwrites existing data.
 fn unique_dest(dir: &Path, name: &str) -> PathBuf {
+    // `Path::exists` follows links and says "no" for a DANGLING symlink — a
+    // paste onto that name would then write *through* the link to its target.
+    // `symlink_metadata` reports the link itself, so any entry counts as taken.
+    let occupied = |p: &Path| std::fs::symlink_metadata(p).is_ok();
     let first = dir.join(name);
-    if !first.exists() {
+    if !occupied(&first) {
         return first;
     }
     let p = Path::new(name);
@@ -2667,12 +2676,12 @@ fn unique_dest(dir: &Path, name: &str) -> PathBuf {
         dir.join(n)
     };
     let c = make(" - Copy");
-    if !c.exists() {
+    if !occupied(&c) {
         return c;
     }
     for i in 2..100_000 {
         let c = make(&format!(" - Copy ({i})"));
-        if !c.exists() {
+        if !occupied(&c) {
             return c;
         }
     }
@@ -2914,14 +2923,31 @@ impl eframe::App for SectorApp {
 
         // Poll the background scan for completion.
         let mut just_finished = false;
-        if let ScanState::Running { stats_rx, stats, .. } = &mut self.scan {
+        if let ScanState::Running { stats_rx, stats, progress, started, .. } = &mut self.scan {
             if stats.is_none() {
                 match stats_rx.try_recv() {
                     Ok(s) => {
                         *stats = Some(s);
                         just_finished = true;
                     }
-                    Err(_) => ctx.request_repaint(), // keep progress + live build ticking
+                    // keep progress + live build ticking
+                    Err(std::sync::mpsc::TryRecvError::Empty) => ctx.request_repaint(),
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        // The scanner thread died without reporting (a panic).
+                        // Land the scan as cancelled so the UI recovers — the
+                        // partial tree stays viewable, but it is neither cached
+                        // nor used for folder sizes.
+                        eprintln!("[sector] scan thread stopped unexpectedly");
+                        *stats = Some(ScanStats {
+                            dirs: progress.dirs.load(Ordering::Relaxed),
+                            files: progress.files.load(Ordering::Relaxed),
+                            bytes: progress.bytes.load(Ordering::Relaxed),
+                            errors: progress.errors.load(Ordering::Relaxed),
+                            elapsed: started.elapsed(),
+                            cancelled: true,
+                        });
+                        just_finished = true;
+                    }
                 }
             }
         }
@@ -3667,6 +3693,19 @@ mod tests {
         // A symlink AS the source is refused outright.
         let err = run_paste(vec![d.join("src/link")], dest, false, cancel).unwrap_err();
         assert!(err.contains("link/junction"));
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unique_dest_treats_dangling_symlink_as_taken() {
+        use std::os::unix::fs::symlink;
+        let d = scratch("dangling");
+        // A dangling link named "a.txt": `exists()` says false, but pasting onto
+        // it would write through to /nonexistent/target — it must count as taken.
+        symlink("/nonexistent/sector-target", d.join("a.txt")).unwrap();
+        assert!(!d.join("a.txt").exists()); // proves the trap is real
+        assert_eq!(unique_dest(&d, "a.txt"), d.join("a - Copy.txt"));
         std::fs::remove_dir_all(&d).ok();
     }
 
