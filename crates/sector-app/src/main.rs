@@ -4604,12 +4604,9 @@ impl eframe::App for SectorApp {
                     {
                         self.start_scan();
                     }
-                    ui.add(
-                        egui::DragValue::new(&mut self.threads)
-                            .range(1..=256)
-                            .prefix("threads "),
-                    )
-                    .on_hover_text("Worker threads for the scan. Higher hides SMB latency on a cold NAS; benchmark on a subfolder to find the sweet spot.");
+                    // (The scan thread-count knob is hidden for now — a
+                    // benchmarking control, not a daily one. `self.threads` is
+                    // still persisted and used; default DEFAULT_THREADS.)
 
                     ui.separator();
                     ui.selectable_value(&mut self.anim_mode, AnimMode::Reveal, "Reveal")
