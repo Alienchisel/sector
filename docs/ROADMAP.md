@@ -228,9 +228,10 @@ Deliberately *not* scheduled — captured so they don't distract us:
 - **Dual-pane explorer** (Midnight Commander style; user idea, 2026-09-05).
   Two independent panes (location, listing, selection, cursor, filter, sort,
   history each), sharing the clipboard, undo stack and background jobs; Tab
-  switches sides; copy/move/drag between them. **Prerequisite:** extract the
-  per-pane state from `SectorApp` into a `Pane` struct — cheaper the earlier
-  it's done. The City would follow the *active* pane (D18 generalised).
+  switches sides; copy/move/drag between them. **Prerequisite ✅ (2026-09-05):**
+  the per-pane state now lives in a `Pane` struct (`SectorApp::pane`, one for
+  now); the tree/list focus enum became `Focus`. The City would follow the
+  *active* pane (D18 generalised).
 - **FSN-style City** (SGI File System Navigator; user idea, 2026-09-05). A
   free perspective fly-through: folders as plinths connected to their
   children, files as blocks on them. Attaches to Step 3b (true-3D wgpu +

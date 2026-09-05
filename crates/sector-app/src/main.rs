@@ -37,9 +37,9 @@ use sector_scan::{
     Progress, ScanOptions, ScanStats, UsnMark,
 };
 
-/// Which Files-view pane the keyboard drives (focus-follows-click).
+/// Which part of the Files view the keyboard drives (focus-follows-click).
 #[derive(Clone, Copy, PartialEq)]
-enum Pane {
+enum Focus {
     Tree,
     List,
 }
@@ -537,11 +537,11 @@ fn main() -> eframe::Result<()> {
                 app.replay_secs = s.replay_secs.clamp(0.5, 60.0);
                 app.threads = s.threads.clamp(1, 256);
                 app.anim_mode = if s.replay_mode { AnimMode::Replay } else { AnimMode::Reveal };
-                app.current_dir = PathBuf::from(&s.current_dir);
-                app.addr_edit = s.current_dir;
+                app.pane.current_dir = PathBuf::from(&s.current_dir);
+                app.pane.addr_edit = s.current_dir;
                 app.show_hidden = s.show_hidden;
-                app.sort_key = SortKey::from_name(&s.sort_key);
-                app.sort_asc = s.sort_asc;
+                app.pane.sort_key = SortKey::from_name(&s.sort_key);
+                app.pane.sort_asc = s.sort_asc;
                 app.auto_scan_local = s.auto_scan_local;
             }
             Ok(Box::new(app))
@@ -561,6 +561,118 @@ enum ScanState {
         stats: Option<ScanStats>,
         started: Instant,
     },
+}
+
+/// One explorer pane: a location and everything that hangs off it — the
+/// listing, selection and cursor, filter, sort, history, address-bar state.
+/// The app holds one today; a dual-pane layout (see ROADMAP) is two of these
+/// sharing the clipboard, undo stack, background jobs and the folder tree.
+struct Pane {
+    current_dir: PathBuf,
+    addr_edit: String,
+    /// The full listing of `current_dir` (all entries, sorted).
+    all_entries: Vec<Entry>,
+    /// The filtered/visible subset actually shown (hidden toggle + text filter).
+    /// Everything — selection, keyboard, footer — indexes THIS.
+    entries: Vec<Entry>,
+    /// Case-insensitive name filter for the current folder (transient; cleared on
+    /// navigation).
+    filter: String,
+    entries_err: Option<String>,
+    entries_dirty: bool,
+    /// History: each entry is a folder plus the item you were on in it, so
+    /// Back/Forward put you back where you were (like `go_up` does).
+    back_stack: Vec<(PathBuf, Option<String>)>,
+    fwd_stack: Vec<(PathBuf, Option<String>)>,
+    /// Free / total bytes of the drive holding `current_dir` (one call per
+    /// navigation), for the status bar. `None` if unknown.
+    drive_space: Option<(u64, u64)>,
+    sort_key: SortKey,
+    sort_asc: bool,
+    /// Selected entries, by name (stable across sort/filter). Source of truth for
+    /// highlighting and multi-item operations.
+    sel: HashSet<String>,
+    /// The focus/cursor row (index into `entries`): the single-item-op target and
+    /// the moving end of a shift-range.
+    lead: Option<usize>,
+    /// The fixed base of a shift-range selection (index into `entries`).
+    anchor: Option<usize>,
+    /// When set, scroll the file table to this row next build (keyboard nav).
+    scroll_target: Option<usize>,
+    /// Type-ahead search buffer + when it was last appended to (resets after a
+    /// short pause), so typing letters jumps to the matching file.
+    type_ahead: String,
+    type_ahead_time: Instant,
+    /// Subtree sizes for the current folder's SUBFOLDERS (lowercased name → bytes),
+    /// derived from an in-memory scan tree that covers this folder — so the list's
+    /// Size column can show folder sizes. `None` when no scan covers it.
+    folder_sizes: Option<HashMap<String, u64>>,
+    /// After the listing for `.0` loads, select the entry named `.1` — used by
+    /// "up" (re-select the folder you left) and F5 (keep the selection). The path
+    /// guards against applying it in an unrelated folder.
+    select_after_reload: Option<(PathBuf, String)>,
+    /// Cached status-footer summary (item counts + total), recomputed only when
+    /// the listing or folder sizes change — not every frame.
+    status_summary: String,
+    /// True while the address bar has (or just lost) focus — suppresses the file
+    /// list's Enter/Backspace shortcuts so they don't fight the address bar.
+    addr_active: bool,
+    /// Path shown as an editable text field (true) vs a clickable breadcrumb.
+    addr_editing: bool,
+    /// Request focus for the address field on the next frame (entering edit mode).
+    addr_edit_focus: bool,
+    /// Request keyboard focus for the filter box on the next frame (Ctrl+F).
+    filter_focus: bool,
+    /// Shift+F10: open the context menu on the lead row next frame (one-shot).
+    kbd_menu_req: bool,
+    /// A keyboard-opened context menu is up — keep it anchored to its row (not
+    /// the pointer) until it closes.
+    kbd_menu_open: bool,
+    /// `current_dir` itself as a listing entry (one stat per navigation), so
+    /// Details can describe the folder the TREE has focused.
+    cur_entry: Option<Entry>,
+    /// The scanned subtree size of `current_dir` (with `folder_sizes`), for the
+    /// tree-focused Details — recomputed with the folder sizes, not per frame.
+    cur_dir_size: Option<u64>,
+    /// A rubber-band selection being dragged out on the list's empty space.
+    marquee: Option<Marquee>,
+}
+
+impl Default for Pane {
+    fn default() -> Self {
+        Pane {
+            current_dir: PathBuf::from("C:\\"),
+            addr_edit: "C:\\".to_string(),
+            all_entries: Vec::new(),
+            entries: Vec::new(),
+            filter: String::new(),
+            entries_err: None,
+            entries_dirty: true,
+            back_stack: Vec::new(),
+            fwd_stack: Vec::new(),
+            drive_space: None,
+            sort_key: SortKey::Name,
+            sort_asc: true,
+            sel: HashSet::new(),
+            lead: None,
+            anchor: None,
+            scroll_target: None,
+            type_ahead: String::new(),
+            type_ahead_time: Instant::now(),
+            folder_sizes: None,
+            select_after_reload: None,
+            status_summary: String::new(),
+            addr_active: false,
+            addr_editing: false,
+            addr_edit_focus: false,
+            filter_focus: false,
+            kbd_menu_req: false,
+            kbd_menu_open: false,
+            cur_entry: None,
+            cur_dir_size: None,
+            marquee: None,
+        }
+    }
 }
 
 struct SectorApp {
@@ -597,56 +709,12 @@ struct SectorApp {
 
     // ---- Explorer (E1) ----
     view: View,
-    current_dir: PathBuf,
-    addr_edit: String,
-    /// The full listing of `current_dir` (all entries, sorted).
-    all_entries: Vec<Entry>,
-    /// The filtered/visible subset actually shown (hidden toggle + text filter).
-    /// Everything — selection, keyboard, footer — indexes THIS.
-    entries: Vec<Entry>,
-    /// Case-insensitive name filter for the current folder (transient; cleared on
-    /// navigation).
-    filter: String,
-    /// Show hidden/system entries (off by default, like Explorer).
+    /// The explorer pane (one for now; see [`Pane`]).
+    pane: Pane,
+    /// Show hidden/system entries (off by default, like Explorer). App-wide.
     show_hidden: bool,
-    entries_err: Option<String>,
-    entries_dirty: bool,
-    /// History: each entry is a folder plus the item you were on in it, so
-    /// Back/Forward put you back where you were (like `go_up` does).
-    back_stack: Vec<(PathBuf, Option<String>)>,
-    fwd_stack: Vec<(PathBuf, Option<String>)>,
-    /// Free / total bytes of the drive holding `current_dir` (one call per
-    /// navigation), for the status bar. `None` if unknown.
-    drive_space: Option<(u64, u64)>,
-    sort_key: SortKey,
-    sort_asc: bool,
-    /// Selected entries, by name (stable across sort/filter). Source of truth for
-    /// highlighting and multi-item operations.
-    sel: HashSet<String>,
-    /// The focus/cursor row (index into `entries`): the single-item-op target and
-    /// the moving end of a shift-range.
-    lead: Option<usize>,
-    /// The fixed base of a shift-range selection (index into `entries`).
-    anchor: Option<usize>,
-    /// When set, scroll the file table to this row next build (keyboard nav).
-    scroll_target: Option<usize>,
-    /// Type-ahead search buffer + when it was last appended to (resets after a
-    /// short pause), so typing letters jumps to the matching file.
-    type_ahead: String,
-    type_ahead_time: Instant,
-    /// Subtree sizes for the current folder's SUBFOLDERS (lowercased name → bytes),
-    /// derived from an in-memory scan tree that covers this folder — so the list's
-    /// Size column can show folder sizes. `None` when no scan covers it.
-    folder_sizes: Option<HashMap<String, u64>>,
-    /// After the listing for `.0` loads, select the entry named `.1` — used by
-    /// "up" (re-select the folder you left) and F5 (keep the selection). The path
-    /// guards against applying it in an unrelated folder.
-    select_after_reload: Option<(PathBuf, String)>,
     /// Last window title we set, to avoid resending it every frame.
     last_title: String,
-    /// Cached status-footer summary (item counts + total), recomputed only when
-    /// the listing or folder sizes change — not every frame.
-    status_summary: String,
     /// An open New-folder / Rename dialog (E4), if any.
     prompt: Option<NamePrompt>,
     /// Cut/copy clipboard (E5).
@@ -670,33 +738,11 @@ struct SectorApp {
     undo_job: Option<(Receiver<Result<UndoDone, String>>, UndoEntry, bool)>,
     /// Transient error from the last edit/paste, shown in the footer.
     op_error: Option<String>,
-    /// True while the address bar has (or just lost) focus — suppresses the file
-    /// list's Enter/Backspace shortcuts so they don't fight the address bar.
-    addr_active: bool,
-    /// Path shown as an editable text field (true) vs a clickable breadcrumb.
-    addr_editing: bool,
-    /// Request focus for the address field on the next frame (entering edit mode).
-    addr_edit_focus: bool,
     /// Show the right-hand Properties panel for the selection.
     props_visible: bool,
-    /// Request keyboard focus for the filter box on the next frame (Ctrl+F).
-    filter_focus: bool,
-    /// Shift+F10: open the context menu on the lead row next frame (one-shot).
-    kbd_menu_req: bool,
-    /// A keyboard-opened context menu is up — keep it anchored to its row (not
-    /// the pointer) until it closes.
-    kbd_menu_open: bool,
-    /// `current_dir` itself as a listing entry (one stat per navigation), so
-    /// Details can describe the folder the TREE has focused.
-    cur_entry: Option<Entry>,
-    /// The scanned subtree size of `current_dir` (with `folder_sizes`), for the
-    /// tree-focused Details — recomputed with the folder sizes, not per frame.
-    cur_dir_size: Option<u64>,
     /// Files currently being dragged over the window (from Explorer or any
     /// app), for the drop overlay. 0 when nothing is hovering.
     drop_hover: usize,
-    /// A rubber-band selection being dragged out on the list's empty space.
-    marquee: Option<Marquee>,
     /// Was a popup/menu open when this frame began? A popup closed by Esc is
     /// already gone by the time the shortcuts run, so without this the same
     /// Esc would go on to clear the selection.
@@ -704,8 +750,9 @@ struct SectorApp {
 
     // ---- Folder-tree sidebar (E1b.2, Files view only — D19) ----
     sb_visible: bool,
-    /// Which pane the keyboard drives (focus follows your last click).
-    focus_pane: Pane,
+    /// Which part of the Files view the keyboard drives (focus follows your
+    /// last click).
+    focus_pane: Focus,
     /// Request to scroll the tree so the current node is visible (after a
     /// keyboard move in the tree).
     tree_scroll: bool,
@@ -762,29 +809,9 @@ impl Default for SectorApp {
             pending_save: None,
 
             view: View::List,
-            current_dir: PathBuf::from("C:\\"),
-            addr_edit: "C:\\".to_string(),
-            all_entries: Vec::new(),
-            entries: Vec::new(),
-            filter: String::new(),
+            pane: Pane::default(),
             show_hidden: false,
-            entries_err: None,
-            entries_dirty: true,
-            back_stack: Vec::new(),
-            fwd_stack: Vec::new(),
-            drive_space: None,
-            sort_key: SortKey::Name,
-            sort_asc: true,
-            sel: HashSet::new(),
-            lead: None,
-            anchor: None,
-            scroll_target: None,
-            type_ahead: String::new(),
-            type_ahead_time: Instant::now(),
-            folder_sizes: None,
-            select_after_reload: None,
             last_title: String::new(),
-            status_summary: String::new(),
             prompt: None,
             clipboard: None,
             clip_seq: 0,
@@ -795,27 +822,18 @@ impl Default for SectorApp {
             redo: Vec::new(),
             undo_job: None,
             op_error: None,
-            cache_mtime: None,
-            pending_usn_mark: None,
-            cache_freshness: Freshness::Unknown,
-            addr_active: false,
-            addr_editing: false,
-            addr_edit_focus: false,
             props_visible: false,
-            filter_focus: false,
-            kbd_menu_req: false,
-            kbd_menu_open: false,
-            cur_entry: None,
-            cur_dir_size: None,
             drop_hover: 0,
-            marquee: None,
             menu_open_at_start: false,
             sb_visible: true,
-            focus_pane: Pane::List,
+            focus_pane: Focus::List,
             tree_scroll: false,
             sb_roots: Vec::new(),
             sb_expanded: HashSet::new(),
             sb_cache: HashMap::new(),
+            cache_mtime: None,
+            pending_usn_mark: None,
+            cache_freshness: Freshness::Unknown,
             city_note: None,
             cache_load: None,
             city_root: None,
@@ -914,7 +932,7 @@ impl SectorApp {
             cancel.store(true, Ordering::Relaxed);
         }
 
-        let path = self.current_dir.clone();
+        let path = self.pane.current_dir.clone();
         let tree = Arc::new(Mutex::new(Tree::new(path.to_string_lossy().into_owned())));
         let progress = Arc::new(Progress::default());
         let cancel = Arc::new(AtomicBool::new(false));
@@ -936,11 +954,11 @@ impl SectorApp {
         self.reveal_start = None; // a leftover cache-load animation must not drive a live scan
         self.dominant = None;
         self.menu_target = None;
-        self.city_root = Some(self.current_dir.clone());
-        self.city_synced_dir = Some(self.current_dir.clone());
+        self.city_root = Some(self.pane.current_dir.clone());
+        self.city_synced_dir = Some(self.pane.current_dir.clone());
         // Capture the USN watermark BEFORE the scan, so any later change counts
         // as making the cache stale (E6). None on NAS / non-NTFS.
-        self.pending_usn_mark = query_mark(&self.current_dir);
+        self.pending_usn_mark = query_mark(&self.pane.current_dir);
         self.cache_freshness = Freshness::Unknown;
         self.scan = ScanState::Running {
             tree,
@@ -956,7 +974,7 @@ impl SectorApp {
     /// The City shows a loading state meanwhile; [`Self::install_cache`] runs
     /// when the result arrives (if we're still in that folder).
     fn start_cache_load(&mut self) {
-        let dir = self.current_dir.clone();
+        let dir = self.pane.current_dir.clone();
         let Some(cp) = cache_path_for(&dir.to_string_lossy()) else {
             eprintln!("[sector] cache: no cache dir");
             self.city_no_cache();
@@ -981,7 +999,7 @@ impl SectorApp {
         let cs = lc.stats;
         // E6: is this cached view still current per the USN journal?
         let mark = UsnMark { journal_id: cs.usn_journal_id, next_usn: cs.usn_next };
-        self.cache_freshness = usn_freshness(&self.current_dir, &mark);
+        self.cache_freshness = usn_freshness(&self.pane.current_dir, &mark);
         self.dominant = Some(lc.dominant);
         let stats = ScanStats {
             dirs: cs.dirs,
@@ -996,8 +1014,8 @@ impl SectorApp {
         self.crystallize = true;
         self.reveal_start = Some(Instant::now()); // animate the city rising
         self.menu_target = None;
-        self.city_root = Some(self.current_dir.clone());
-        self.city_synced_dir = Some(self.current_dir.clone());
+        self.city_root = Some(self.pane.current_dir.clone());
+        self.city_synced_dir = Some(self.pane.current_dir.clone());
         // No scanner thread; the dead channel is never polled because `stats`
         // is already `Some`.
         let (_tx, rx) = channel();
@@ -1018,7 +1036,7 @@ impl SectorApp {
     /// the point, and a local subfolder is seconds); otherwise the idle
     /// scan-prompt (network drives and drive roots always wait for Scan).
     fn city_no_cache(&mut self) {
-        let dir = &self.current_dir;
+        let dir = &self.pane.current_dir;
         let eligible = self.auto_scan_local && dir.parent().is_some() && !is_network_path(dir);
         if eligible {
             self.start_scan();
@@ -1047,7 +1065,7 @@ impl SectorApp {
     /// Point the City at `current_dir` (E2). Instant cache-load if one exists;
     /// otherwise drop to an idle scan-prompt (a full scan stays deliberate).
     fn sync_city(&mut self) {
-        let cur = self.current_dir.clone();
+        let cur = self.pane.current_dir.clone();
         // One stat here (folder change), reused by the City top bar's Load-cached
         // button so it doesn't re-stat the file every frame.
         let md = cache_path_for(&cur.to_string_lossy())
@@ -1070,29 +1088,29 @@ impl SectorApp {
 
     /// Keep the address bar showing the canonical current directory.
     fn sync_addr(&mut self) {
-        self.addr_edit = self.current_dir.to_string_lossy().into_owned();
+        self.pane.addr_edit = self.pane.current_dir.to_string_lossy().into_owned();
     }
 
     /// Switch the address bar to its text field, with the path selected so
     /// typing replaces it (Edit button, Alt+D, Ctrl+L, F4).
     fn begin_addr_edit(&mut self) {
-        self.addr_edit = self.current_dir.to_string_lossy().into_owned();
-        self.addr_editing = true;
-        self.addr_edit_focus = true;
+        self.pane.addr_edit = self.pane.current_dir.to_string_lossy().into_owned();
+        self.pane.addr_editing = true;
+        self.pane.addr_edit_focus = true;
     }
 
     fn navigate_to(&mut self, path: PathBuf) {
-        if path == self.current_dir {
-            self.entries_dirty = true;
+        if path == self.pane.current_dir {
+            self.pane.entries_dirty = true;
             return;
         }
-        let leaving = (self.current_dir.clone(), self.lead_name());
-        self.back_stack.push(leaving);
-        self.fwd_stack.clear();
-        self.current_dir = path;
-        self.entries_dirty = true;
+        let leaving = (self.pane.current_dir.clone(), self.lead_name());
+        self.pane.back_stack.push(leaving);
+        self.pane.fwd_stack.clear();
+        self.pane.current_dir = path;
+        self.pane.entries_dirty = true;
         self.clear_selection();
-        self.filter.clear();
+        self.pane.filter.clear();
         self.op_error = None;
         self.sync_addr();
         self.sb_reveal();
@@ -1107,44 +1125,44 @@ impl SectorApp {
     /// item on the cursor) for the opposite stack. Once the folder loads, the
     /// remembered item is re-selected and scrolled into view.
     fn hop(&mut self, to: (PathBuf, Option<String>)) -> (PathBuf, Option<String>) {
-        let leaving = (self.current_dir.clone(), self.lead_name());
+        let leaving = (self.pane.current_dir.clone(), self.lead_name());
         let (path, name) = to;
-        self.current_dir = path.clone();
-        self.entries_dirty = true;
+        self.pane.current_dir = path.clone();
+        self.pane.entries_dirty = true;
         self.clear_selection();
-        self.filter.clear();
+        self.pane.filter.clear();
         self.sync_addr();
         self.sb_reveal();
         if let Some(n) = name {
-            self.select_after_reload = Some((path, n));
+            self.pane.select_after_reload = Some((path, n));
         }
         leaving
     }
 
     fn go_back(&mut self) {
-        if let Some(to) = self.back_stack.pop() {
+        if let Some(to) = self.pane.back_stack.pop() {
             let left = self.hop(to);
-            self.fwd_stack.push(left);
+            self.pane.fwd_stack.push(left);
         }
     }
 
     fn go_forward(&mut self) {
-        if let Some(to) = self.fwd_stack.pop() {
+        if let Some(to) = self.pane.fwd_stack.pop() {
             let left = self.hop(to);
-            self.back_stack.push(left);
+            self.pane.back_stack.push(left);
         }
     }
 
     fn go_up(&mut self) {
-        if let Some(parent) = self.current_dir.parent().map(|p| p.to_path_buf()) {
+        if let Some(parent) = self.pane.current_dir.parent().map(|p| p.to_path_buf()) {
             // Re-select the folder we're stepping out of, once the parent loads.
             let child = self
-                .current_dir
+                .pane.current_dir
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned());
             self.navigate_to(parent.clone());
             if let Some(c) = child {
-                self.select_after_reload = Some((parent, c));
+                self.pane.select_after_reload = Some((parent, c));
             }
         }
     }
@@ -1152,30 +1170,30 @@ impl SectorApp {
     // ---- Selection (multi-select) ----
 
     fn clear_selection(&mut self) {
-        self.sel.clear();
-        self.lead = None;
-        self.anchor = None;
+        self.pane.sel.clear();
+        self.pane.lead = None;
+        self.pane.anchor = None;
     }
 
     /// Select exactly row `i` (plain click / arrow).
     fn select_only(&mut self, i: usize) {
-        self.sel.clear();
-        if let Some(e) = self.entries.get(i) {
-            self.sel.insert(e.name.clone());
-            self.lead = Some(i);
-            self.anchor = Some(i);
+        self.pane.sel.clear();
+        if let Some(e) = self.pane.entries.get(i) {
+            self.pane.sel.insert(e.name.clone());
+            self.pane.lead = Some(i);
+            self.pane.anchor = Some(i);
         }
     }
 
     /// Toggle row `i` in the selection (Ctrl+click).
     fn toggle_at(&mut self, i: usize) {
-        if let Some(e) = self.entries.get(i) {
+        if let Some(e) = self.pane.entries.get(i) {
             let name = e.name.clone();
-            if !self.sel.remove(&name) {
-                self.sel.insert(name);
+            if !self.pane.sel.remove(&name) {
+                self.pane.sel.insert(name);
             }
-            self.lead = Some(i);
-            self.anchor = Some(i);
+            self.pane.lead = Some(i);
+            self.pane.anchor = Some(i);
         }
     }
 
@@ -1184,42 +1202,42 @@ impl SectorApp {
     /// (extending from an empty state), establish one at `i` so the next extend
     /// grows the range instead of resetting it.
     fn select_range_to(&mut self, i: usize) {
-        let a = self.anchor.unwrap_or(i);
-        self.anchor = Some(a);
+        let a = self.pane.anchor.unwrap_or(i);
+        self.pane.anchor = Some(a);
         let (lo, hi) = (a.min(i), a.max(i));
-        self.sel.clear();
-        for e in self.entries.iter().skip(lo).take(hi - lo + 1) {
-            self.sel.insert(e.name.clone());
+        self.pane.sel.clear();
+        for e in self.pane.entries.iter().skip(lo).take(hi - lo + 1) {
+            self.pane.sel.insert(e.name.clone());
         }
-        self.lead = Some(i);
+        self.pane.lead = Some(i);
     }
 
     /// The item single-item ops (Open / Rename / Properties) should target: the
     /// lead if it's actually selected, else the sole selected item, else none.
     /// (Guards against Ctrl+click deselecting the lead but ops still hitting it.)
     fn op_target(&self) -> Option<usize> {
-        if let Some(i) = self.lead {
-            if self.entries.get(i).is_some_and(|e| self.sel.contains(&e.name)) {
+        if let Some(i) = self.pane.lead {
+            if self.pane.entries.get(i).is_some_and(|e| self.pane.sel.contains(&e.name)) {
                 return Some(i);
             }
         }
-        if self.sel.len() == 1 {
-            let name = self.sel.iter().next()?;
-            return self.entries.iter().position(|e| &e.name == name);
+        if self.pane.sel.len() == 1 {
+            let name = self.pane.sel.iter().next()?;
+            return self.pane.entries.iter().position(|e| &e.name == name);
         }
         None
     }
 
     fn lead_entry(&self) -> Option<&Entry> {
-        self.lead.and_then(|i| self.entries.get(i))
+        self.pane.lead.and_then(|i| self.pane.entries.get(i))
     }
 
     /// Selected entries' absolute paths, in listing order.
     fn selected_paths(&self) -> Vec<PathBuf> {
-        self.entries
+        self.pane.entries
             .iter()
-            .filter(|e| self.sel.contains(&e.name))
-            .map(|e| self.current_dir.join(&e.name))
+            .filter(|e| self.pane.sel.contains(&e.name))
+            .map(|e| self.pane.current_dir.join(&e.name))
             .collect()
     }
 
@@ -1227,7 +1245,7 @@ impl SectorApp {
     /// their scanned subtree size when one is known (else 0).
     fn entry_size(&self, e: &Entry) -> u64 {
         if e.is_dir {
-            self.folder_sizes
+            self.pane.folder_sizes
                 .as_ref()
                 .and_then(|m| m.get(&e.name.to_lowercase()))
                 .copied()
@@ -1238,7 +1256,7 @@ impl SectorApp {
     }
 
     fn sort_entries(&self, es: &mut [Entry]) {
-        let (key, asc) = (self.sort_key, self.sort_asc);
+        let (key, asc) = (self.pane.sort_key, self.pane.sort_asc);
         es.sort_by(|a, b| {
             // Folders always first, then by the chosen key.
             b.is_dir.cmp(&a.is_dir).then_with(|| {
@@ -1258,36 +1276,36 @@ impl SectorApp {
     }
 
     fn reload_entries(&mut self) {
-        self.drive_space = drive_space(&self.current_dir);
+        self.pane.drive_space = drive_space(&self.pane.current_dir);
         // Refresh folder sizes first so the initial sort (by Size) can use them.
         self.recompute_folder_sizes();
-        match list_dir(&self.current_dir) {
+        match list_dir(&self.pane.current_dir) {
             Ok(mut es) => {
                 self.sort_entries(&mut es);
-                self.all_entries = es;
-                self.entries_err = None;
+                self.pane.all_entries = es;
+                self.pane.entries_err = None;
             }
             Err(e) => {
-                self.all_entries.clear();
-                self.entries_err = Some(e.to_string());
+                self.pane.all_entries.clear();
+                self.pane.entries_err = Some(e.to_string());
             }
         }
         self.apply_filter();
-        self.addr_edit = self.current_dir.to_string_lossy().into_owned();
-        self.entries_dirty = false;
+        self.pane.addr_edit = self.pane.current_dir.to_string_lossy().into_owned();
+        self.pane.entries_dirty = false;
         // The folder itself, for Details when the tree has focus (one stat).
-        self.cur_entry = stat_entry(&self.current_dir).ok();
+        self.pane.cur_entry = stat_entry(&self.pane.current_dir).ok();
         // Honor a pending select-by-name (from "up" or F5) — but only in the
         // folder it was meant for, so a stale value can't select elsewhere.
-        if let Some((dir, name)) = self.select_after_reload.take() {
-            if dir == self.current_dir {
+        if let Some((dir, name)) = self.pane.select_after_reload.take() {
+            if dir == self.pane.current_dir {
                 if let Some(i) = self
-                    .entries
+                    .pane.entries
                     .iter()
                     .position(|e| e.name.eq_ignore_ascii_case(&name))
                 {
                     self.select_only(i);
-                    self.scroll_target = Some(i);
+                    self.pane.scroll_target = Some(i);
                 }
             }
         }
@@ -1298,12 +1316,12 @@ impl SectorApp {
     /// the text filter, preserving the selection by name. Cheap re-clone; call it
     /// whenever the filter or the hidden toggle changes.
     fn apply_filter(&mut self) {
-        let name_of = |i: Option<usize>| i.and_then(|i| self.entries.get(i)).map(|e| e.name.clone());
-        let (lead_name, anchor_name) = (name_of(self.lead), name_of(self.anchor));
+        let name_of = |i: Option<usize>| i.and_then(|i| self.pane.entries.get(i)).map(|e| e.name.clone());
+        let (lead_name, anchor_name) = (name_of(self.pane.lead), name_of(self.pane.anchor));
         let show_hidden = self.show_hidden;
-        let f = self.filter.trim().to_lowercase();
-        self.entries = self
-            .all_entries
+        let f = self.pane.filter.trim().to_lowercase();
+        self.pane.entries = self
+            .pane.all_entries
             .iter()
             .filter(|e| {
                 (show_hidden || !e.is_hidden)
@@ -1313,11 +1331,11 @@ impl SectorApp {
             .collect();
         // Keep only selected names that are still visible; remap lead & anchor by
         // their OWN names (don't collapse the range anchor into the lead).
-        let visible: HashSet<String> = self.entries.iter().map(|e| e.name.clone()).collect();
-        self.sel.retain(|n| visible.contains(n));
-        let pos = |n: Option<String>| n.and_then(|n| self.entries.iter().position(|e| e.name == n));
-        self.lead = pos(lead_name);
-        self.anchor = pos(anchor_name);
+        let visible: HashSet<String> = self.pane.entries.iter().map(|e| e.name.clone()).collect();
+        self.pane.sel.retain(|n| visible.contains(n));
+        let pos = |n: Option<String>| n.and_then(|n| self.pane.entries.iter().position(|e| e.name == n));
+        self.pane.lead = pos(lead_name);
+        self.pane.anchor = pos(anchor_name);
         // NB: scrolling to the selection is done by the sort handler, not here —
         // a filter keystroke shouldn't yank the viewport.
         self.refresh_status_summary();
@@ -1329,34 +1347,34 @@ impl SectorApp {
     /// it `None` when no completed scan covers `current_dir`. Callers refresh the
     /// status summary (the total depends on folder sizes).
     fn recompute_folder_sizes(&mut self) {
-        self.folder_sizes = self.compute_folder_sizes();
-        let cur = self.current_dir.clone();
-        self.cur_dir_size = self.scanned_subtree_size(&cur);
+        self.pane.folder_sizes = self.compute_folder_sizes();
+        let cur = self.pane.current_dir.clone();
+        self.pane.cur_dir_size = self.scanned_subtree_size(&cur);
     }
 
     /// Recompute the cached status-footer summary. O(n) over the listing, but
     /// only when it (or folder sizes) changes — never per frame.
     fn refresh_status_summary(&mut self) {
-        if self.entries_err.is_some() {
-            self.status_summary.clear();
+        if self.pane.entries_err.is_some() {
+            self.pane.status_summary.clear();
             return;
         }
-        let n = self.entries.len();
-        let folders = self.entries.iter().filter(|e| e.is_dir).count();
-        let total: u64 = self.entries.iter().map(|e| self.entry_size(e)).sum();
+        let n = self.pane.entries.len();
+        let folders = self.pane.entries.iter().filter(|e| e.is_dir).count();
+        let total: u64 = self.pane.entries.iter().map(|e| self.entry_size(e)).sum();
         // If a filter or the hidden toggle is narrowing the listing, lead with the
         // shown-of-total count.
-        let hidden_or_filtered = n != self.all_entries.len();
+        let hidden_or_filtered = n != self.pane.all_entries.len();
         let prefix = if hidden_or_filtered {
-            format!("{} of {} shown · ", commas(n as u64), commas(self.all_entries.len() as u64))
+            format!("{} of {} shown · ", commas(n as u64), commas(self.pane.all_entries.len() as u64))
         } else {
             String::new()
         };
         let space = self
-            .drive_space
+            .pane.drive_space
             .map(|(free, total)| format!(" · {} free of {}", human_size(free), human_size(total)))
             .unwrap_or_default();
-        self.status_summary = format!(
+        self.pane.status_summary = format!(
             "{prefix}{} items · {} folders · {} files · {}{space}",
             commas(n as u64),
             commas(folders as u64),
@@ -1381,7 +1399,7 @@ impl SectorApp {
                 .map(|c| c.as_os_str().to_string_lossy().to_lowercase())
                 .collect()
         };
-        let (root_c, cur_c) = (lower(root), lower(&self.current_dir));
+        let (root_c, cur_c) = (lower(root), lower(&self.pane.current_dir));
         if !cur_c.starts_with(&root_c) {
             return None; // current folder isn't inside the scanned root
         }
@@ -1411,7 +1429,7 @@ impl SectorApp {
 
     /// F2 with the folder tree focused: rename the folder you're in.
     fn open_rename_dir(&mut self) {
-        let d = self.current_dir.clone();
+        let d = self.pane.current_dir.clone();
         self.open_rename_dir_at(d);
     }
 
@@ -1431,14 +1449,14 @@ impl SectorApp {
     /// Ctrl+C/X with the tree focused: the folder you're in goes on the
     /// clipboard (never a drive root).
     fn clip_current_dir(&mut self, cut: bool) {
-        if self.current_dir.parent().is_some() {
-            self.set_clipboard(vec![self.current_dir.clone()], cut);
+        if self.pane.current_dir.parent().is_some() {
+            self.set_clipboard(vec![self.pane.current_dir.clone()], cut);
         }
     }
 
     /// Delete with the tree focused: the folder you're in (never a drive root).
     fn request_delete_current_dir(&mut self) {
-        let d = self.current_dir.clone();
+        let d = self.pane.current_dir.clone();
         self.request_delete_dir(d);
     }
 
@@ -1461,7 +1479,7 @@ impl SectorApp {
     /// (case-insensitively) in the current listing.
     fn unique_new_folder_name(&self) -> String {
         let taken =
-            |name: &str| self.all_entries.iter().any(|e| e.name.eq_ignore_ascii_case(name));
+            |name: &str| self.pane.all_entries.iter().any(|e| e.name.eq_ignore_ascii_case(name));
         if !taken("New folder") {
             return "New folder".to_string();
         }
@@ -1515,7 +1533,7 @@ impl SectorApp {
         // that the filesystem will treat as the same name.
         let lname = name.to_lowercase();
         let lallow = allow.map(str::to_lowercase);
-        let clashes = self.all_entries.iter().any(|e| {
+        let clashes = self.pane.all_entries.iter().any(|e| {
             let en = e.name.to_lowercase();
             en == lname && lallow.as_deref() != Some(en.as_str())
         });
@@ -1531,7 +1549,7 @@ impl SectorApp {
         match &prompt.kind {
             PromptKind::NewFolder => {
                 let name = self.validate_name(&prompt.buf, None)?.to_string();
-                let target = self.current_dir.join(&name);
+                let target = self.pane.current_dir.join(&name);
                 std::fs::create_dir(&target)
                     .map_err(|e| format!("Couldn't create the folder: {e}"))?;
                 self.push_undo(UndoEntry::new(UndoOp::RemoveDir { path: target }, "new folder"));
@@ -1542,8 +1560,8 @@ impl SectorApp {
                 if name == *orig {
                     return Ok(()); // no change — just close
                 }
-                let src = self.current_dir.join(orig);
-                let dst = self.current_dir.join(&name);
+                let src = self.pane.current_dir.join(orig);
+                let dst = self.pane.current_dir.join(&name);
                 // The listing we validated against can be stale (a file created
                 // since the last refresh), and `fs::rename` on Windows REPLACES
                 // an existing file — so re-check on disk right before renaming.
@@ -1586,12 +1604,12 @@ impl SectorApp {
                 if self.sb_expanded.remove(dir) {
                     self.sb_expanded.insert(dst.clone());
                 }
-                if let Some(p) = reroot(&self.current_dir, dir, &dst) {
-                    self.current_dir = p;
+                if let Some(p) = reroot(&self.pane.current_dir, dir, &dst) {
+                    self.pane.current_dir = p;
                     self.sync_addr();
                 }
                 self.sb_cache.clear();
-                self.entries_dirty = true;
+                self.pane.entries_dirty = true;
                 self.sb_reveal();
             }
         }
@@ -1600,31 +1618,31 @@ impl SectorApp {
 
     /// Refresh views after a successful edit, and select the affected item.
     fn after_edit(&mut self, select_name: String) {
-        self.entries_dirty = true;
+        self.pane.entries_dirty = true;
         self.sb_cache.clear(); // the folder tree may have changed
-        self.filter.clear(); // so the new/renamed item is visible
-        self.select_after_reload = Some((self.current_dir.clone(), select_name));
+        self.pane.filter.clear(); // so the new/renamed item is visible
+        self.pane.select_after_reload = Some((self.pane.current_dir.clone(), select_name));
     }
 
     /// Field list for the Details panel, or `None`. Describes the list's target
     /// item — or, when the tree has focus or nothing is selected, the folder
     /// you're IN (as Explorer's details pane does).
     fn selected_properties(&self) -> Option<Vec<(&'static str, String)>> {
-        let tree_focus = self.focus_pane == Pane::Tree && self.sb_visible;
-        let item = if tree_focus { None } else { self.op_target().and_then(|i| self.entries.get(i)) };
+        let tree_focus = self.focus_pane == Focus::Tree && self.sb_visible;
+        let item = if tree_focus { None } else { self.op_target().and_then(|i| self.pane.entries.get(i)) };
         match item {
             Some(e) => {
                 let size = if e.is_dir {
-                    self.folder_sizes.as_ref().and_then(|m| m.get(&e.name.to_lowercase())).copied()
+                    self.pane.folder_sizes.as_ref().and_then(|m| m.get(&e.name.to_lowercase())).copied()
                 } else {
                     None
                 };
-                Some(self.properties_of(e, &self.current_dir, size))
+                Some(self.properties_of(e, &self.pane.current_dir, size))
             }
             None => {
-                let e = self.cur_entry.as_ref()?;
-                let location = self.current_dir.parent().unwrap_or(&self.current_dir).to_path_buf();
-                Some(self.properties_of(e, &location, self.cur_dir_size))
+                let e = self.pane.cur_entry.as_ref()?;
+                let location = self.pane.current_dir.parent().unwrap_or(&self.pane.current_dir).to_path_buf();
+                Some(self.properties_of(e, &location, self.pane.cur_dir_size))
             }
         }
     }
@@ -1730,7 +1748,7 @@ impl SectorApp {
 
     /// Start pasting the clipboard into the current folder (background thread).
     fn start_paste(&mut self) {
-        let dest = self.current_dir.clone();
+        let dest = self.pane.current_dir.clone();
         self.start_paste_into(dest);
     }
 
@@ -1878,28 +1896,28 @@ impl SectorApp {
     /// completed after you navigated elsewhere no longer reselects by name in
     /// the wrong folder.)
     fn after_op(&mut self, item: &Path) {
-        self.entries_dirty = true;
+        self.pane.entries_dirty = true;
         self.sb_cache.clear();
-        if item.parent() == Some(self.current_dir.as_path()) {
-            self.filter.clear();
-            self.select_after_reload = Some((self.current_dir.clone(), name_of(item)));
+        if item.parent() == Some(self.pane.current_dir.as_path()) {
+            self.pane.filter.clear();
+            self.pane.select_after_reload = Some((self.pane.current_dir.clone(), name_of(item)));
         }
     }
 
     /// If the folder we're IN no longer exists (deleted, undone), step out to
     /// its nearest surviving ancestor — in place, not as a history step.
     fn step_out_if_gone(&mut self) {
-        if std::fs::symlink_metadata(&self.current_dir).is_ok() {
+        if std::fs::symlink_metadata(&self.pane.current_dir).is_ok() {
             return;
         }
-        let mut p = self.current_dir.clone();
+        let mut p = self.pane.current_dir.clone();
         while let Some(parent) = p.parent().map(Path::to_path_buf) {
             p = parent;
             if std::fs::symlink_metadata(&p).is_ok() {
                 break;
             }
         }
-        self.current_dir = p;
+        self.pane.current_dir = p;
         self.sync_addr();
         self.clear_selection();
         self.sb_reveal();
@@ -1911,7 +1929,7 @@ impl SectorApp {
     /// leaving the current folder itself highlighted-but-not-expanded (a click
     /// expands it explicitly; keyboard arrowing just highlights).
     fn sb_reveal(&mut self) {
-        let mut cur = self.current_dir.clone();
+        let mut cur = self.pane.current_dir.clone();
         while let Some(parent) = cur.parent().map(|p| p.to_path_buf()) {
             self.sb_expanded.insert(parent.clone());
             cur = parent;
@@ -2007,11 +2025,11 @@ impl SectorApp {
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| path.to_string_lossy().into_owned());
         let open = self.sb_expanded.contains(&path);
-        let is_current = self.current_dir == path;
+        let is_current = self.pane.current_dir == path;
 
         let mut toggle = false;
         let mut navigate = false;
-        let scroll_here = self.tree_scroll && is_current && self.focus_pane == Pane::Tree;
+        let scroll_here = self.tree_scroll && is_current && self.focus_pane == Focus::Tree;
 
         // The whole row is ONE full-width interactive element, so hovering
         // anywhere on it (text or the space beside it) highlights uniformly.
@@ -2119,7 +2137,7 @@ impl SectorApp {
             item(ui, true, "Properties", TreeAct::Props);
         });
         if let Some(a) = act {
-            self.focus_pane = Pane::Tree;
+            self.focus_pane = Focus::Tree;
             match a {
                 TreeAct::Open => navigate = true,
                 TreeAct::Toggle => toggle = true,
@@ -2151,12 +2169,12 @@ impl SectorApp {
             } else {
                 self.sb_expanded.insert(path.clone());
             }
-            self.focus_pane = Pane::Tree;
+            self.focus_pane = Focus::Tree;
         }
         if navigate {
             // Select/navigate WITHOUT expanding — the triangle (or → key) expands.
             self.navigate_to(path.clone());
-            self.focus_pane = Pane::Tree;
+            self.focus_pane = Focus::Tree;
         }
 
         if self.sb_expanded.contains(&path) {
@@ -2184,13 +2202,13 @@ impl SectorApp {
         // you can jump straight to a folder (browser-style).
         let (mut back_n, mut fwd_n) = (0usize, 0usize);
         let back = ui
-            .add_enabled(!self.back_stack.is_empty(), egui::Button::new("◀"))
+            .add_enabled(!self.pane.back_stack.is_empty(), egui::Button::new("◀"))
             .on_hover_text("Back (right-click for history)");
         if back.clicked() {
             back_n = 1;
         }
         back.context_menu(|ui| {
-            for (n, (p, _)) in self.back_stack.iter().rev().take(HISTORY_MENU).enumerate() {
+            for (n, (p, _)) in self.pane.back_stack.iter().rev().take(HISTORY_MENU).enumerate() {
                 if ui.button(p.to_string_lossy().into_owned()).clicked() {
                     back_n = n + 1;
                     ui.close();
@@ -2198,13 +2216,13 @@ impl SectorApp {
             }
         });
         let fwd = ui
-            .add_enabled(!self.fwd_stack.is_empty(), egui::Button::new("▶"))
+            .add_enabled(!self.pane.fwd_stack.is_empty(), egui::Button::new("▶"))
             .on_hover_text("Forward (right-click for history)");
         if fwd.clicked() {
             fwd_n = 1;
         }
         fwd.context_menu(|ui| {
-            for (n, (p, _)) in self.fwd_stack.iter().rev().take(HISTORY_MENU).enumerate() {
+            for (n, (p, _)) in self.pane.fwd_stack.iter().rev().take(HISTORY_MENU).enumerate() {
                 if ui.button(p.to_string_lossy().into_owned()).clicked() {
                     fwd_n = n + 1;
                     ui.close();
@@ -2218,38 +2236,38 @@ impl SectorApp {
             self.go_forward();
         }
         if ui
-            .add_enabled(self.current_dir.parent().is_some(), egui::Button::new("⬆"))
+            .add_enabled(self.pane.current_dir.parent().is_some(), egui::Button::new("⬆"))
             .on_hover_text("Up")
             .clicked()
         {
             self.go_up();
         }
 
-        if self.addr_editing {
+        if self.pane.addr_editing {
             // Editable path field.
             let addr_id = egui::Id::new("sector_addr_edit");
             let r = ui.add(
-                egui::TextEdit::singleline(&mut self.addr_edit)
+                egui::TextEdit::singleline(&mut self.pane.addr_edit)
                     .id(addr_id)
                     .desired_width(f32::INFINITY),
             );
-            if self.addr_edit_focus {
+            if self.pane.addr_edit_focus {
                 r.request_focus();
                 // Select the whole path (like Explorer) so typing replaces it.
                 if let Some(mut state) = egui::TextEdit::load_state(ui.ctx(), addr_id) {
-                    let end = self.addr_edit.chars().count();
+                    let end = self.pane.addr_edit.chars().count();
                     state.cursor.set_char_range(Some(egui::text::CCursorRange::two(
                         egui::text::CCursor::new(0),
                         egui::text::CCursor::new(end),
                     )));
                     egui::TextEdit::store_state(ui.ctx(), addr_id, state);
                 }
-                self.addr_edit_focus = false;
+                self.pane.addr_edit_focus = false;
             }
-            self.addr_active = r.has_focus() || r.lost_focus();
+            self.pane.addr_active = r.has_focus() || r.lost_focus();
             if r.lost_focus() {
                 if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                    let raw = self.addr_edit.trim();
+                    let raw = self.pane.addr_edit.trim();
                     // "C:" is drive-relative; the user means the drive root.
                     let norm = if raw.len() == 2
                         && raw.as_bytes()[0].is_ascii_alphabetic()
@@ -2261,10 +2279,10 @@ impl SectorApp {
                     };
                     self.navigate_to(PathBuf::from(norm));
                 }
-                self.addr_editing = false; // leave edit mode on commit or blur
+                self.pane.addr_editing = false; // leave edit mode on commit or blur
             }
         } else {
-            self.addr_active = false;
+            self.pane.addr_active = false;
             // The bar itself, registered FIRST so the segments (added later) sit
             // on top: a click on its empty space switches to the text field, as
             // in Explorer. A faint hover fill + I-beam cursor make that visible.
@@ -2280,7 +2298,7 @@ impl SectorApp {
             let bar = bar.on_hover_text("Click to edit the path (Alt+D, Ctrl+L, F4)");
             // Clickable breadcrumb.
             let mut go: Option<PathBuf> = None;
-            let segs = breadcrumb_segments(&self.current_dir);
+            let segs = breadcrumb_segments(&self.pane.current_dir);
             let last = segs.len().saturating_sub(1);
             // Breathing room between segments and their chevrons (the chevrons
             // are buttons now, so a tight gap reads as one run of text).
@@ -2333,7 +2351,7 @@ impl SectorApp {
     /// The file-explorer List view: a folder-tree sidebar + a virtualized file
     /// table for `current_dir`.
     fn show_list(&mut self, ui: &mut egui::Ui) {
-        if self.entries_dirty {
+        if self.pane.entries_dirty {
             self.reload_entries();
         }
 
@@ -2359,27 +2377,27 @@ impl SectorApp {
                 }
                 ui.separator();
                 let r = ui.add(
-                    egui::TextEdit::singleline(&mut self.filter)
+                    egui::TextEdit::singleline(&mut self.pane.filter)
                         .id(egui::Id::new("sector_filter_edit"))
                         .desired_width(220.0)
                         .hint_text("Filter this folder… (Ctrl+F)"),
                 );
-                if self.filter_focus {
+                if self.pane.filter_focus {
                     r.request_focus();
-                    self.filter_focus = false;
+                    self.pane.filter_focus = false;
                 }
                 let mut changed = r.changed();
                 // Esc while typing here clears the filter (egui drops focus on
                 // Esc but leaves the key readable this frame).
                 if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
                     esc_handled = true;
-                    if !self.filter.is_empty() {
-                        self.filter.clear();
+                    if !self.pane.filter.is_empty() {
+                        self.pane.filter.clear();
                         changed = true;
                     }
                 }
-                if !self.filter.is_empty() && ui.button("×").on_hover_text("Clear filter").clicked() {
-                    self.filter.clear();
+                if !self.pane.filter.is_empty() && ui.button("×").on_hover_text("Clear filter").clicked() {
+                    self.pane.filter.clear();
                     changed = true;
                 }
                 ui.separator();
@@ -2485,21 +2503,21 @@ impl SectorApp {
 
         // Status footer: folder totals (cached) + selection details.
         {
-            let detail = if self.sel.len() > 1 {
+            let detail = if self.pane.sel.len() > 1 {
                 // Multiple selected: count + combined size of known items.
                 let total: u64 = self
-                    .entries
+                    .pane.entries
                     .iter()
-                    .filter(|e| self.sel.contains(&e.name))
+                    .filter(|e| self.pane.sel.contains(&e.name))
                     .map(|e| self.entry_size(e))
                     .sum();
-                Some(format!("{} selected · {}", self.sel.len(), human_size(total)))
+                Some(format!("{} selected · {}", self.pane.sel.len(), human_size(total)))
             } else {
-                self.lead_entry().filter(|e| self.sel.contains(&e.name)).map(|e| {
+                self.lead_entry().filter(|e| self.pane.sel.contains(&e.name)).map(|e| {
                     let mut s = e.name.clone();
                     let known = !e.is_dir
                         || self
-                            .folder_sizes
+                            .pane.folder_sizes
                             .as_ref()
                             .map(|m| m.contains_key(&e.name.to_lowercase()))
                             .unwrap_or(false);
@@ -2537,7 +2555,7 @@ impl SectorApp {
                             clear_err = true;
                         }
                     } else {
-                        ui.weak(&self.status_summary);
+                        ui.weak(&self.pane.status_summary);
                         if let Some(d) = detail {
                             ui.separator();
                             ui.label(d);
@@ -2596,10 +2614,10 @@ impl SectorApp {
             // replaces it.
             if bg.drag_started_by(egui::PointerButton::Primary) && !dismissing {
                 let additive = ui.ctx().input(|i| i.modifiers.ctrl || i.modifiers.shift);
-                let base = if additive { self.sel.clone() } else { HashSet::new() };
+                let base = if additive { self.pane.sel.clone() } else { HashSet::new() };
                 let start = bg.interact_pointer_pos().unwrap_or(bg.rect.min);
-                self.marquee = Some(Marquee { start, base });
-                self.focus_pane = Pane::List;
+                self.pane.marquee = Some(Marquee { start, base });
+                self.focus_pane = Focus::List;
             }
             let can_paste_here = self.clipboard.is_some() && !self.file_op_running();
             bg.context_menu(|ui| {
@@ -2619,21 +2637,21 @@ impl SectorApp {
                 item(ui, true, "Properties", BgAct::Props);
             });
             if let Some(a) = bg_act {
-                self.focus_pane = Pane::List;
+                self.focus_pane = Focus::List;
                 match a {
                     BgAct::Deselect => self.clear_selection(),
                     BgAct::Paste => self.start_paste(),
                     BgAct::NewFolder => self.open_new_folder(),
                     BgAct::SelectAll => {
-                        self.sel = self.entries.iter().map(|e| e.name.clone()).collect();
-                        self.lead = self.entries.len().checked_sub(1);
-                        self.anchor = Some(0);
+                        self.pane.sel = self.pane.entries.iter().map(|e| e.name.clone()).collect();
+                        self.pane.lead = self.pane.entries.len().checked_sub(1);
+                        self.pane.anchor = Some(0);
                     }
                     BgAct::Refresh => {
-                        self.entries_dirty = true;
+                        self.pane.entries_dirty = true;
                         self.sb_cache.clear();
                     }
-                    BgAct::Reveal => reveal_in_explorer(&self.current_dir, true),
+                    BgAct::Reveal => reveal_in_explorer(&self.pane.current_dir, true),
                     BgAct::Props => {
                         self.clear_selection(); // Details then shows the folder itself
                         self.props_visible = true;
@@ -2641,13 +2659,13 @@ impl SectorApp {
                 }
             }
 
-            if let Some(err) = self.entries_err.clone() {
+            if let Some(err) = self.pane.entries_err.clone() {
                 ui.centered_and_justified(|ui| {
                     ui.weak(format!("⚠  {err}"));
                 });
                 return;
             }
-            if self.entries.is_empty() {
+            if self.pane.entries.is_empty() {
                 ui.centered_and_justified(|ui| {
                     ui.weak("(empty folder)");
                 });
@@ -2658,11 +2676,11 @@ impl SectorApp {
 
             // Move entries out of self so the table closures don't fight the
             // borrow checker; deferred mutations are applied after.
-            let entries = std::mem::take(&mut self.entries);
-            let folder_sizes = self.folder_sizes.take();
-            let cur = self.current_dir.clone();
-            let (sort_key, sort_asc) = (self.sort_key, self.sort_asc);
-            let scroll_target = self.scroll_target.take();
+            let entries = std::mem::take(&mut self.pane.entries);
+            let folder_sizes = self.pane.folder_sizes.take();
+            let cur = self.pane.current_dir.clone();
+            let (sort_key, sort_asc) = (self.pane.sort_key, self.pane.sort_asc);
+            let scroll_target = self.pane.scroll_target.take();
             // Paths of cut items (dimmed in the list).
             let cut_paths: HashSet<PathBuf> = self
                 .clipboard
@@ -2672,13 +2690,13 @@ impl SectorApp {
                 .unwrap_or_default();
             // Selection set (taken out so the row closures can read it), plus the
             // click intent + modifiers, applied after the table.
-            let sel = std::mem::take(&mut self.sel);
+            let sel = std::mem::take(&mut self.pane.sel);
             let mods = ui.ctx().input(|i| i.modifiers);
             // Focus cursor + keyboard-menu state, read by the row closures.
-            let lead = self.lead;
-            let list_focus = !(self.focus_pane == Pane::Tree && self.sb_visible);
+            let lead = self.pane.lead;
+            let list_focus = !(self.focus_pane == Focus::Tree && self.sb_visible);
             let lead_color = ui.visuals().selection.stroke.color;
-            let (kbd_req, kbd_open) = (self.kbd_menu_req, self.kbd_menu_open);
+            let (kbd_req, kbd_open) = (self.pane.kbd_menu_req, self.pane.kbd_menu_open);
             // Internal drag-and-drop bookkeeping (applied after the table).
             let mut drag_start: Option<usize> = None;
             let mut drop_target: Option<(PathBuf, Vec<PathBuf>)> = None;
@@ -2941,24 +2959,24 @@ impl SectorApp {
                 });
 
             // Restore entries + selection, then apply deferred mutations.
-            self.entries = entries;
-            self.folder_sizes = folder_sizes;
-            self.sel = sel;
+            self.pane.entries = entries;
+            self.pane.folder_sizes = folder_sizes;
+            self.pane.sel = sel;
             // Rubber-band selection: every frame of the drag, select the rows the
             // band touches (on top of `base`), and paint the band.
-            if let Some((start, base)) = self.marquee.as_ref().map(|m| (m.start, m.base.clone())) {
+            if let Some((start, base)) = self.pane.marquee.as_ref().map(|m| (m.start, m.base.clone())) {
                 if let Some(cur_pos) = ui.ctx().pointer_latest_pos() {
                     let band = Rect::from_two_pos(start, cur_pos);
                     let hit: Vec<usize> =
                         row_rects.iter().filter(|(_, r)| r.intersects(band)).map(|(i, _)| *i).collect();
                     let mut sel = base;
                     for &i in &hit {
-                        sel.insert(self.entries[i].name.clone());
+                        sel.insert(self.pane.entries[i].name.clone());
                     }
-                    self.sel = sel;
+                    self.pane.sel = sel;
                     if let (Some(&lo), Some(&hi)) = (hit.iter().min(), hit.iter().max()) {
-                        self.anchor = Some(lo);
-                        self.lead = Some(hi);
+                        self.pane.anchor = Some(lo);
+                        self.pane.lead = Some(hi);
                     }
                     let accent = lead_color;
                     ui.painter().rect(
@@ -2971,7 +2989,7 @@ impl SectorApp {
                     ui.ctx().request_repaint();
                 }
                 if bg.drag_stopped() || !ui.ctx().input(|i| i.pointer.any_down()) {
-                    self.marquee = None;
+                    self.pane.marquee = None;
                 }
             }
             // Focus cursor: a thin outline around the lead row — but only when it
@@ -2980,9 +2998,9 @@ impl SectorApp {
             // and this is the one the keyboard acts on. A plain single selection
             // gets no extra mark.
             if list_focus {
-                if let Some(l) = self.lead {
-                    let on_selection = self.entries.get(l).is_some_and(|e| self.sel.contains(&e.name));
-                    if !on_selection || self.sel.len() > 1 {
+                if let Some(l) = self.pane.lead {
+                    let on_selection = self.pane.entries.get(l).is_some_and(|e| self.pane.sel.contains(&e.name));
+                    if !on_selection || self.pane.sel.len() > 1 {
                         if let Some((_, r)) = row_rects.iter().find(|(i, _)| *i == l) {
                             ui.painter().rect_stroke(
                                 r.shrink(0.5),
@@ -3000,10 +3018,10 @@ impl SectorApp {
                 ui.painter().rect_stroke(r, 3.0_f32, Stroke::new(2.0, lead_color), egui::StrokeKind::Inside);
             }
             if let Some(i) = drag_start {
-                if !self.entries.get(i).is_some_and(|e| self.sel.contains(&e.name)) {
+                if !self.pane.entries.get(i).is_some_and(|e| self.pane.sel.contains(&e.name)) {
                     self.select_only(i);
                 }
-                self.focus_pane = Pane::List;
+                self.focus_pane = Focus::List;
             }
             if let Some((dest, paths)) = drop_target {
                 let copy = ui.ctx().input(|i| i.modifiers.ctrl);
@@ -3011,12 +3029,12 @@ impl SectorApp {
             }
             // Keyboard context menu: the request was consumed by the lead row
             // this frame; once the menu closes, stop anchoring to it.
-            if self.kbd_menu_req {
-                self.kbd_menu_req = false;
-                self.kbd_menu_open = true;
+            if self.pane.kbd_menu_req {
+                self.pane.kbd_menu_req = false;
+                self.pane.kbd_menu_open = true;
             }
-            if self.kbd_menu_open && !egui::Popup::is_any_open(ui.ctx()) {
-                self.kbd_menu_open = false;
+            if self.pane.kbd_menu_open && !egui::Popup::is_any_open(ui.ctx()) {
+                self.pane.kbd_menu_open = false;
             }
             // Apply a click: Shift = range, Ctrl = toggle, plain = select one.
             if let Some(i) = click {
@@ -3027,31 +3045,31 @@ impl SectorApp {
                 } else {
                     self.select_only(i);
                 }
-                self.focus_pane = Pane::List; // keyboard now drives the list
+                self.focus_pane = Focus::List; // keyboard now drives the list
             }
             // A right-click on an unselected row selects just it (keeps a
             // multi-selection when right-clicking within it).
             if let Some(i) = menu_row {
                 let in_sel =
-                    self.entries.get(i).map(|e| self.sel.contains(&e.name)).unwrap_or(false);
+                    self.pane.entries.get(i).map(|e| self.pane.sel.contains(&e.name)).unwrap_or(false);
                 if !in_sel {
                     self.select_only(i);
                 }
             }
             if let Some(k) = new_sort {
-                if self.sort_key == k {
-                    self.sort_asc = !self.sort_asc;
+                if self.pane.sort_key == k {
+                    self.pane.sort_asc = !self.pane.sort_asc;
                 } else {
-                    self.sort_key = k;
-                    self.sort_asc = true;
+                    self.pane.sort_key = k;
+                    self.pane.sort_asc = true;
                 }
                 // Re-sort the full listing IN PLACE (no directory re-read), then
                 // re-apply the filter (which preserves the selection by name).
-                let mut es = std::mem::take(&mut self.all_entries);
+                let mut es = std::mem::take(&mut self.pane.all_entries);
                 self.sort_entries(&mut es);
-                self.all_entries = es;
+                self.pane.all_entries = es;
                 self.apply_filter();
-                self.scroll_target = self.lead; // keep the selection visible
+                self.pane.scroll_target = self.pane.lead; // keep the selection visible
             }
             if let Some(t) = nav_target {
                 self.navigate_to(t);
@@ -3086,20 +3104,20 @@ impl SectorApp {
         // the address bar owns the keyboard (F5 there would wipe in-progress text).
         let typing = self.prompt.is_some()
             || self.confirm_delete.is_some()
-            || self.addr_active
+            || self.pane.addr_active
             || ui.ctx().memory(|m| m.focused()).is_some()
             || self.menu_open_at_start // a menu owns the keys while open —
             || egui::Popup::is_any_open(ui.ctx()); // including the Esc that closed it
         if !typing {
             // With the folder tree focused, item commands act on the folder you're
             // IN (the tree's highlighted node) rather than the list's selection.
-            let tree_focus = self.focus_pane == Pane::Tree && self.sb_visible;
+            let tree_focus = self.focus_pane == Focus::Tree && self.sb_visible;
             // Esc: clear the filter, else the selection, else close Details.
             if !esc_handled && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
-                if !self.filter.is_empty() {
-                    self.filter.clear();
+                if !self.pane.filter.is_empty() {
+                    self.pane.filter.clear();
                     self.apply_filter();
-                } else if !self.sel.is_empty() || self.lead.is_some() {
+                } else if !self.pane.sel.is_empty() || self.pane.lead.is_some() {
                     self.clear_selection();
                 } else if self.props_visible {
                     self.props_visible = false;
@@ -3111,7 +3129,7 @@ impl SectorApp {
                     && !i.modifiers.shift
                     && (i.key_pressed(egui::Key::F) || i.key_pressed(egui::Key::E))
             }) {
-                self.filter_focus = true;
+                self.pane.filter_focus = true;
             }
             // Alt+Up: up (alias of Backspace).
             if ui.input(|i| i.modifiers.alt && i.key_pressed(egui::Key::ArrowUp)) {
@@ -3119,7 +3137,7 @@ impl SectorApp {
             }
             // Ctrl+Shift+C: copy the path(s) — the focused folder, or the selection.
             if ui.input(|i| i.modifiers.ctrl && i.modifiers.shift && i.key_pressed(egui::Key::C)) {
-                let paths = if tree_focus { vec![self.current_dir.clone()] } else { self.selected_paths() };
+                let paths = if tree_focus { vec![self.pane.current_dir.clone()] } else { self.selected_paths() };
                 if !paths.is_empty() {
                     let text: Vec<String> = paths.iter().map(|p| p.to_string_lossy().into_owned()).collect();
                     ui.ctx().copy_text(text.join("\n"));
@@ -3127,15 +3145,15 @@ impl SectorApp {
             }
             // Shift+F10: open the context menu on the list's target row.
             if !tree_focus && ui.input(|i| i.modifiers.shift && i.key_pressed(egui::Key::F10)) {
-                if let Some(i) = self.op_target().or(self.lead) {
-                    self.lead = Some(i);
-                    self.scroll_target = Some(i); // the row must be rendered to host it
-                    self.kbd_menu_req = true;
+                if let Some(i) = self.op_target().or(self.pane.lead) {
+                    self.pane.lead = Some(i);
+                    self.pane.scroll_target = Some(i); // the row must be rendered to host it
+                    self.pane.kbd_menu_req = true;
                 }
             }
             // Ctrl+Space: toggle the lead row in the selection (keyboard Ctrl+click).
             if !tree_focus && ui.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::Space)) {
-                if let Some(l) = self.lead {
+                if let Some(l) = self.pane.lead {
                     self.toggle_at(l);
                 }
             }
@@ -3149,9 +3167,9 @@ impl SectorApp {
                 let keep = self.lead_entry().map(|e| e.name.clone());
                 self.clear_selection();
                 if let Some(name) = keep {
-                    self.select_after_reload = Some((self.current_dir.clone(), name));
+                    self.pane.select_after_reload = Some((self.pane.current_dir.clone(), name));
                 }
-                self.entries_dirty = true;
+                self.pane.entries_dirty = true;
                 self.sb_cache.clear();
             }
             if ui.input(|i| i.key_pressed(egui::Key::Backspace)) {
@@ -3163,8 +3181,8 @@ impl SectorApp {
                 && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Tab))
             {
                 self.focus_pane =
-                    if self.focus_pane == Pane::Tree { Pane::List } else { Pane::Tree };
-                if self.focus_pane == Pane::Tree {
+                    if self.focus_pane == Focus::Tree { Focus::List } else { Focus::Tree };
+                if self.focus_pane == Focus::Tree {
                     self.tree_scroll = true; // bring the current node into view
                 }
             }
@@ -3180,7 +3198,7 @@ impl SectorApp {
                 if tree_focus {
                     self.open_rename_dir();
                 } else if let Some(name) =
-                    self.op_target().and_then(|i| self.entries.get(i)).map(|e| e.name.clone())
+                    self.op_target().and_then(|i| self.pane.entries.get(i)).map(|e| e.name.clone())
                 {
                     self.open_rename(name);
                 }
@@ -3190,9 +3208,9 @@ impl SectorApp {
             }
             // Ctrl+A selects everything in the folder.
             if ui.input(|i| i.modifiers.ctrl && !i.modifiers.shift && i.key_pressed(egui::Key::A)) {
-                self.sel = self.entries.iter().map(|e| e.name.clone()).collect();
-                self.lead = self.entries.len().checked_sub(1);
-                self.anchor = Some(0);
+                self.pane.sel = self.pane.entries.iter().map(|e| e.name.clone()).collect();
+                self.pane.lead = self.pane.entries.len().checked_sub(1);
+                self.pane.anchor = Some(0);
             }
             // Ctrl+C copy, Ctrl+X cut, Ctrl+V paste (not Shift, to avoid clashing
             // with Ctrl+Shift+N).
@@ -3230,19 +3248,19 @@ impl SectorApp {
                 } else if tree_focus {
                     // Enter in the tree: expand/collapse the focused folder
                     // (arrowing onto it already navigated there).
-                    let d = self.current_dir.clone();
+                    let d = self.pane.current_dir.clone();
                     if !self.sb_expanded.remove(&d) {
                         self.sb_expanded.insert(d);
                     }
-                } else if self.sel.len() > 1 {
+                } else if self.pane.sel.len() > 1 {
                     // Enter on a multi-selection opens every selected FILE (a
                     // folder can't be entered alongside). Capped, like Explorer.
                     const MAX_OPEN: usize = 15;
                     let files: Vec<PathBuf> = self
-                        .entries
+                        .pane.entries
                         .iter()
-                        .filter(|e| !e.is_dir && self.sel.contains(&e.name))
-                        .map(|e| self.current_dir.join(&e.name))
+                        .filter(|e| !e.is_dir && self.pane.sel.contains(&e.name))
+                        .map(|e| self.pane.current_dir.join(&e.name))
                         .collect();
                     if files.is_empty() {
                         self.op_error =
@@ -3258,8 +3276,8 @@ impl SectorApp {
                 } else {
                     let action = self
                         .op_target()
-                        .and_then(|i| self.entries.get(i))
-                        .map(|e| (self.current_dir.join(&e.name), e.is_dir));
+                        .and_then(|i| self.pane.entries.get(i))
+                        .map(|e| (self.pane.current_dir.join(&e.name), e.is_dir));
                     if let Some((full, is_dir)) = action {
                         if is_dir {
                             self.navigate_to(full);
@@ -3271,17 +3289,17 @@ impl SectorApp {
             }
 
             // Arrows drive whichever pane has focus. The tree only when it's shown.
-            if self.focus_pane == Pane::Tree && self.sb_visible {
+            if self.focus_pane == Focus::Tree && self.sb_visible {
                 self.type_ahead_tree(ui);
                 self.tree_keys(ui);
             } else {
                 self.type_ahead_list(ui);
                 // Move the lead in the list (Shift extends the range from the
                 // anchor), scrolling it into view.
-                let n = self.entries.len();
+                let n = self.pane.entries.len();
                 if n > 0 {
                     const PAGE: usize = 12;
-                    let cur = self.lead;
+                    let cur = self.pane.lead;
                     let mut moved = cur;
                     let (shift, ctrl) = ui.input(|i| {
                         use egui::Key;
@@ -3315,11 +3333,11 @@ impl SectorApp {
                                 // Ctrl+move: move the focus cursor only — then
                                 // Ctrl+Space toggles it (Explorer's model for a
                                 // non-contiguous selection by keyboard).
-                                self.lead = Some(m);
+                                self.pane.lead = Some(m);
                             } else {
                                 self.select_only(m);
                             }
-                            self.scroll_target = Some(m);
+                            self.pane.scroll_target = Some(m);
                             ui.ctx().request_repaint();
                         }
                     }
@@ -3351,7 +3369,7 @@ impl SectorApp {
         if visible.is_empty() {
             return;
         }
-        let cur = visible.iter().position(|p| p == &self.current_dir);
+        let cur = visible.iter().position(|p| p == &self.pane.current_dir);
         let go = |app: &mut Self, path: PathBuf| {
             app.navigate_to(path);
             app.tree_scroll = true;
@@ -3371,7 +3389,7 @@ impl SectorApp {
             go(self, visible[visible.len() - 1].clone());
         } else if right {
             // Expand a collapsed folder; if already expanded, step into its first child.
-            let cur_dir = self.current_dir.clone();
+            let cur_dir = self.pane.current_dir.clone();
             let mut kids = self.sb_children(&cur_dir);
             if !kids.is_empty() {
                 if !self.sb_expanded.contains(&cur_dir) {
@@ -3382,14 +3400,14 @@ impl SectorApp {
             }
         } else if left {
             // Collapse an expanded folder; otherwise step out to the parent.
-            let cur_dir = self.current_dir.clone();
+            let cur_dir = self.pane.current_dir.clone();
             if self.sb_expanded.contains(&cur_dir) {
                 self.sb_expanded.remove(&cur_dir);
             } else if let Some(parent) = cur_dir.parent().map(|p| p.to_path_buf()) {
                 go(self, parent);
             }
         }
-        self.focus_pane = Pane::Tree;
+        self.focus_pane = Focus::Tree;
         ui.ctx().request_repaint();
     }
 
@@ -3412,36 +3430,36 @@ impl SectorApp {
         }
         let typed = typed.to_lowercase();
         let now = Instant::now();
-        let timed_out = now.duration_since(self.type_ahead_time) >= Duration::from_millis(900);
+        let timed_out = now.duration_since(self.pane.type_ahead_time) >= Duration::from_millis(900);
         let repeat = !timed_out
-            && self.type_ahead.chars().count() == 1
+            && self.pane.type_ahead.chars().count() == 1
             && typed.chars().count() == 1
-            && self.type_ahead == typed;
+            && self.pane.type_ahead == typed;
         if timed_out {
-            self.type_ahead = typed;
+            self.pane.type_ahead = typed;
         } else if !repeat {
-            self.type_ahead.push_str(&typed);
+            self.pane.type_ahead.push_str(&typed);
         }
-        self.type_ahead_time = now;
-        Some((self.type_ahead.clone(), repeat))
+        self.pane.type_ahead_time = now;
+        Some((self.pane.type_ahead.clone(), repeat))
     }
 
     /// Type-ahead in the file list: jump to the first matching name; repeating a
     /// letter cycles through matches.
     fn type_ahead_list(&mut self, ui: &egui::Ui) {
-        if self.entries.is_empty() {
+        if self.pane.entries.is_empty() {
             return;
         }
         let Some((q, repeat)) = self.type_ahead_input(ui) else { return };
-        let n = self.entries.len();
-        let start = if repeat { self.lead.map_or(0, |i| i + 1) } else { 0 };
+        let n = self.pane.entries.len();
+        let start = if repeat { self.pane.lead.map_or(0, |i| i + 1) } else { 0 };
         let hit = (0..n)
             .map(|off| (start + off) % n)
-            .find(|&i| self.entries[i].name.to_lowercase().starts_with(&q));
+            .find(|&i| self.pane.entries[i].name.to_lowercase().starts_with(&q));
         if let Some(i) = hit {
             self.select_only(i);
-            self.scroll_target = Some(i);
-            self.focus_pane = Pane::List;
+            self.pane.scroll_target = Some(i);
+            self.focus_pane = Focus::List;
             ui.ctx().request_repaint();
         }
     }
@@ -3456,7 +3474,7 @@ impl SectorApp {
         if n == 0 {
             return;
         }
-        let cur = visible.iter().position(|p| p == &self.current_dir);
+        let cur = visible.iter().position(|p| p == &self.pane.current_dir);
         let start = cur.map_or(0, |i| i + 1);
         let name_of = |p: &Path| {
             p.file_name()
@@ -3470,7 +3488,7 @@ impl SectorApp {
         if let Some(i) = hit {
             self.navigate_to(visible[i].clone());
             self.tree_scroll = true;
-            self.focus_pane = Pane::Tree;
+            self.focus_pane = Focus::Tree;
             ui.ctx().request_repaint();
         }
     }
@@ -4358,10 +4376,10 @@ impl eframe::App for SectorApp {
             replay_secs: self.replay_secs,
             threads: self.threads,
             replay_mode: self.anim_mode == AnimMode::Replay,
-            current_dir: self.current_dir.to_string_lossy().into_owned(),
+            current_dir: self.pane.current_dir.to_string_lossy().into_owned(),
             show_hidden: self.show_hidden,
-            sort_key: self.sort_key.name().to_string(),
-            sort_asc: self.sort_asc,
+            sort_key: self.pane.sort_key.name().to_string(),
+            sort_asc: self.pane.sort_asc,
             auto_scan_local: self.auto_scan_local,
         };
         eframe::set_value(storage, "settings", &s);
@@ -4381,7 +4399,7 @@ impl eframe::App for SectorApp {
         }
 
         // Reflect the current folder in the window/taskbar title (only on change).
-        let title = format!("{} — {}", sector_core::APP_NAME, self.current_dir.display());
+        let title = format!("{} — {}", sector_core::APP_NAME, self.pane.current_dir.display());
         if title != self.last_title {
             ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
             self.last_title = title;
@@ -4413,7 +4431,7 @@ impl eframe::App for SectorApp {
         }
         if let Some((result, dir)) = loaded {
             self.cache_load = None;
-            if dir == self.current_dir {
+            if dir == self.pane.current_dir {
                 match result {
                     Ok(lc) => self.install_cache(lc),
                     Err(e) => {
@@ -4550,7 +4568,7 @@ impl eframe::App for SectorApp {
                 self.push_undo(entry);
             }
             self.op_error = out.error;
-            self.entries_dirty = true;
+            self.pane.entries_dirty = true;
             self.sb_cache.clear();
             if let Some((_, dst)) = out.done.last() {
                 self.after_op(dst); // selects it only if we're still in that folder
@@ -4574,7 +4592,7 @@ impl eframe::App for SectorApp {
         if let Some(out) = delete_done {
             self.delete_job = None;
             // Either way, the folder may have changed on disk — refresh the view.
-            self.entries_dirty = true;
+            self.pane.entries_dirty = true;
             self.sb_cache.clear();
             if !out.recycled.is_empty() {
                 self.push_undo(UndoEntry::new(UndoOp::Restore { paths: out.recycled }, "delete"));
@@ -4604,7 +4622,7 @@ impl eframe::App for SectorApp {
         }
         if let Some(result) = undo_done {
             let (_, entry, was_redo) = self.undo_job.take().expect("undo job present");
-            self.entries_dirty = true;
+            self.pane.entries_dirty = true;
             self.sb_cache.clear();
             match result {
                 Ok(done) => {
@@ -4621,8 +4639,8 @@ impl eframe::App for SectorApp {
                     }
                     // Follow the folder we're IN if the reversal renamed it.
                     if let UndoOp::Rename { from, to } = &entry.op {
-                        if let Some(p) = reroot(&self.current_dir, from, to) {
-                            self.current_dir = p;
+                        if let Some(p) = reroot(&self.pane.current_dir, from, to) {
+                            self.pane.current_dir = p;
                             self.sync_addr();
                             self.sb_reveal();
                         }
@@ -4650,7 +4668,7 @@ impl eframe::App for SectorApp {
         // Address bar from the keyboard, in both views: Alt+D / Ctrl+L / F4.
         let kb_free = self.prompt.is_none()
             && self.confirm_delete.is_none()
-            && !self.addr_active
+            && !self.pane.addr_active
             && ctx.memory(|m| m.focused()).is_none()
             && !self.menu_open_at_start
             && !egui::Popup::is_any_open(&ctx);
@@ -4673,7 +4691,7 @@ impl eframe::App for SectorApp {
         let dropped: Vec<PathBuf> =
             ctx.input(|i| i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).collect());
         if !dropped.is_empty() && self.prompt.is_none() && self.confirm_delete.is_none() {
-            let dest = self.current_dir.clone();
+            let dest = self.pane.current_dir.clone();
             self.start_transfer(dropped, dest, false);
         }
         self.drop_hover = ctx.input(|i| i.raw.hovered_files.len());
@@ -4703,14 +4721,14 @@ impl eframe::App for SectorApp {
         // E2: keep the City pointed at the folder you're browsing. When the
         // location drifts (address bar, up/back, or a Files navigation), re-sync
         // — instant cache-load if available, else drop to a scan-prompt.
-        if self.city_synced_dir.as_deref() != Some(self.current_dir.as_path()) {
+        if self.city_synced_dir.as_deref() != Some(self.pane.current_dir.as_path()) {
             // Still inside the loaded tree (the address bar, Up, Back, or the
             // Files tree moved us within it)? Re-root the City there — instant
             // — instead of reloading a separate cache for that folder.
-            match self.city_node_for(&self.current_dir, false) {
+            match self.city_node_for(&self.pane.current_dir, false) {
                 Some(node) => {
                     self.root = node;
-                    self.city_synced_dir = Some(self.current_dir.clone());
+                    self.city_synced_dir = Some(self.pane.current_dir.clone());
                 }
                 None => self.sync_city(),
             }
@@ -4721,7 +4739,7 @@ impl eframe::App for SectorApp {
                 let scanning = matches!(&self.scan, ScanState::Running { stats: None, .. })
                     || self.cache_load.is_some();
                 ui.add_enabled_ui(!scanning, |ui| {
-                    let scanned = self.city_root.as_deref() == Some(self.current_dir.as_path())
+                    let scanned = self.city_root.as_deref() == Some(self.pane.current_dir.as_path())
                         && matches!(&self.scan, ScanState::Running { stats: Some(_), .. });
                     let scan_label = if scanned { "Rescan" } else { "Scan" };
                     if ui
@@ -4795,14 +4813,14 @@ impl eframe::App for SectorApp {
                     if self.cache_load.is_some() {
                         ui.horizontal(|ui| {
                             ui.spinner();
-                            ui.label(format!("Loading the cached scan of {}…", self.current_dir.display()));
+                            ui.label(format!("Loading the cached scan of {}…", self.pane.current_dir.display()));
                         });
                     } else if let Some(note) = &self.city_note {
                         ui.colored_label(egui::Color32::from_rgb(230, 170, 80), note);
                     } else {
                         ui.label(format!(
                             "No cityscape for {} yet — press Scan to build one.",
-                            self.current_dir.display()
+                            self.pane.current_dir.display()
                         ));
                     }
                 }
@@ -5077,11 +5095,11 @@ impl eframe::App for SectorApp {
             // Case-insensitive: the tree has the real casing, `current_dir` has
             // whatever was typed — a case-only difference is the same folder,
             // and must not push a phantom history entry.
-            let same = t.to_string_lossy().to_lowercase() == self.current_dir.to_string_lossy().to_lowercase();
+            let same = t.to_string_lossy().to_lowercase() == self.pane.current_dir.to_string_lossy().to_lowercase();
             if !same {
                 self.navigate_to(t);
             }
-            self.city_synced_dir = Some(self.current_dir.clone());
+            self.city_synced_dir = Some(self.pane.current_dir.clone());
         }
         } // end City view
 
@@ -5262,7 +5280,7 @@ impl eframe::App for SectorApp {
             );
             let n = self.drop_hover;
             let what = if n == 1 { "1 item".to_string() } else { format!("{n} items") };
-            let text = format!("Drop to copy {what} into {}", self.current_dir.display());
+            let text = format!("Drop to copy {what} into {}", self.pane.current_dir.display());
             let galley = painter.layout_no_wrap(text, egui::FontId::proportional(20.0), Color32::WHITE);
             let pad = Vec2::new(18.0, 12.0);
             let bg = Rect::from_center_size(r.center(), galley.size() + pad * 2.0);
@@ -5582,25 +5600,25 @@ mod tests {
     #[test]
     fn history_restores_the_item_you_were_on() {
         let mut app = SectorApp::default();
-        app.current_dir = PathBuf::from("/a");
-        app.entries = vec![entry("one"), entry("two")];
-        app.lead = Some(1);
+        app.pane.current_dir = PathBuf::from("/a");
+        app.pane.entries = vec![entry("one"), entry("two")];
+        app.pane.lead = Some(1);
 
         app.navigate_to(PathBuf::from("/b"));
-        assert_eq!(app.back_stack, vec![(PathBuf::from("/a"), Some("two".to_string()))]);
-        assert!(app.fwd_stack.is_empty());
+        assert_eq!(app.pane.back_stack, vec![(PathBuf::from("/a"), Some("two".to_string()))]);
+        assert!(app.pane.fwd_stack.is_empty());
 
         // In /b the cursor is on nothing; Back must return to /a AND re-select "two".
-        app.entries.clear();
-        app.lead = None;
+        app.pane.entries.clear();
+        app.pane.lead = None;
         app.go_back();
-        assert_eq!(app.current_dir, PathBuf::from("/a"));
-        assert_eq!(app.select_after_reload, Some((PathBuf::from("/a"), "two".to_string())));
-        assert_eq!(app.fwd_stack, vec![(PathBuf::from("/b"), None)]);
+        assert_eq!(app.pane.current_dir, PathBuf::from("/a"));
+        assert_eq!(app.pane.select_after_reload, Some((PathBuf::from("/a"), "two".to_string())));
+        assert_eq!(app.pane.fwd_stack, vec![(PathBuf::from("/b"), None)]);
 
         app.go_forward();
-        assert_eq!(app.current_dir, PathBuf::from("/b"));
-        assert_eq!(app.back_stack, vec![(PathBuf::from("/a"), None)]); // cursor wasn't restored yet (no reload) — recorded as-is
+        assert_eq!(app.pane.current_dir, PathBuf::from("/b"));
+        assert_eq!(app.pane.back_stack, vec![(PathBuf::from("/a"), None)]); // cursor wasn't restored yet (no reload) — recorded as-is
     }
 
     #[test]
