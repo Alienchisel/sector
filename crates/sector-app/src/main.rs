@@ -2694,16 +2694,6 @@ impl SectorApp {
                         let is_cut = cut_paths.contains(&cur.join(&e.name));
                         row.set_selected(sel.contains(&e.name));
                         row.col(|ui| {
-                            // Focus cursor: a slim bar on the lead row, so Ctrl+Arrow
-                            // (move without selecting) has something to show.
-                            if list_focus && lead == Some(row_index) {
-                                let r = ui.max_rect();
-                                ui.painter().rect_filled(
-                                    Rect::from_min_max(r.left_top(), Pos2::new(r.left() + 2.0, r.bottom())),
-                                    0.0,
-                                    lead_color,
-                                );
-                            }
                             ui.horizontal(|ui| {
                                 ui.spacing_mut().item_spacing.x = 6.0;
                                 match cat {
@@ -2898,6 +2888,26 @@ impl SectorApp {
                 }
                 if bg.drag_stopped() || !ui.ctx().input(|i| i.pointer.any_down()) {
                     self.marquee = None;
+                }
+            }
+            // Focus cursor: a thin outline around the lead row — but only when it
+            // says something the selection highlight doesn't: the cursor has been
+            // moved off the selection (Ctrl+Arrow), or several rows are selected
+            // and this is the one the keyboard acts on. A plain single selection
+            // gets no extra mark.
+            if list_focus {
+                if let Some(l) = self.lead {
+                    let on_selection = self.entries.get(l).is_some_and(|e| self.sel.contains(&e.name));
+                    if !on_selection || self.sel.len() > 1 {
+                        if let Some((_, r)) = row_rects.iter().find(|(i, _)| *i == l) {
+                            ui.painter().rect_stroke(
+                                r.shrink(0.5),
+                                2.0_f32,
+                                Stroke::new(1.0, lead_color.gamma_multiply(0.7)),
+                                egui::StrokeKind::Inside,
+                            );
+                        }
+                    }
                 }
             }
             // Drag-and-drop: highlight the hovered folder row; select the row a
