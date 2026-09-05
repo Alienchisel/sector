@@ -63,11 +63,70 @@ struct Clipboard {
 
 /// A paste running on a background thread.
 struct PasteJob {
-    rx: Receiver<Result<String, String>>,
+    rx: Receiver<PasteOutcome>,
     cancel: Arc<AtomicBool>,
     cut: bool,
     /// Short description for the status line (e.g. "Copying “movie.mkv”").
     desc: String,
+}
+
+/// What a paste worker accomplished: every (source, destination) it completed,
+/// in order, plus the error that stopped it (if any). Completed items are real
+/// even when a later one failed — they're what Undo reverses.
+struct PasteOutcome {
+    done: Vec<(PathBuf, PathBuf)>,
+    error: Option<String>,
+}
+
+impl PasteOutcome {
+    #[cfg(test)]
+    fn last_name(&self) -> Option<String> {
+        self.done.last().and_then(|(_, d)| d.file_name()).map(|n| n.to_string_lossy().into_owned())
+    }
+}
+
+/// What a delete worker accomplished: the paths that went to the Recycle Bin
+/// (restorable), plus any error. Permanent (network) deletes aren't listed.
+struct DeleteOutcome {
+    recycled: Vec<PathBuf>,
+    error: Option<String>,
+}
+
+/// One undoable file operation (session-only; Ctrl+Z pops the latest).
+#[derive(Clone)]
+enum UndoOp {
+    /// Undo by renaming `from` (the current name) back to `to`.
+    Rename { from: PathBuf, to: PathBuf },
+    /// Undo by removing the folder — only while it is still empty.
+    NewFolder { path: PathBuf },
+    /// A paste-copy: undo by deleting the copies (Recycle Bin where possible).
+    Copied { dsts: Vec<PathBuf> },
+    /// A paste-move: undo by moving each `dst` back to `src`.
+    Moved { pairs: Vec<(PathBuf, PathBuf)> },
+    /// A delete to the Recycle Bin: undo by restoring these original paths.
+    Recycled { paths: Vec<PathBuf> },
+}
+
+impl UndoOp {
+    fn label(&self) -> &'static str {
+        match self {
+            UndoOp::Rename { .. } => "rename",
+            UndoOp::NewFolder { .. } => "new folder",
+            UndoOp::Copied { .. } => "copy",
+            UndoOp::Moved { .. } => "move",
+            UndoOp::Recycled { .. } => "delete",
+        }
+    }
+}
+
+/// How many operations Undo remembers.
+const UNDO_CAP: usize = 50;
+
+/// The last path component for messages (or the whole path for a root).
+fn name_of(p: &Path) -> String {
+    p.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| p.to_string_lossy().into_owned())
 }
 
 /// A pending name-entry dialog (E4): create a folder, or rename an entry.
@@ -427,8 +486,13 @@ struct SectorApp {
     paste_job: Option<PasteJob>,
     /// Paths awaiting delete confirmation (the modal is up), if any.
     confirm_delete: Option<Vec<PathBuf>>,
-    /// A background delete-to-Recycle-Bin in progress: `Ok(())` or `Err(msg)`.
-    delete_job: Option<Receiver<Result<(), String>>>,
+    /// A background delete-to-Recycle-Bin in progress.
+    delete_job: Option<Receiver<DeleteOutcome>>,
+    /// Undo stack, newest last (session-only).
+    undo: Vec<UndoOp>,
+    /// An undo running on a background thread, with the op being undone (so
+    /// the view can follow a renamed/removed current folder afterwards).
+    undo_job: Option<(Receiver<Result<Option<PathBuf>, String>>, UndoOp)>,
     /// Transient error from the last edit/paste, shown in the footer.
     op_error: Option<String>,
     /// True while the address bar has (or just lost) focus — suppresses the file
@@ -532,6 +596,8 @@ impl Default for SectorApp {
             paste_job: None,
             confirm_delete: None,
             delete_job: None,
+            undo: Vec::new(),
+            undo_job: None,
             op_error: None,
             cache_mtime: None,
             pending_usn_mark: None,
@@ -1117,7 +1183,7 @@ impl SectorApp {
 
     /// Delete with the tree focused: the folder you're in (never a drive root).
     fn request_delete_current_dir(&mut self) {
-        if self.delete_job.is_some() || self.paste_job.is_some() {
+        if self.file_op_running() {
             return; // one background file operation at a time
         }
         if self.current_dir.parent().is_some() {
@@ -1207,6 +1273,7 @@ impl SectorApp {
                 let target = self.current_dir.join(&name);
                 std::fs::create_dir(&target)
                     .map_err(|e| format!("Couldn't create the folder: {e}"))?;
+                self.push_undo(UndoOp::NewFolder { path: target });
                 self.after_edit(name);
             }
             PromptKind::Rename { orig } => {
@@ -1226,6 +1293,7 @@ impl SectorApp {
                     return Err("An item with that name already exists.".into());
                 }
                 std::fs::rename(&src, &dst).map_err(|e| format!("Couldn't rename: {e}"))?;
+                self.push_undo(UndoOp::Rename { from: dst, to: src });
                 self.after_edit(name);
             }
             PromptKind::RenameDir { dir } => {
@@ -1248,6 +1316,7 @@ impl SectorApp {
                     return Err("An item with that name already exists.".into());
                 }
                 std::fs::rename(dir, &dst).map_err(|e| format!("Couldn't rename: {e}"))?;
+                self.push_undo(UndoOp::Rename { from: dst.clone(), to: dir.clone() });
                 // Follow the folder to its new name — in place, not a history step.
                 if self.sb_expanded.remove(dir) {
                     self.sb_expanded.insert(dst.clone());
@@ -1378,7 +1447,7 @@ impl SectorApp {
 
     /// Start pasting the clipboard into the current folder (background thread).
     fn start_paste(&mut self) {
-        if self.paste_job.is_some() || self.delete_job.is_some() {
+        if self.file_op_running() {
             return; // one background file operation at a time
         }
         let Some(clip) = &self.clipboard else { return };
@@ -1425,9 +1494,8 @@ impl SectorApp {
 
     /// Ask to delete the current selection (opens the confirmation modal).
     fn request_delete(&mut self) {
-        // One background file operation at a time.
-        if self.delete_job.is_some() || self.paste_job.is_some() {
-            return;
+        if self.file_op_running() {
+            return; // one background file operation at a time
         }
         let paths = self.selected_paths();
         if !paths.is_empty() {
@@ -1437,34 +1505,95 @@ impl SectorApp {
 
     /// Delete `paths` to the Recycle Bin on a background thread.
     fn start_delete(&mut self, paths: Vec<PathBuf>) {
-        if self.delete_job.is_some() || self.paste_job.is_some() || paths.is_empty() {
+        if self.file_op_running() || paths.is_empty() {
             return; // one background file operation at a time
         }
         let (tx, rx) = channel();
         std::thread::spawn(move || {
             let mut errors: Vec<String> = Vec::new();
+            let mut recycled = Vec::new();
             for p in &paths {
                 // Network drives have no Recycle Bin — the trash op fails there,
                 // so delete permanently (the user confirmed a permanent delete).
-                let res: Result<(), String> = if is_network_path(p) {
-                    remove_any(p).map_err(|e| e.to_string())
+                // `Ok(true)` = went to the Recycle Bin (restorable by Undo).
+                let res: Result<bool, String> = if is_network_path(p) {
+                    remove_any(p).map(|()| false).map_err(|e| e.to_string())
                 } else {
-                    trash::delete(p).map_err(|e| e.to_string())
+                    trash::delete(p).map(|()| true).map_err(|e| e.to_string())
                 };
-                if let Err(e) = res {
-                    let name = p.file_name().map(|n| n.to_string_lossy().into_owned());
-                    errors.push(format!("{}: {e}", name.unwrap_or_default()));
+                match res {
+                    Ok(true) => recycled.push(p.clone()),
+                    Ok(false) => {}
+                    Err(e) => errors.push(format!("{}: {e}", name_of(p))),
                 }
             }
-            let result = if errors.is_empty() {
-                Ok(())
-            } else {
-                Err(format!("Couldn't delete: {}", errors.join("; ")))
-            };
-            let _ = tx.send(result);
+            let error =
+                (!errors.is_empty()).then(|| format!("Couldn't delete: {}", errors.join("; ")));
+            let _ = tx.send(DeleteOutcome { recycled, error });
         });
         self.op_error = None;
         self.delete_job = Some(rx);
+    }
+
+    // ---- Undo ----
+
+    /// Is a background file operation (paste / delete / undo) in progress?
+    fn file_op_running(&self) -> bool {
+        self.paste_job.is_some() || self.delete_job.is_some() || self.undo_job.is_some()
+    }
+
+    fn push_undo(&mut self, op: UndoOp) {
+        self.undo.push(op);
+        if self.undo.len() > UNDO_CAP {
+            self.undo.remove(0);
+        }
+    }
+
+    /// Ctrl+Z: reverse the most recent operation on a background thread.
+    fn start_undo(&mut self) {
+        if self.file_op_running() {
+            return;
+        }
+        let Some(op) = self.undo.pop() else { return };
+        let (tx, rx) = channel();
+        let work = op.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(run_undo(work));
+        });
+        self.op_error = None;
+        self.undo_job = Some((rx, op));
+    }
+
+    /// Refresh views after a background op touched `item`; if it lives in the
+    /// folder we're looking at, clear the filter and select it. (An op that
+    /// completed after you navigated elsewhere no longer reselects by name in
+    /// the wrong folder.)
+    fn after_op(&mut self, item: &Path) {
+        self.entries_dirty = true;
+        self.sb_cache.clear();
+        if item.parent() == Some(self.current_dir.as_path()) {
+            self.filter.clear();
+            self.select_after_reload = Some((self.current_dir.clone(), name_of(item)));
+        }
+    }
+
+    /// If the folder we're IN no longer exists (deleted, undone), step out to
+    /// its nearest surviving ancestor — in place, not as a history step.
+    fn step_out_if_gone(&mut self) {
+        if std::fs::symlink_metadata(&self.current_dir).is_ok() {
+            return;
+        }
+        let mut p = self.current_dir.clone();
+        while let Some(parent) = p.parent().map(Path::to_path_buf) {
+            p = parent;
+            if std::fs::symlink_metadata(&p).is_ok() {
+                break;
+            }
+        }
+        self.current_dir = p;
+        self.sync_addr();
+        self.clear_selection();
+        self.sb_reveal();
     }
 
     // ---- Folder-tree sidebar (E1b.2) ----
@@ -1930,10 +2059,14 @@ impl SectorApp {
             };
             let mut cancel_paste = false;
             let mut clear_err = false;
+            let mut undo_req = false;
             egui::Panel::bottom("files_status").show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    // A running paste/delete takes over the footer with a spinner.
-                    if self.delete_job.is_some() {
+                    // A running paste/delete/undo takes over the footer with a spinner.
+                    if let Some((_, op)) = &self.undo_job {
+                        ui.spinner();
+                        ui.label(format!("Undoing {}…", op.label()));
+                    } else if self.delete_job.is_some() {
                         ui.spinner();
                         ui.label("Moving to Recycle Bin…");
                     } else if let Some(job) = &self.paste_job {
@@ -1958,9 +2091,22 @@ impl SectorApp {
                             let verb = if c.cut { "cut" } else { "copied" };
                             ui.weak(format!("📋 {} {verb}", c.paths.len()));
                         }
+                        if let Some(op) = self.undo.last() {
+                            ui.separator();
+                            if ui
+                                .small_button(format!("↶ Undo {}", op.label()))
+                                .on_hover_text("Ctrl+Z")
+                                .clicked()
+                            {
+                                undo_req = true;
+                            }
+                        }
                     }
                 });
             });
+            if undo_req {
+                self.start_undo();
+            }
             if cancel_paste {
                 if let Some(job) = &self.paste_job {
                     job.cancel.store(true, Ordering::Relaxed);
@@ -2433,6 +2579,10 @@ impl SectorApp {
             }
             if ui.input(|i| i.modifiers.ctrl && !i.modifiers.shift && i.key_pressed(egui::Key::V)) {
                 self.start_paste();
+            }
+            // Ctrl+Z: undo the last rename / new folder / paste / delete.
+            if ui.input(|i| i.modifiers.ctrl && !i.modifiers.shift && i.key_pressed(egui::Key::Z)) {
+                self.start_undo();
             }
             // Delete → Recycle Bin (with a confirmation).
             if ui.input(|i| i.key_pressed(egui::Key::Delete)) {
@@ -3069,50 +3219,151 @@ fn cleanup_partial(dst: &Path, err: &std::io::Error) {
 /// same volume, else copy-then-delete — and the source is removed ONLY after its
 /// copy fully succeeds; if that removal fails, the good copy is kept and the
 /// outcome is reported honestly. Links/junctions as a source are refused. On any
-/// copy failure the partial (fresh) destination is cleaned up. Returns the last
-/// pasted name.
+/// copy failure the partial (fresh) destination is cleaned up. Every completed
+/// (source, destination) pair is reported, even when a later item fails.
 fn run_paste(
     sources: Vec<PathBuf>,
     dest_dir: PathBuf,
     cut: bool,
     cancel: Arc<AtomicBool>,
-) -> Result<String, String> {
-    let mut last = String::new();
+) -> PasteOutcome {
+    let mut done: Vec<(PathBuf, PathBuf)> = Vec::new();
     for src in &sources {
         let name = match src.file_name() {
             Some(n) => n.to_string_lossy().into_owned(),
-            None => return Err("Invalid source path.".to_string()),
+            None => return PasteOutcome { done, error: Some("Invalid source path.".into()) },
         };
         // Refuse to copy/move a link or junction as a whole (v1).
         if std::fs::symlink_metadata(src).map(|m| is_reparse(&m)).unwrap_or(false) {
-            return Err(format!("“{name}” is a link/junction — not copied."));
+            let error = Some(format!("“{name}” is a link/junction — not copied."));
+            return PasteOutcome { done, error };
         }
         let dst = unique_dest(&dest_dir, &name);
 
         if cut {
             // Same-volume: atomic rename (fast, preserves junctions inside).
             if std::fs::rename(src, &dst).is_ok() {
-                last = dst.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or(name);
+                done.push((src.clone(), dst));
                 continue;
             }
             // Cross-volume: copy, then remove the source.
             if let Err(e) = copy_any(src, &dst, &cancel, 0) {
                 cleanup_partial(&dst, &e);
-                return Err(format!("Move failed: {e}"));
+                return PasteOutcome { done, error: Some(format!("Move failed: {e}")) };
             }
             if let Err(e) = remove_any(src) {
                 // Copy is good; do NOT delete it. Report that the source remains.
-                return Err(format!(
+                // (Not recorded for Undo: it is neither a clean move nor a copy.)
+                let error = Some(format!(
                     "Copied “{name}”, but couldn't remove the original ({e}) — both remain."
                 ));
+                return PasteOutcome { done, error };
             }
         } else if let Err(e) = copy_any(src, &dst, &cancel, 0) {
             cleanup_partial(&dst, &e);
-            return Err(format!("Copy failed: {e}"));
+            return PasteOutcome { done, error: Some(format!("Copy failed: {e}")) };
         }
-        last = dst.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or(name);
+        done.push((src.clone(), dst));
     }
-    Ok(last)
+    PasteOutcome { done, error: None }
+}
+
+/// Move a pasted item back to where it came from — its ORIGINAL name at its
+/// original parent (a paste may have auto-renamed it "… - Copy"). Never
+/// overwrites: if something else now has the original name, it lands beside it
+/// with the usual suffix. Same-volume rename, else copy-back-then-delete.
+fn move_back(dst: &Path, src: &Path) -> Result<PathBuf, String> {
+    let parent = src.parent().ok_or_else(|| "Invalid original path.".to_string())?;
+    let target = unique_dest(parent, &name_of(src));
+    if std::fs::rename(dst, &target).is_ok() {
+        return Ok(target);
+    }
+    let cancel = AtomicBool::new(false);
+    copy_any(dst, &target, &cancel, 0).map_err(|e| {
+        cleanup_partial(&target, &e);
+        e.to_string()
+    })?;
+    remove_any(dst)
+        .map_err(|e| format!("copied back, but couldn't remove “{}”: {e}", name_of(dst)))?;
+    Ok(target)
+}
+
+/// Worker body for Undo: reverse `op`. Returns the item to select afterwards.
+fn run_undo(op: UndoOp) -> Result<Option<PathBuf>, String> {
+    match op {
+        UndoOp::Rename { from, to } => {
+            let case_only = name_of(&from).to_lowercase() == name_of(&to).to_lowercase();
+            if !case_only && std::fs::symlink_metadata(&to).is_ok() {
+                return Err(format!("Can't undo the rename: something is now named “{}”.", name_of(&to)));
+            }
+            std::fs::rename(&from, &to).map_err(|e| format!("Couldn't undo the rename: {e}"))?;
+            Ok(Some(to))
+        }
+        UndoOp::NewFolder { path } => {
+            // remove_dir refuses a non-empty folder — exactly the safety we want.
+            std::fs::remove_dir(&path).map_err(|e| {
+                format!("Couldn't remove “{}” — it may no longer be empty ({e}).", name_of(&path))
+            })?;
+            Ok(None)
+        }
+        UndoOp::Copied { dsts } => {
+            let mut errors = Vec::new();
+            for d in &dsts {
+                let r = if is_network_path(d) {
+                    remove_any(d).map_err(|e| e.to_string())
+                } else {
+                    trash::delete(d).map_err(|e| e.to_string())
+                };
+                if let Err(e) = r {
+                    errors.push(format!("{}: {e}", name_of(d)));
+                }
+            }
+            if errors.is_empty() {
+                Ok(None)
+            } else {
+                Err(format!("Couldn't remove some copies: {}", errors.join("; ")))
+            }
+        }
+        UndoOp::Moved { pairs } => {
+            let mut last = None;
+            for (src, dst) in pairs.iter().rev() {
+                last = Some(move_back(dst, src).map_err(|e| {
+                    format!("Couldn't move “{}” back: {e}", name_of(dst))
+                })?);
+            }
+            Ok(last)
+        }
+        UndoOp::Recycled { paths } => restore_from_trash(&paths),
+    }
+}
+
+/// Restore `paths` from the Recycle Bin (the most recently deleted item that
+/// came from each path). Never overwrites: the trash crate refuses to restore
+/// over an existing file.
+#[cfg(any(windows, target_os = "linux"))]
+fn restore_from_trash(paths: &[PathBuf]) -> Result<Option<PathBuf>, String> {
+    use trash::os_limited::{list, restore_all};
+    let items = list().map_err(|e| format!("Couldn't read the Recycle Bin: {e}"))?;
+    let mut picked = Vec::new();
+    for p in paths {
+        let best = items
+            .iter()
+            .enumerate()
+            .filter(|(_, it)| it.original_path() == *p)
+            .max_by_key(|(_, it)| it.time_deleted)
+            .map(|(i, _)| i);
+        match best {
+            Some(i) => picked.push(i),
+            None => return Err(format!("“{}” isn't in the Recycle Bin any more.", name_of(p))),
+        }
+    }
+    let chosen = items.into_iter().enumerate().filter(|(i, _)| picked.contains(i)).map(|(_, it)| it);
+    restore_all(chosen).map_err(|e| format!("Couldn't restore from the Recycle Bin: {e}"))?;
+    Ok(paths.last().cloned())
+}
+#[cfg(not(any(windows, target_os = "linux")))]
+fn restore_from_trash(_paths: &[PathBuf]) -> Result<Option<PathBuf>, String> {
+    Err("Restoring from the trash isn't supported on this platform.".into())
 }
 
 /// Enumerate drive roots for the folder-tree sidebar. Uses `GetLogicalDrives`
@@ -3524,7 +3775,7 @@ impl eframe::App for SectorApp {
         }
 
         // Poll a background paste (E5) for completion.
-        let mut paste_done: Option<Result<String, String>> = None;
+        let mut paste_done: Option<PasteOutcome> = None;
         let mut paste_was_cut = false;
         if let Some(job) = &self.paste_job {
             match job.rx.try_recv() {
@@ -3534,11 +3785,14 @@ impl eframe::App for SectorApp {
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => ctx.request_repaint(),
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    paste_done = Some(Err("Paste worker stopped unexpectedly.".into()));
+                    paste_done = Some(PasteOutcome {
+                        done: Vec::new(),
+                        error: Some("Paste worker stopped unexpectedly.".into()),
+                    });
                 }
             }
         }
-        if let Some(result) = paste_done {
+        if let Some(out) = paste_done {
             self.paste_job = None;
             // A cut consumes the clipboard whatever the outcome: on partial
             // failure some sources have already moved, so the remaining paths are
@@ -3547,53 +3801,90 @@ impl eframe::App for SectorApp {
                 self.clipboard = None;
                 sys_clipboard::clear(); // Explorer does the same after a cut is pasted
             }
-            match result {
-                Ok(name) => {
-                    // Refresh listing + tree, clear the filter so the pasted item
-                    // is visible, and select it by name.
-                    self.after_edit(name);
-                    self.op_error = None;
-                }
-                Err(e) => {
-                    self.op_error = Some(e);
-                    // Some items may still have changed on disk — refresh the view.
-                    self.entries_dirty = true;
-                    self.sb_cache.clear();
-                }
+            // Whatever completed is real (even on a partial failure) — that is
+            // what Undo reverses.
+            if !out.done.is_empty() {
+                let op = if paste_was_cut {
+                    UndoOp::Moved { pairs: out.done.clone() }
+                } else {
+                    UndoOp::Copied { dsts: out.done.iter().map(|(_, d)| d.clone()).collect() }
+                };
+                self.push_undo(op);
+            }
+            self.op_error = out.error;
+            self.entries_dirty = true;
+            self.sb_cache.clear();
+            if let Some((_, dst)) = out.done.last() {
+                self.after_op(dst); // selects it only if we're still in that folder
             }
         }
 
         // Poll a background delete (E5) for completion.
-        let mut delete_done: Option<Result<(), String>> = None;
+        let mut delete_done: Option<DeleteOutcome> = None;
         if let Some(rx) = &self.delete_job {
             match rx.try_recv() {
                 Ok(r) => delete_done = Some(r),
                 Err(std::sync::mpsc::TryRecvError::Empty) => ctx.request_repaint(),
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    delete_done = Some(Err("Delete worker stopped unexpectedly.".into()));
+                    delete_done = Some(DeleteOutcome {
+                        recycled: Vec::new(),
+                        error: Some("Delete worker stopped unexpectedly.".into()),
+                    });
                 }
             }
         }
-        if let Some(result) = delete_done {
+        if let Some(out) = delete_done {
             self.delete_job = None;
             // Either way, the folder may have changed on disk — refresh the view.
             self.entries_dirty = true;
             self.sb_cache.clear();
-            match result {
-                Ok(()) => {
+            if !out.recycled.is_empty() {
+                self.push_undo(UndoOp::Recycled { paths: out.recycled });
+            }
+            match out.error {
+                None => {
                     self.clear_selection(); // items are gone
                     self.op_error = None;
                     // If the folder we were IN is gone (tree-focused Delete), step
-                    // out to its parent — in place, not as a history step.
-                    if std::fs::symlink_metadata(&self.current_dir).is_err() {
-                        if let Some(p) = self.current_dir.parent().map(Path::to_path_buf) {
-                            self.current_dir = p;
+                    // out to its parent.
+                    self.step_out_if_gone();
+                }
+                Some(e) => self.op_error = Some(e), // keep selection to retry
+            }
+        }
+
+        // Poll a background undo for completion.
+        let mut undo_done: Option<Result<Option<PathBuf>, String>> = None;
+        if let Some((rx, _)) = &self.undo_job {
+            match rx.try_recv() {
+                Ok(r) => undo_done = Some(r),
+                Err(std::sync::mpsc::TryRecvError::Empty) => ctx.request_repaint(),
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    undo_done = Some(Err("Undo worker stopped unexpectedly.".into()));
+                }
+            }
+        }
+        if let Some(result) = undo_done {
+            let (_, op) = self.undo_job.take().expect("undo job present");
+            self.entries_dirty = true;
+            self.sb_cache.clear();
+            match result {
+                Ok(item) => {
+                    self.op_error = None;
+                    // Follow the folder we're IN if the undo renamed it.
+                    if let UndoOp::Rename { from, to } = &op {
+                        if self.current_dir == *from {
+                            self.current_dir = to.clone();
                             self.sync_addr();
                             self.sb_reveal();
                         }
                     }
+                    self.step_out_if_gone();
+                    if let Some(p) = item {
+                        self.after_op(&p);
+                    }
                 }
-                Err(e) => self.op_error = Some(e), // keep selection to retry
+                Err(e) => self.op_error = Some(e),
             }
         }
 
@@ -4217,15 +4508,16 @@ mod tests {
         std::fs::create_dir(&dest).unwrap();
 
         let cancel = Arc::new(AtomicBool::new(false));
-        let name = run_paste(vec![d.join("src")], dest.clone(), false, cancel.clone()).unwrap();
-        assert_eq!(name, "src");
+        let out = run_paste(vec![d.join("src")], dest.clone(), false, cancel.clone());
+        assert!(out.error.is_none());
+        assert_eq!(out.last_name().as_deref(), Some("src"));
         assert!(d.join("src/f.txt").exists()); // source preserved (copy)
         assert_eq!(std::fs::read(dest.join("src/f.txt")).unwrap(), b"hello");
         assert!(dest.join("src/sub/g.bin").exists());
 
         // Paste again → must NOT overwrite; lands as "src - Copy".
-        let name2 = run_paste(vec![d.join("src")], dest.clone(), false, cancel).unwrap();
-        assert_eq!(name2, "src - Copy");
+        let out2 = run_paste(vec![d.join("src")], dest.clone(), false, cancel);
+        assert_eq!(out2.last_name().as_deref(), Some("src - Copy"));
         assert!(dest.join("src/f.txt").exists()); // first copy untouched
         assert!(dest.join("src - Copy/f.txt").exists());
         std::fs::remove_dir_all(&d).ok();
@@ -4249,13 +4541,13 @@ mod tests {
         let cancel = Arc::new(AtomicBool::new(false));
 
         // Copying the folder skips the symlink (never follows into `outside`).
-        run_paste(vec![d.join("src")], dest.clone(), false, cancel.clone()).unwrap();
+        assert!(run_paste(vec![d.join("src")], dest.clone(), false, cancel.clone()).error.is_none());
         assert!(dest.join("src/real.txt").exists());
         assert!(!dest.join("src/link").exists()); // link skipped
         assert!(!dest.join("src/link/secret.txt").exists()); // target NOT copied
 
         // A symlink AS the source is refused outright.
-        let err = run_paste(vec![d.join("src/link")], dest, false, cancel).unwrap_err();
+        let err = run_paste(vec![d.join("src/link")], dest, false, cancel).error.unwrap();
         assert!(err.contains("link/junction"));
         std::fs::remove_dir_all(&d).ok();
     }
@@ -4280,10 +4572,92 @@ mod tests {
         let dest = d.join("dest");
         std::fs::create_dir(&dest).unwrap();
         let cancel = Arc::new(AtomicBool::new(false));
-        let name = run_paste(vec![d.join("m.txt")], dest.clone(), true, cancel).unwrap();
-        assert_eq!(name, "m.txt");
+        let out = run_paste(vec![d.join("m.txt")], dest.clone(), true, cancel);
+        assert_eq!(out.last_name().as_deref(), Some("m.txt"));
         assert!(!d.join("m.txt").exists()); // source gone (moved)
         assert_eq!(std::fs::read(dest.join("m.txt")).unwrap(), b"data");
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn paste_reports_completed_items_on_partial_failure() {
+        let d = scratch("partial");
+        std::fs::write(d.join("ok.txt"), b"1").unwrap();
+        let dest = d.join("dest");
+        std::fs::create_dir(&dest).unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        // Second source doesn't exist → the paste fails there, but the first
+        // item really was copied and must be reported (Undo reverses it).
+        let out = run_paste(vec![d.join("ok.txt"), d.join("missing.txt")], dest.clone(), false, cancel);
+        assert!(out.error.is_some());
+        assert_eq!(out.done.len(), 1);
+        assert_eq!(out.done[0].1, dest.join("ok.txt"));
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn undo_move_restores_original_name() {
+        let d = scratch("undo-move");
+        std::fs::write(d.join("m.txt"), b"mine").unwrap();
+        let dest = d.join("dest");
+        std::fs::create_dir(&dest).unwrap();
+        std::fs::write(dest.join("m.txt"), b"theirs").unwrap(); // name taken at the destination
+        let cancel = Arc::new(AtomicBool::new(false));
+        let out = run_paste(vec![d.join("m.txt")], dest.clone(), true, cancel);
+        assert_eq!(out.done[0].1, dest.join("m - Copy.txt")); // auto-renamed on paste
+
+        // Undo puts it back under its ORIGINAL name, leaving "theirs" untouched.
+        let sel = run_undo(UndoOp::Moved { pairs: out.done }).unwrap();
+        assert_eq!(sel, Some(d.join("m.txt")));
+        assert_eq!(std::fs::read(d.join("m.txt")).unwrap(), b"mine");
+        assert_eq!(std::fs::read(dest.join("m.txt")).unwrap(), b"theirs");
+        assert!(!dest.join("m - Copy.txt").exists());
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn undo_rename_and_new_folder() {
+        let d = scratch("undo-misc");
+        // Rename a → b, undo → a again; and refuse to undo over a newcomer.
+        std::fs::write(d.join("a.txt"), b"x").unwrap();
+        std::fs::rename(d.join("a.txt"), d.join("b.txt")).unwrap();
+        let op = UndoOp::Rename { from: d.join("b.txt"), to: d.join("a.txt") };
+        assert_eq!(run_undo(op.clone()).unwrap(), Some(d.join("a.txt")));
+        assert!(d.join("a.txt").exists() && !d.join("b.txt").exists());
+        std::fs::rename(d.join("a.txt"), d.join("b.txt")).unwrap();
+        std::fs::write(d.join("a.txt"), b"newcomer").unwrap();
+        assert!(run_undo(op).unwrap_err().contains("something is now named"));
+        assert_eq!(std::fs::read(d.join("a.txt")).unwrap(), b"newcomer"); // untouched
+
+        // New folder: undo removes it while empty, refuses once it has content.
+        std::fs::create_dir(d.join("nf")).unwrap();
+        assert!(run_undo(UndoOp::NewFolder { path: d.join("nf") }).is_ok());
+        assert!(!d.join("nf").exists());
+        std::fs::create_dir(d.join("nf2")).unwrap();
+        std::fs::write(d.join("nf2/keep.txt"), b"!").unwrap();
+        assert!(run_undo(UndoOp::NewFolder { path: d.join("nf2") }).is_err());
+        assert!(d.join("nf2/keep.txt").exists());
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// Round-trip through the real trash (freedesktop here, Recycle Bin on
+    /// Windows). Skips itself if this environment has no usable trash.
+    #[test]
+    fn undo_delete_restores_from_trash() {
+        let d = scratch("undo-trash");
+        let f = d.join("gone.txt");
+        std::fs::write(&f, b"bring me back").unwrap();
+        if let Err(e) = trash::delete(&f) {
+            eprintln!("skipping: no usable trash here ({e})");
+            std::fs::remove_dir_all(&d).ok();
+            return;
+        }
+        assert!(!f.exists());
+        let sel = run_undo(UndoOp::Recycled { paths: vec![f.clone()] }).unwrap();
+        assert_eq!(sel, Some(f.clone()));
+        assert_eq!(std::fs::read(&f).unwrap(), b"bring me back");
+        // A second undo of the same delete finds nothing to restore.
+        assert!(run_undo(UndoOp::Recycled { paths: vec![f.clone()] }).unwrap_err().contains("isn't in"));
         std::fs::remove_dir_all(&d).ok();
     }
 

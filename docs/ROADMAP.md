@@ -265,6 +265,10 @@ safest-first — destructive ops must be bulletproof (see D16, D1).
   **System clipboard ✅** — Cut/Copy write `CF_HDROP` + "Preferred DropEffect"
   to the Windows clipboard and the app mirrors it (via the clipboard sequence
   number), so it interoperates with Explorer in both directions.
+  **Undo ✅** (Ctrl+Z): a session undo stack of rename / new folder / paste
+  (per-item records, so a partial paste undoes what actually happened) /
+  delete (restored from the Recycle Bin via `trash::os_limited`). Reversals run
+  on the background worker and never overwrite. *Redo not yet.*
 - **E6 — Incremental freshness (D17)  ◐**: **slice 1 ✅** — the cache stores a
   USN watermark (journal id + next USN) at scan completion and, on reload,
   reports the cached view as Current / Stale / Unknown (`sector-scan::usn`).
