@@ -225,6 +225,16 @@ Deliberately *not* scheduled — captured so they don't distract us:
   / Ctrl+0 zoom already scales the whole UI (persisted). The proper item is a
   text-size setting independent of zoom — scale the style's text sizes, expose
   it somewhere discoverable, persist it with the other settings.
+- **Dual-pane explorer** (Midnight Commander style; user idea, 2026-09-05).
+  Two independent panes (location, listing, selection, cursor, filter, sort,
+  history each), sharing the clipboard, undo stack and background jobs; Tab
+  switches sides; copy/move/drag between them. **Prerequisite:** extract the
+  per-pane state from `SectorApp` into a `Pane` struct — cheaper the earlier
+  it's done. The City would follow the *active* pane (D18 generalised).
+- **FSN-style City** (SGI File System Navigator; user idea, 2026-09-05). A
+  free perspective fly-through: folders as plinths connected to their
+  children, files as blocks on them. Attaches to Step 3b (true-3D wgpu +
+  camera) and the camera-controls item above — FSN is the visual reference.
 - Multiple / all-drives view.
 - Saved scans, scan history, diff between two scans.
 - Filters (by type, age, size threshold).
