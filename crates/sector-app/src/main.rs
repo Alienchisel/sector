@@ -4289,10 +4289,8 @@ impl eframe::App for SectorApp {
         // and a copy is the safe default (and undoable). winit reports the
         // files but not the drop position, so the target is the current folder
         // rather than a row under the pointer.
-        let dropped: Vec<PathBuf> = ctx.input(|i| {
-            use egui::DroppedFile as _; // the `path()` accessor
-            i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).collect()
-        });
+        let dropped: Vec<PathBuf> =
+            ctx.input(|i| i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).collect());
         if !dropped.is_empty() && self.prompt.is_none() && self.confirm_delete.is_none() {
             let dest = self.current_dir.clone();
             self.start_transfer(dropped, dest, false);
