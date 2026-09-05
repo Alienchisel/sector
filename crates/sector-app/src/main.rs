@@ -514,6 +514,13 @@ struct SectorApp {
     /// `current_dir` itself as a listing entry (one stat per navigation), so
     /// Details can describe the folder the TREE has focused.
     cur_entry: Option<Entry>,
+    /// The scanned subtree size of `current_dir` (with `folder_sizes`), for the
+    /// tree-focused Details — recomputed with the folder sizes, not per frame.
+    cur_dir_size: Option<u64>,
+    /// Was a popup/menu open when this frame began? A popup closed by Esc is
+    /// already gone by the time the shortcuts run, so without this the same
+    /// Esc would go on to clear the selection.
+    menu_open_at_start: bool,
 
     // ---- Folder-tree sidebar (E1b.2, Files view only — D19) ----
     sb_visible: bool,
@@ -610,6 +617,8 @@ impl Default for SectorApp {
             kbd_menu_req: false,
             kbd_menu_open: false,
             cur_entry: None,
+            cur_dir_size: None,
+            menu_open_at_start: false,
             sb_visible: true,
             focus_pane: Pane::List,
             tree_scroll: false,
@@ -1086,6 +1095,8 @@ impl SectorApp {
     /// status summary (the total depends on folder sizes).
     fn recompute_folder_sizes(&mut self) {
         self.folder_sizes = self.compute_folder_sizes();
+        let cur = self.current_dir.clone();
+        self.cur_dir_size = self.scanned_subtree_size(&cur);
     }
 
     /// Recompute the cached status-footer summary. O(n) over the listing, but
@@ -1345,8 +1356,7 @@ impl SectorApp {
         if self.focus_pane == Pane::Tree && self.sb_visible {
             let e = self.cur_entry.as_ref()?;
             let location = self.current_dir.parent().unwrap_or(&self.current_dir).to_path_buf();
-            let size = self.scanned_subtree_size(&self.current_dir);
-            return Some(self.properties_of(e, &location, size));
+            return Some(self.properties_of(e, &location, self.cur_dir_size));
         }
         let e = self.entries.get(self.op_target()?)?;
         let size = if e.is_dir {
@@ -1886,6 +1896,9 @@ impl SectorApp {
             self.reload_entries();
         }
 
+        // An Esc that left the filter box is spent; it must not also fall
+        // through to the list's Esc (clear filter → clear selection → …).
+        let mut esc_handled = false;
         // Files toolbar: folder-tree toggle, New folder, name filter, hidden.
         egui::Panel::top("files_bar").show(ui, |ui| {
             ui.horizontal(|ui| {
@@ -1917,12 +1930,12 @@ impl SectorApp {
                 let mut changed = r.changed();
                 // Esc while typing here clears the filter (egui drops focus on
                 // Esc but leaves the key readable this frame).
-                if r.lost_focus()
-                    && !self.filter.is_empty()
-                    && ui.input(|i| i.key_pressed(egui::Key::Escape))
-                {
-                    self.filter.clear();
-                    changed = true;
+                if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                    esc_handled = true;
+                    if !self.filter.is_empty() {
+                        self.filter.clear();
+                        changed = true;
+                    }
                 }
                 if !self.filter.is_empty() && ui.button("×").on_hover_text("Clear filter").clicked() {
                     self.filter.clear();
@@ -2153,7 +2166,7 @@ impl SectorApp {
             let mods = ui.ctx().input(|i| i.modifiers);
             // Focus cursor + keyboard-menu state, read by the row closures.
             let lead = self.lead;
-            let list_focus = self.focus_pane == Pane::List;
+            let list_focus = !(self.focus_pane == Pane::Tree && self.sb_visible);
             let lead_color = ui.visuals().selection.stroke.color;
             let (kbd_req, kbd_open) = (self.kbd_menu_req, self.kbd_menu_open);
             let mut click: Option<usize> = None;
@@ -2167,7 +2180,7 @@ impl SectorApp {
             let mut cut_req = false;
             let mut paste_req = false;
             let mut delete_req = false;
-            let can_paste = self.clipboard.is_some() && self.paste_job.is_none();
+            let can_paste = self.clipboard.is_some() && !self.file_op_running();
 
             let arrow = |k: SortKey| {
                 if k == sort_key {
@@ -2464,13 +2477,14 @@ impl SectorApp {
             || self.confirm_delete.is_some()
             || self.addr_active
             || ui.ctx().memory(|m| m.focused()).is_some()
-            || egui::Popup::is_any_open(ui.ctx()); // a menu owns the keys while open
+            || self.menu_open_at_start // a menu owns the keys while open —
+            || egui::Popup::is_any_open(ui.ctx()); // including the Esc that closed it
         if !typing {
             // With the folder tree focused, item commands act on the folder you're
             // IN (the tree's highlighted node) rather than the list's selection.
             let tree_focus = self.focus_pane == Pane::Tree && self.sb_visible;
             // Esc: clear the filter, else the selection, else close Details.
-            if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+            if !esc_handled && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
                 if !self.filter.is_empty() {
                     self.filter.clear();
                     self.apply_filter();
@@ -2611,7 +2625,10 @@ impl SectorApp {
                         .filter(|e| !e.is_dir && self.sel.contains(&e.name))
                         .map(|e| self.current_dir.join(&e.name))
                         .collect();
-                    if files.len() > MAX_OPEN {
+                    if files.is_empty() {
+                        self.op_error =
+                            Some("Enter opens files; select a single folder to enter it.".into());
+                    } else if files.len() > MAX_OPEN {
                         self.op_error =
                             Some(format!("Select {MAX_OPEN} or fewer files to open them all at once."));
                     } else {
@@ -3344,22 +3361,28 @@ fn run_undo(op: UndoOp) -> Result<Option<PathBuf>, String> {
 fn restore_from_trash(paths: &[PathBuf]) -> Result<Option<PathBuf>, String> {
     use trash::os_limited::{list, restore_all};
     let items = list().map_err(|e| format!("Couldn't read the Recycle Bin: {e}"))?;
-    let mut picked = Vec::new();
+    // The shell reports the original location in ITS casing (NTFS is
+    // case-insensitive), so compare paths case-insensitively.
+    let key = |p: &Path| p.to_string_lossy().to_lowercase();
+    let mut picked: Vec<(usize, PathBuf)> = Vec::new();
     for p in paths {
+        let want = key(p);
         let best = items
             .iter()
             .enumerate()
-            .filter(|(_, it)| it.original_path() == *p)
+            .filter(|(_, it)| key(&it.original_path()) == want)
             .max_by_key(|(_, it)| it.time_deleted)
-            .map(|(i, _)| i);
+            .map(|(i, it)| (i, it.original_path()));
         match best {
-            Some(i) => picked.push(i),
+            Some(b) => picked.push(b),
             None => return Err(format!("“{}” isn't in the Recycle Bin any more.", name_of(p))),
         }
     }
-    let chosen = items.into_iter().enumerate().filter(|(i, _)| picked.contains(i)).map(|(_, it)| it);
+    let restored_last = picked.last().map(|(_, p)| p.clone());
+    let idx: Vec<usize> = picked.iter().map(|(i, _)| *i).collect();
+    let chosen = items.into_iter().enumerate().filter(|(i, _)| idx.contains(i)).map(|(_, it)| it);
     restore_all(chosen).map_err(|e| format!("Couldn't restore from the Recycle Bin: {e}"))?;
-    Ok(paths.last().cloned())
+    Ok(restored_last)
 }
 #[cfg(not(any(windows, target_os = "linux")))]
 fn restore_from_trash(_paths: &[PathBuf]) -> Result<Option<PathBuf>, String> {
@@ -3689,6 +3712,7 @@ impl eframe::App for SectorApp {
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        self.menu_open_at_start = egui::Popup::is_any_open(&ctx);
 
         // Reflect the current folder in the window/taskbar title (only on change).
         let title = format!("{} — {}", sector_core::APP_NAME, self.current_dir.display());
@@ -3794,10 +3818,10 @@ impl eframe::App for SectorApp {
         }
         if let Some(out) = paste_done {
             self.paste_job = None;
-            // A cut consumes the clipboard whatever the outcome: on partial
-            // failure some sources have already moved, so the remaining paths are
-            // stale and must not be re-pasted.
-            if paste_was_cut {
+            // A cut consumes the clipboard once anything moved: on a partial
+            // failure the remaining paths are stale and must not be re-pasted.
+            // If NOTHING moved (refused outright), the cut is still valid.
+            if paste_was_cut && !out.done.is_empty() {
                 self.clipboard = None;
                 sys_clipboard::clear(); // Explorer does the same after a cut is pasted
             }
@@ -3905,6 +3929,7 @@ impl eframe::App for SectorApp {
             && self.confirm_delete.is_none()
             && !self.addr_active
             && ctx.memory(|m| m.focused()).is_none()
+            && !self.menu_open_at_start
             && !egui::Popup::is_any_open(&ctx);
         if kb_free
             && ctx.input(|i| {
