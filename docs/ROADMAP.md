@@ -221,6 +221,10 @@ Deliberately *not* scheduled — captured so they don't distract us:
   Bin, and potentially fuller browse/copy/move/rename. Not planned now, but a
   door we keep open (see README non-goals). AI/assistant features are *not* in
   this parking lot — they are a firm permanent non-goal.
+- **Adjustable text size** (user request, 2026-09-05). egui's Ctrl+= / Ctrl+-
+  / Ctrl+0 zoom already scales the whole UI (persisted). The proper item is a
+  text-size setting independent of zoom — scale the style's text sizes, expose
+  it somewhere discoverable, persist it with the other settings.
 - Multiple / all-drives view.
 - Saved scans, scan history, diff between two scans.
 - Filters (by type, age, size threshold).
