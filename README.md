@@ -15,20 +15,27 @@ went.
 
 - **Folder tree + file list**, fully keyboard-drivable. **Tab** switches panes;
   arrows move; **→/←** open/close tree folders; type letters to **jump**
-  (type-ahead) in either pane. Drag the divider to resize the tree, or
+  (type-ahead) in either pane. `Ctrl+↑/↓` moves the cursor without selecting
+  and `Ctrl+Space` toggles it, so non-contiguous selections work by keyboard.
+  `Shift+F10` opens the context menu; `Esc` clears the filter, then the
+  selection, then closes Details. With the tree focused, `F2` / `Del` /
+  `Ctrl+C` / `Ctrl+X` / `Alt+Enter` act on the folder you're in, and `Enter`
+  expands or collapses it. Drag the divider to resize the tree, or
   **double-click it** to fit the widest visible row.
-- **Navigation** — a clickable breadcrumb (or **Edit** to type a path), plus
-  **Back/Forward/Up** (`Alt+←` / `Alt+→` / `Backspace`) with history.
+- **Navigation** — a clickable breadcrumb (or `Alt+D` / `Ctrl+L` / `F4` to type
+  a path), plus **Back/Forward/Up** (`Alt+←` / `Alt+→` / `Backspace` or `Alt+↑`)
+  with history.
 - **List** — Name / Size / Type / Modified, sortable, virtualized for huge
   folders, file-type–colored. Folder sizes appear when a scan covers the folder.
-- **Filter** the current folder as you type, and a **hidden-files** toggle.
+- **Filter** the current folder as you type (`Ctrl+F`), and a **hidden-files** toggle.
 - **Details** panel (`Alt+Enter`, or the toolbar toggle) — path, sizes, dates,
   attributes.
 - **Multi-select** — click / `Ctrl`-click / `Shift`-click / `Ctrl+A`.
 
 ### File operations
 
-- Open (`Enter` / double-click), **Reveal in Explorer**, **Copy path / name**.
+- Open (`Enter` / double-click; on a multi-selection, every selected file),
+  **Reveal in Explorer**, **Copy path** (`Ctrl+Shift+C`) **/ name**.
 - **New folder** (`Ctrl+Shift+N`) and **Rename** (`F2`) — validated (bad chars,
   reserved names, duplicates), extension preserved on rename.
 - **Cut / Copy / Paste** (`Ctrl+X/C/V`) — runs in the background, **never

@@ -86,6 +86,28 @@ pub fn list_dir(path: &Path) -> std::io::Result<Vec<Entry>> {
     Ok(out)
 }
 
+/// Describe a single path as an [`Entry`] (the same fields `list_dir` fills for
+/// its children), without following links. Lets the explorer describe the folder
+/// it is *in* — e.g. for a Details panel when the folder tree has focus.
+pub fn stat_entry(path: &Path) -> std::io::Result<Entry> {
+    let md = std::fs::symlink_metadata(path)?;
+    let ft = md.file_type();
+    let is_dir = ft.is_dir();
+    Ok(Entry {
+        name: path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.to_string_lossy().into_owned()),
+        is_dir,
+        size: if is_dir { 0 } else { md.len() },
+        modified: md.modified().ok(),
+        created: md.created().ok(),
+        is_symlink: ft.is_symlink() || is_reparse_point(Some(&md)),
+        is_hidden: is_hidden_entry(Some(&md)),
+        readonly: md.permissions().readonly(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -122,6 +144,13 @@ mod tests {
         let sub = entries.iter().find(|e| e.name == "sub").unwrap();
         assert!(sub.is_dir);
         assert_eq!(sub.size, 0);
+
+        // stat_entry describes one path the same way.
+        let s = stat_entry(&root.join("a.txt")).unwrap();
+        assert_eq!((s.name.as_str(), s.is_dir, s.size), ("a.txt", false, 123));
+        let sd = stat_entry(&root.join("sub")).unwrap();
+        assert_eq!((sd.name.as_str(), sd.is_dir), ("sub", true));
+        assert!(stat_entry(&root.join("nope")).is_err());
 
         let _ = fs::remove_dir_all(&root);
     }

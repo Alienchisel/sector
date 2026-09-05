@@ -9,6 +9,6 @@ pub mod browse;
 pub mod usn;
 pub mod walk;
 
-pub use browse::{list_dir, Entry};
+pub use browse::{list_dir, stat_entry, Entry};
 pub use usn::{freshness, query_mark, Freshness, UsnMark};
 pub use walk::{scan, scan_into, Progress, ScanOptions, ScanStats};
