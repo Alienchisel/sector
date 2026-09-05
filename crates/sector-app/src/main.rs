@@ -475,7 +475,14 @@ fn main() -> eframe::Result<()> {
             // Don't make label text drag-to-select — in the file list it gives an
             // I-beam cursor and intercepts hover over a filename, so hovering the
             // text behaves differently from the rest of the row.
-            cc.egui_ctx.all_styles_mut(|s| s.interaction.selectable_labels = false);
+            cc.egui_ctx.all_styles_mut(|s| {
+                s.interaction.selectable_labels = false;
+                // Solid (non-floating) scrollbars everywhere, drawn in the widget
+                // FILL colour rather than the text colour — egui's default draws
+                // the handle with the foreground colour, which on the dark theme
+                // is a near-white bar.
+                s.spacing.scroll = egui::style::ScrollStyle::solid();
+            });
             if let Some(rs) = &cc.wgpu_render_state {
                 let info = rs.adapter.get_info();
                 eprintln!(
@@ -2354,9 +2361,9 @@ impl SectorApp {
                 .min_size(150.0)
                 .show(ui, |ui| {
                     ui.add_space(4.0);
-                    // Reserve space for the scrollbar (don't float it over the
-                    // rows) so the full-width row text can't run under it.
-                    ui.spacing_mut().scroll.floating = false;
+                    // (Scrollbars are solid app-wide — see the style setup in
+                    // main — so the bar reserves its own space and the full-width
+                    // row text can't run under it.)
                     egui::ScrollArea::vertical()
                         .auto_shrink([false, false])
                         .show(ui, |ui| {
