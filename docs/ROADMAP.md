@@ -249,6 +249,9 @@ safest-first — destructive ops must be bulletproof (see D16, D1).
 - **E2 — List / City toggle  ✅**: one shared location (`current_dir`) drives both
   views; the City visualizes the folder you're browsing — instant cache-load if
   present, else a scan-prompt; drilling in the City syncs back to Files. See D18.
+  **Within-tree re-root ✅** (2026-09-05): navigating to a folder inside the
+  loaded tree (address bar, Up, Back, the Files tree) re-roots the City there
+  instantly instead of reloading; the City's own breadcrumb is gone.
 - **E3 — Read-only actions  ✅**: double-click / Enter opens (default app for
   files, in-app navigate for folders), right-click menu (Open · Reveal/Open in
   Explorer · Copy path · Copy name), Backspace = up. **Properties/Details panel ✅** (in-app,

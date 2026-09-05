@@ -1582,13 +1582,14 @@ impl SectorApp {
         }
     }
 
-    /// The scanned subtree size of `dir`, if the City's completed (not
-    /// cancelled) scan covers it. Same prefix walk as `compute_folder_sizes`.
-    fn scanned_subtree_size(&self, dir: &Path) -> Option<u64> {
-        let ScanState::Running { tree, stats: Some(st), .. } = &self.scan else {
+    /// The loaded City tree's node for `dir`, if `dir` is the City's root or
+    /// inside it (case-insensitive path walk). `complete_only` ignores a
+    /// cancelled scan's partial tree.
+    fn city_node_for(&self, dir: &Path, complete_only: bool) -> Option<NodeId> {
+        let ScanState::Running { tree, stats, .. } = &self.scan else {
             return None;
         };
-        if st.cancelled {
+        if complete_only && !matches!(stats, Some(st) if !st.cancelled) {
             return None;
         }
         let root = self.city_root.as_ref()?;
@@ -1601,7 +1602,17 @@ impl SectorApp {
         }
         let comps: Vec<&str> = cur_c[root_c.len()..].iter().map(String::as_str).collect();
         let t = tree.lock().ok()?;
-        let node = t.find_descendant(Tree::ROOT, &comps)?;
+        t.find_descendant(Tree::ROOT, &comps)
+    }
+
+    /// The scanned subtree size of `dir`, if the City's completed (not
+    /// cancelled) scan covers it.
+    fn scanned_subtree_size(&self, dir: &Path) -> Option<u64> {
+        let node = self.city_node_for(dir, true)?;
+        let ScanState::Running { tree, .. } = &self.scan else {
+            return None;
+        };
+        let t = tree.lock().ok()?;
         Some(t.node(node).subtree_size)
     }
 
@@ -3412,21 +3423,6 @@ impl SectorApp {
         }
     }
 
-    /// Ancestors of `root`, from the tree root down to `root` (for the breadcrumb).
-    fn breadcrumb(tree: &Tree, root: NodeId) -> Vec<NodeId> {
-        let mut chain = vec![root];
-        let mut cur = root;
-        loop {
-            let parent = tree.node(cur).parent;
-            if parent == cur {
-                break;
-            }
-            chain.push(parent);
-            cur = parent;
-        }
-        chain.reverse();
-        chain
-    }
 }
 
 /// One extruded block (a leaf tile), pre-projected to screen space.
@@ -4633,7 +4629,16 @@ impl eframe::App for SectorApp {
         // location drifts (address bar, up/back, or a Files navigation), re-sync
         // — instant cache-load if available, else drop to a scan-prompt.
         if self.city_synced_dir.as_deref() != Some(self.current_dir.as_path()) {
-            self.sync_city();
+            // Still inside the loaded tree (the address bar, Up, Back, or the
+            // Files tree moved us within it)? Re-root the City there — instant
+            // — instead of reloading a separate cache for that folder.
+            match self.city_node_for(&self.current_dir, false) {
+                Some(node) => {
+                    self.root = node;
+                    self.city_synced_dir = Some(self.current_dir.clone());
+                }
+                None => self.sync_city(),
+            }
         }
         // ---- Top bar --------------------------------------------------------
         egui::Panel::top("bar").show(ui, |ui| {
@@ -4740,20 +4745,11 @@ impl eframe::App for SectorApp {
                         });
                     }
                     Some(st) => {
+                        // (No City-specific breadcrumb: the shared address bar
+                        // navigates AND re-roots within the loaded tree.)
                         let t = tree.lock().unwrap_or_else(|e| e.into_inner());
                         ui.horizontal_wrapped(|ui| {
-                            if self.root != Tree::ROOT && ui.button("⬆ Up").clicked() {
-                                self.root = t.node(self.root).parent;
-                            }
-                            for (i, id) in Self::breadcrumb(&t, self.root).into_iter().enumerate() {
-                                if i > 0 {
-                                    ui.label("›");
-                                }
-                                if ui.link(t.node(id).name.as_ref()).clicked() {
-                                    self.root = id;
-                                }
-                            }
-                            ui.separator();
+                            ui.weak(format!("Scan of {}:", t.node(Tree::ROOT).name));
                             let mut note = String::new();
                             if st.errors > 0 {
                                 note.push_str(&format!(" · {} unreadable", commas(st.errors)));
