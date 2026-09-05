@@ -230,8 +230,11 @@ Deliberately *not* scheduled — captured so they don't distract us:
   history each), sharing the clipboard, undo stack and background jobs; Tab
   switches sides; copy/move/drag between them. **Prerequisite ✅ (2026-09-05):**
   the per-pane state now lives in a `Pane` struct (`SectorApp::pane`, one for
-  now); the tree/list focus enum became `Focus`. The City would follow the
-  *active* pane (D18 generalised).
+  now); the tree/list focus enum became `Focus`; the pane's logic lives on
+  `impl Pane` (app wrappers apply the shared side effects); the list renders
+  via `show_pane_list` with pane-relative widget ids. Remaining: a second
+  `Pane`, an active index, Tab between panes, F5/F6 to the other pane, and
+  the City following the *active* pane (D18 generalised).
 - **FSN-style City** (SGI File System Navigator; user idea, 2026-09-05). A
   free perspective fly-through: folders as plinths connected to their
   children, files as blocks on them. Attaches to Step 3b (true-3D wgpu +

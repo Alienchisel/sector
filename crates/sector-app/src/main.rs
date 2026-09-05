@@ -2373,7 +2373,7 @@ impl SectorApp {
 
         if self.pane.addr_editing {
             // Editable path field.
-            let addr_id = egui::Id::new("sector_addr_edit");
+            let addr_id = ui.id().with("addr_edit");
             let r = ui.add(
                 egui::TextEdit::singleline(&mut self.pane.addr_edit)
                     .id(addr_id)
@@ -2416,7 +2416,7 @@ impl SectorApp {
             // in Explorer. A faint hover fill + I-beam cursor make that visible.
             let bar = ui.interact(
                 ui.available_rect_before_wrap(),
-                egui::Id::new("addr_bar_bg"),
+                ui.id().with("addr_bar_bg"),
                 Sense::click(),
             );
             if bar.hovered() {
@@ -2506,7 +2506,7 @@ impl SectorApp {
                 ui.separator();
                 let r = ui.add(
                     egui::TextEdit::singleline(&mut self.pane.filter)
-                        .id(egui::Id::new("sector_filter_edit"))
+                        .id(ui.id().with("filter_edit"))
                         .desired_width(220.0)
                         .hint_text("Filter this folder… (Ctrl+F)"),
                 );
@@ -2724,508 +2724,7 @@ impl SectorApp {
             }
         }
 
-        egui::CentralPanel::default().show(ui, |ui| {
-            // The list background, registered FIRST so the rows (added later) sit
-            // on top of it: a click on empty space deselects, a right-click opens
-            // the folder's own menu (Paste / New folder / …). Present even when
-            // the folder is empty or unreadable.
-            let bg = ui.interact(ui.max_rect(), egui::Id::new("files_bg"), Sense::click_and_drag());
-            let mut bg_act: Option<BgAct> = None;
-            // (A click that merely dismissed a context menu doesn't deselect or
-            // start a band — Windows consumes that click too.)
-            let dismissing = self.menu_open_at_start;
-            if bg.clicked() && !dismissing {
-                bg_act = Some(BgAct::Deselect);
-            }
-            // A (left-button) drag from empty space starts a rubber-band
-            // selection. Ctrl/Shift add to the current selection; a plain drag
-            // replaces it.
-            if bg.drag_started_by(egui::PointerButton::Primary) && !dismissing {
-                let additive = ui.ctx().input(|i| i.modifiers.ctrl || i.modifiers.shift);
-                let base = if additive { self.pane.sel.clone() } else { HashSet::new() };
-                let start = bg.interact_pointer_pos().unwrap_or(bg.rect.min);
-                self.pane.marquee = Some(Marquee { start, base });
-                self.focus_pane = Focus::List;
-            }
-            let can_paste_here = self.clipboard.is_some() && !self.file_op_running();
-            bg.context_menu(|ui| {
-                let mut item = |ui: &mut egui::Ui, enabled: bool, label: &str, a: BgAct| {
-                    if ui.add_enabled(enabled, egui::Button::new(label)).clicked() {
-                        bg_act = Some(a);
-                        ui.close();
-                    }
-                };
-                item(ui, can_paste_here, "Paste", BgAct::Paste);
-                item(ui, true, "New folder…", BgAct::NewFolder);
-                ui.separator();
-                item(ui, true, "Select all", BgAct::SelectAll);
-                item(ui, true, "Refresh", BgAct::Refresh);
-                ui.separator();
-                item(ui, true, "Open in Explorer", BgAct::Reveal);
-                item(ui, true, "Properties", BgAct::Props);
-            });
-            if let Some(a) = bg_act {
-                self.focus_pane = Focus::List;
-                match a {
-                    BgAct::Deselect => self.pane.clear_selection(),
-                    BgAct::Paste => self.start_paste(),
-                    BgAct::NewFolder => self.open_new_folder(),
-                    BgAct::SelectAll => {
-                        self.pane.sel = self.pane.entries.iter().map(|e| e.name.clone()).collect();
-                        self.pane.lead = self.pane.entries.len().checked_sub(1);
-                        self.pane.anchor = Some(0);
-                    }
-                    BgAct::Refresh => {
-                        self.pane.entries_dirty = true;
-                        self.sb_cache.clear();
-                    }
-                    BgAct::Reveal => reveal_in_explorer(&self.pane.current_dir, true),
-                    BgAct::Props => {
-                        self.pane.clear_selection(); // Details then shows the folder itself
-                        self.props_visible = true;
-                    }
-                }
-            }
-
-            if let Some(err) = self.pane.entries_err.clone() {
-                ui.centered_and_justified(|ui| {
-                    ui.weak(format!("⚠  {err}"));
-                });
-                return;
-            }
-            if self.pane.entries.is_empty() {
-                ui.centered_and_justified(|ui| {
-                    ui.weak("(empty folder)");
-                });
-                return;
-            }
-
-            use egui_extras::{Column, TableBuilder};
-
-            // Move entries out of self so the table closures don't fight the
-            // borrow checker; deferred mutations are applied after.
-            let entries = std::mem::take(&mut self.pane.entries);
-            let folder_sizes = self.pane.folder_sizes.take();
-            let cur = self.pane.current_dir.clone();
-            let (sort_key, sort_asc) = (self.pane.sort_key, self.pane.sort_asc);
-            let scroll_target = self.pane.scroll_target.take();
-            // Paths of cut items (dimmed in the list).
-            let cut_paths: HashSet<PathBuf> = self
-                .clipboard
-                .as_ref()
-                .filter(|c| c.cut)
-                .map(|c| c.paths.iter().cloned().collect())
-                .unwrap_or_default();
-            // Selection set (taken out so the row closures can read it), plus the
-            // click intent + modifiers, applied after the table.
-            let sel = std::mem::take(&mut self.pane.sel);
-            let mods = ui.ctx().input(|i| i.modifiers);
-            // Focus cursor + keyboard-menu state, read by the row closures.
-            let lead = self.pane.lead;
-            let list_focus = !(self.focus_pane == Focus::Tree && self.sb_visible);
-            let lead_color = ui.visuals().selection.stroke.color;
-            let (kbd_req, kbd_open) = (self.pane.kbd_menu_req, self.pane.kbd_menu_open);
-            // Internal drag-and-drop bookkeeping (applied after the table).
-            let mut drag_start: Option<usize> = None;
-            let mut drop_target: Option<(PathBuf, Vec<PathBuf>)> = None;
-            let mut drop_hover_rect: Option<Rect> = None;
-            // Screen rects of the rows rendered this frame (for the marquee).
-            let mut row_rects: Vec<(usize, Rect)> = Vec::new();
-            let mut click: Option<usize> = None;
-            let mut menu_row: Option<usize> = None;
-            let mut nav_target: Option<PathBuf> = None;
-            let mut new_sort: Option<SortKey> = None;
-            let mut rename_req: Option<String> = None;
-            let mut new_folder_req = false;
-            let mut props_req = false;
-            let mut copy_req = false;
-            let mut cut_req = false;
-            let mut paste_req = false;
-            let mut delete_req = false;
-            let can_paste = self.clipboard.is_some() && !self.file_op_running();
-
-            let arrow = |k: SortKey| {
-                // ⏶/⏷ (not ▲/▼): the latter exist only in the monospace font
-                // and render as boxes in a proportional label.
-                if k == sort_key {
-                    if sort_asc {
-                        " ⏶"
-                    } else {
-                        " ⏷"
-                    }
-                } else {
-                    ""
-                }
-            };
-            // Left-aligned header, vertically centered (so it lines up with the
-            // right-aligned headers, which are also center-aligned).
-            let header_cell = |ui: &mut egui::Ui, label: String, out: &mut Option<SortKey>, k: SortKey| {
-                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                    if ui
-                        .add(egui::Label::new(egui::RichText::new(label).strong()).sense(Sense::click()))
-                        .clicked()
-                    {
-                        *out = Some(k);
-                    }
-                });
-            };
-            // Right-aligned header, for the numeric/date columns. The leading
-            // add_space (right_to_left places it at the far right) keeps the text
-            // off the panel edge.
-            let header_cell_r = |ui: &mut egui::Ui, label: String, out: &mut Option<SortKey>, k: SortKey| {
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.add_space(8.0);
-                    if ui
-                        .add(egui::Label::new(egui::RichText::new(label).strong()).sense(Sense::click()))
-                        .clicked()
-                    {
-                        *out = Some(k);
-                    }
-                });
-            };
-            // Right-aligned data cell wrapper (with the same right padding).
-            let cell_r = |ui: &mut egui::Ui, add: &mut dyn FnMut(&mut egui::Ui)| {
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.add_space(8.0);
-                    add(ui);
-                });
-            };
-
-            let mut table = TableBuilder::new(ui)
-                .striped(true)
-                .resizable(true) // drag the header separators; widths persist
-                .sense(Sense::click_and_drag()) // rows are drag sources
-                // Name is the flexible column and must stay NON-resizable: a
-                // resizable column keeps its stored width, so it wouldn't shrink
-                // when the list narrows (e.g. the Details panel opens) and the
-                // other columns would be pushed off the edge. Resize the others;
-                // Name absorbs the difference.
-                .column(Column::remainder().at_least(220.0).clip(true).resizable(false))
-                .column(Column::auto().at_least(90.0))
-                .column(Column::auto().at_least(90.0))
-                .column(Column::auto().at_least(90.0));
-            if let Some(row) = scroll_target {
-                table = table.scroll_to_row(row, None);
-            }
-            table
-                .header(22.0, |mut h| {
-                    h.col(|ui| header_cell(ui, format!("Name{}", arrow(SortKey::Name)), &mut new_sort, SortKey::Name));
-                    h.col(|ui| header_cell_r(ui, format!("Size{}", arrow(SortKey::Size)), &mut new_sort, SortKey::Size));
-                    h.col(|ui| header_cell(ui, format!("Type{}", arrow(SortKey::Kind)), &mut new_sort, SortKey::Kind));
-                    h.col(|ui| header_cell_r(ui, format!("Modified{}", arrow(SortKey::Modified)), &mut new_sort, SortKey::Modified));
-                })
-                .body(|body| {
-                    body.rows(20.0, entries.len(), |mut row| {
-                        let row_index = row.index();
-                        let e = &entries[row_index];
-                        // File-type color, shared with the City palette so the two
-                        // views read the same. Folders keep the folder glyph.
-                        let cat = (!e.is_dir).then(|| categorize(&e.name));
-                        let is_cut = cut_paths.contains(&cur.join(&e.name));
-                        row.set_selected(sel.contains(&e.name));
-                        row.col(|ui| {
-                            ui.horizontal(|ui| {
-                                ui.spacing_mut().item_spacing.x = 6.0;
-                                match cat {
-                                    None => {
-                                        ui.label("📁");
-                                    }
-                                    Some(c) => {
-                                        // Painted, not a glyph: "●" isn't in egui's
-                                        // proportional fonts (it rendered as a box).
-                                        let (r, _) =
-                                            ui.allocate_exact_size(Vec2::new(10.0, 10.0), Sense::hover());
-                                        ui.painter().circle_filled(r.center(), 4.0, category_color(c));
-                                    }
-                                }
-                                // A cut item is dimmed until the paste completes.
-                                if is_cut {
-                                    ui.weak(&e.name);
-                                } else {
-                                    ui.label(&e.name);
-                                }
-                            });
-                        });
-                        row.col(|ui| {
-                            cell_r(ui, &mut |ui| {
-                                if e.is_dir {
-                                    // Folder size from a covering scan, if we have one.
-                                    if let Some(sz) = folder_sizes
-                                        .as_ref()
-                                        .and_then(|m| m.get(&e.name.to_lowercase()))
-                                    {
-                                        ui.monospace(human_size(*sz));
-                                    }
-                                } else {
-                                    ui.monospace(human_size(e.size));
-                                }
-                            });
-                        });
-                        row.col(|ui| match cat {
-                            None => {
-                                ui.weak("Folder");
-                            }
-                            Some(c) => {
-                                ui.colored_label(category_color(c), c.label());
-                            }
-                        });
-                        row.col(|ui| {
-                            cell_r(ui, &mut |ui| {
-                                if let Some(m) = e.modified {
-                                    ui.weak(humanize_age(m));
-                                }
-                            });
-                        });
-                        let full = cur.join(&e.name);
-                        // Hover: the full (unclipped) name + essentials, like Explorer.
-                        // (`on_hover_ui` is lazy — the text is built only when shown.)
-                        let resp = row.response().on_hover_ui(|ui| {
-                            ui.label(row_tooltip(e, folder_sizes.as_ref()));
-                        });
-                        row_rects.push((row_index, resp.rect));
-                        // Drag source: dragging a selected row drags the whole
-                        // selection; dragging an unselected row drags just it.
-                        // Primary button only — a right-drag must not move files.
-                        if resp.drag_started_by(egui::PointerButton::Primary) {
-                            let paths: Vec<PathBuf> = if sel.contains(&e.name) {
-                                entries.iter().filter(|x| sel.contains(&x.name)).map(|x| cur.join(&x.name)).collect()
-                            } else {
-                                vec![full.clone()]
-                            };
-                            egui::DragAndDrop::set_payload(&resp.ctx, DragFiles { paths });
-                            drag_start = Some(row_index);
-                        }
-                        // Drop target: a folder row (not one being dragged).
-                        if e.is_dir {
-                            if let Some(p) = resp.dnd_hover_payload::<DragFiles>() {
-                                if p.can_drop_into(&full) {
-                                    drop_hover_rect = Some(resp.rect);
-                                    if let Some(p) = resp.dnd_release_payload::<DragFiles>() {
-                                        drop_target = Some((full.clone(), p.paths.clone()));
-                                    }
-                                }
-                            }
-                        }
-                        if resp.clicked() {
-                            click = Some(row.index());
-                        }
-                        if resp.secondary_clicked() {
-                            menu_row = Some(row.index());
-                        }
-                        if resp.double_clicked() {
-                            if e.is_dir {
-                                nav_target = Some(full.clone());
-                            } else {
-                                open_path(&full);
-                            }
-                        }
-                        // A keyboard-opened menu (Shift+F10) anchors to the row
-                        // instead of the pointer, for as long as it stays open.
-                        let popup = if lead == Some(row_index) && (kbd_req || kbd_open) {
-                            egui::Popup::menu(&resp)
-                                .open_memory(kbd_req.then_some(egui::SetOpenCommand::Bool(true)))
-                        } else {
-                            egui::Popup::context_menu(&resp)
-                        };
-                        popup.show(|ui| {
-                            if ui.button("Open").clicked() {
-                                if e.is_dir {
-                                    nav_target = Some(full.clone()); // enter it in SECTOR
-                                } else {
-                                    open_path(&full); // launch its default app
-                                }
-                                ui.close();
-                            }
-                            let reveal_label =
-                                if e.is_dir { "Open in Explorer" } else { "Reveal in Explorer" };
-                            if ui.button(reveal_label).clicked() {
-                                reveal_in_explorer(&full, e.is_dir);
-                                ui.close();
-                            }
-                            ui.separator();
-                            if ui.button("Copy path").clicked() {
-                                ui.ctx().copy_text(full.to_string_lossy().into_owned());
-                                ui.close();
-                            }
-                            if ui.button("Copy name").clicked() {
-                                ui.ctx().copy_text(e.name.clone());
-                                ui.close();
-                            }
-                            ui.separator();
-                            if ui.button("Copy").clicked() {
-                                copy_req = true;
-                                ui.close();
-                            }
-                            if ui.button("Cut").clicked() {
-                                cut_req = true;
-                                ui.close();
-                            }
-                            if ui.add_enabled(can_paste, egui::Button::new("Paste")).clicked() {
-                                paste_req = true;
-                                ui.close();
-                            }
-                            if ui.button("Delete").clicked() {
-                                delete_req = true;
-                                ui.close();
-                            }
-                            ui.separator();
-                            if ui.button("Rename…").clicked() {
-                                rename_req = Some(e.name.clone());
-                                ui.close();
-                            }
-                            if ui.button("New folder…").clicked() {
-                                new_folder_req = true;
-                                ui.close();
-                            }
-                            ui.separator();
-                            if ui.button("Properties").clicked() {
-                                props_req = true;
-                                ui.close();
-                            }
-                        });
-                    });
-                });
-
-            // Restore entries + selection, then apply deferred mutations.
-            self.pane.entries = entries;
-            self.pane.folder_sizes = folder_sizes;
-            self.pane.sel = sel;
-            // Rubber-band selection: every frame of the drag, select the rows the
-            // band touches (on top of `base`), and paint the band.
-            if let Some((start, base)) = self.pane.marquee.as_ref().map(|m| (m.start, m.base.clone())) {
-                if let Some(cur_pos) = ui.ctx().pointer_latest_pos() {
-                    let band = Rect::from_two_pos(start, cur_pos);
-                    let hit: Vec<usize> =
-                        row_rects.iter().filter(|(_, r)| r.intersects(band)).map(|(i, _)| *i).collect();
-                    let mut sel = base;
-                    for &i in &hit {
-                        sel.insert(self.pane.entries[i].name.clone());
-                    }
-                    self.pane.sel = sel;
-                    if let (Some(&lo), Some(&hi)) = (hit.iter().min(), hit.iter().max()) {
-                        self.pane.anchor = Some(lo);
-                        self.pane.lead = Some(hi);
-                    }
-                    let accent = lead_color;
-                    ui.painter().rect(
-                        band,
-                        0.0_f32,
-                        Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 40),
-                        Stroke::new(1.0, accent),
-                        egui::StrokeKind::Inside,
-                    );
-                    ui.ctx().request_repaint();
-                }
-                if bg.drag_stopped() || !ui.ctx().input(|i| i.pointer.any_down()) {
-                    self.pane.marquee = None;
-                }
-            }
-            // Focus cursor: a thin outline around the lead row — but only when it
-            // says something the selection highlight doesn't: the cursor has been
-            // moved off the selection (Ctrl+Arrow), or several rows are selected
-            // and this is the one the keyboard acts on. A plain single selection
-            // gets no extra mark.
-            if list_focus {
-                if let Some(l) = self.pane.lead {
-                    let on_selection = self.pane.entries.get(l).is_some_and(|e| self.pane.sel.contains(&e.name));
-                    if !on_selection || self.pane.sel.len() > 1 {
-                        if let Some((_, r)) = row_rects.iter().find(|(i, _)| *i == l) {
-                            ui.painter().rect_stroke(
-                                r.shrink(0.5),
-                                2.0_f32,
-                                Stroke::new(1.0, lead_color.gamma_multiply(0.7)),
-                                egui::StrokeKind::Inside,
-                            );
-                        }
-                    }
-                }
-            }
-            // Drag-and-drop: highlight the hovered folder row; select the row a
-            // drag started on (Explorer does); perform a drop (Ctrl = copy).
-            if let Some(r) = drop_hover_rect {
-                ui.painter().rect_stroke(r, 3.0_f32, Stroke::new(2.0, lead_color), egui::StrokeKind::Inside);
-            }
-            if let Some(i) = drag_start {
-                if !self.pane.entries.get(i).is_some_and(|e| self.pane.sel.contains(&e.name)) {
-                    self.pane.select_only(i);
-                }
-                self.focus_pane = Focus::List;
-            }
-            if let Some((dest, paths)) = drop_target {
-                let copy = ui.ctx().input(|i| i.modifiers.ctrl);
-                self.start_transfer(paths, dest, !copy);
-            }
-            // Keyboard context menu: the request was consumed by the lead row
-            // this frame; once the menu closes, stop anchoring to it.
-            if self.pane.kbd_menu_req {
-                self.pane.kbd_menu_req = false;
-                self.pane.kbd_menu_open = true;
-            }
-            if self.pane.kbd_menu_open && !egui::Popup::is_any_open(ui.ctx()) {
-                self.pane.kbd_menu_open = false;
-            }
-            // Apply a click: Shift = range, Ctrl = toggle, plain = select one.
-            if let Some(i) = click {
-                if mods.shift {
-                    self.pane.select_range_to(i);
-                } else if mods.ctrl {
-                    self.pane.toggle_at(i);
-                } else {
-                    self.pane.select_only(i);
-                }
-                self.focus_pane = Focus::List; // keyboard now drives the list
-            }
-            // A right-click on an unselected row selects just it (keeps a
-            // multi-selection when right-clicking within it).
-            if let Some(i) = menu_row {
-                let in_sel =
-                    self.pane.entries.get(i).map(|e| self.pane.sel.contains(&e.name)).unwrap_or(false);
-                if !in_sel {
-                    self.pane.select_only(i);
-                }
-            }
-            if let Some(k) = new_sort {
-                if self.pane.sort_key == k {
-                    self.pane.sort_asc = !self.pane.sort_asc;
-                } else {
-                    self.pane.sort_key = k;
-                    self.pane.sort_asc = true;
-                }
-                // Re-sort the full listing IN PLACE (no directory re-read), then
-                // re-apply the filter (which preserves the selection by name).
-                let mut es = std::mem::take(&mut self.pane.all_entries);
-                self.pane.sort_entries(&mut es);
-                self.pane.all_entries = es;
-                self.apply_filter();
-                self.pane.scroll_target = self.pane.lead; // keep the selection visible
-            }
-            if let Some(t) = nav_target {
-                self.navigate_to(t);
-            }
-            if let Some(name) = rename_req {
-                self.open_rename(name);
-            }
-            if new_folder_req {
-                self.open_new_folder();
-            }
-            if props_req {
-                self.props_visible = true;
-            }
-            // The selection now reflects the right-clicked row (or a kept
-            // multi-selection); copy/cut act on all of it.
-            if copy_req {
-                self.clip_selected(false);
-            }
-            if cut_req {
-                self.clip_selected(true);
-            }
-            if paste_req {
-                self.start_paste();
-            }
-            if delete_req {
-                self.request_delete();
-            }
-        });
+        egui::CentralPanel::default().show(ui, |ui| self.show_pane_list(ui));
 
         // Keyboard parity with Explorer: F5 refreshes; arrows/Home/End/PageUp/Down
         // move the selection; Enter opens it; Backspace goes up — but never while
@@ -3473,6 +2972,513 @@ impl SectorApp {
             }
         }
     }
+
+    /// The file list for ONE pane: the table with its selection, drag-and-drop,
+    /// marquee, context menus and deferred actions. Widget ids are relative to
+    /// `ui`, so a second pane rendered under its own `push_id` can't collide.
+    fn show_pane_list(&mut self, ui: &mut egui::Ui) {
+        // The list background, registered FIRST so the rows (added later) sit
+        // on top of it: a click on empty space deselects, a right-click opens
+        // the folder's own menu (Paste / New folder / …). Present even when
+        // the folder is empty or unreadable.
+        let bg = ui.interact(ui.max_rect(), ui.id().with("files_bg"), Sense::click_and_drag());
+        let mut bg_act: Option<BgAct> = None;
+        // (A click that merely dismissed a context menu doesn't deselect or
+        // start a band — Windows consumes that click too.)
+        let dismissing = self.menu_open_at_start;
+        if bg.clicked() && !dismissing {
+            bg_act = Some(BgAct::Deselect);
+        }
+        // A (left-button) drag from empty space starts a rubber-band
+        // selection. Ctrl/Shift add to the current selection; a plain drag
+        // replaces it.
+        if bg.drag_started_by(egui::PointerButton::Primary) && !dismissing {
+            let additive = ui.ctx().input(|i| i.modifiers.ctrl || i.modifiers.shift);
+            let base = if additive { self.pane.sel.clone() } else { HashSet::new() };
+            let start = bg.interact_pointer_pos().unwrap_or(bg.rect.min);
+            self.pane.marquee = Some(Marquee { start, base });
+            self.focus_pane = Focus::List;
+        }
+        let can_paste_here = self.clipboard.is_some() && !self.file_op_running();
+        bg.context_menu(|ui| {
+            let mut item = |ui: &mut egui::Ui, enabled: bool, label: &str, a: BgAct| {
+                if ui.add_enabled(enabled, egui::Button::new(label)).clicked() {
+                    bg_act = Some(a);
+                    ui.close();
+                }
+            };
+            item(ui, can_paste_here, "Paste", BgAct::Paste);
+            item(ui, true, "New folder…", BgAct::NewFolder);
+            ui.separator();
+            item(ui, true, "Select all", BgAct::SelectAll);
+            item(ui, true, "Refresh", BgAct::Refresh);
+            ui.separator();
+            item(ui, true, "Open in Explorer", BgAct::Reveal);
+            item(ui, true, "Properties", BgAct::Props);
+        });
+        if let Some(a) = bg_act {
+            self.focus_pane = Focus::List;
+            match a {
+                BgAct::Deselect => self.pane.clear_selection(),
+                BgAct::Paste => self.start_paste(),
+                BgAct::NewFolder => self.open_new_folder(),
+                BgAct::SelectAll => {
+                    self.pane.sel = self.pane.entries.iter().map(|e| e.name.clone()).collect();
+                    self.pane.lead = self.pane.entries.len().checked_sub(1);
+                    self.pane.anchor = Some(0);
+                }
+                BgAct::Refresh => {
+                    self.pane.entries_dirty = true;
+                    self.sb_cache.clear();
+                }
+                BgAct::Reveal => reveal_in_explorer(&self.pane.current_dir, true),
+                BgAct::Props => {
+                    self.pane.clear_selection(); // Details then shows the folder itself
+                    self.props_visible = true;
+                }
+            }
+        }
+
+        if let Some(err) = self.pane.entries_err.clone() {
+            ui.centered_and_justified(|ui| {
+                ui.weak(format!("⚠  {err}"));
+            });
+            return;
+        }
+        if self.pane.entries.is_empty() {
+            ui.centered_and_justified(|ui| {
+                ui.weak("(empty folder)");
+            });
+            return;
+        }
+
+        use egui_extras::{Column, TableBuilder};
+
+        // Move entries out of self so the table closures don't fight the
+        // borrow checker; deferred mutations are applied after.
+        let entries = std::mem::take(&mut self.pane.entries);
+        let folder_sizes = self.pane.folder_sizes.take();
+        let cur = self.pane.current_dir.clone();
+        let (sort_key, sort_asc) = (self.pane.sort_key, self.pane.sort_asc);
+        let scroll_target = self.pane.scroll_target.take();
+        // Paths of cut items (dimmed in the list).
+        let cut_paths: HashSet<PathBuf> = self
+            .clipboard
+            .as_ref()
+            .filter(|c| c.cut)
+            .map(|c| c.paths.iter().cloned().collect())
+            .unwrap_or_default();
+        // Selection set (taken out so the row closures can read it), plus the
+        // click intent + modifiers, applied after the table.
+        let sel = std::mem::take(&mut self.pane.sel);
+        let mods = ui.ctx().input(|i| i.modifiers);
+        // Focus cursor + keyboard-menu state, read by the row closures.
+        let lead = self.pane.lead;
+        let list_focus = !(self.focus_pane == Focus::Tree && self.sb_visible);
+        let lead_color = ui.visuals().selection.stroke.color;
+        let (kbd_req, kbd_open) = (self.pane.kbd_menu_req, self.pane.kbd_menu_open);
+        // Internal drag-and-drop bookkeeping (applied after the table).
+        let mut drag_start: Option<usize> = None;
+        let mut drop_target: Option<(PathBuf, Vec<PathBuf>)> = None;
+        let mut drop_hover_rect: Option<Rect> = None;
+        // Screen rects of the rows rendered this frame (for the marquee).
+        let mut row_rects: Vec<(usize, Rect)> = Vec::new();
+        let mut click: Option<usize> = None;
+        let mut menu_row: Option<usize> = None;
+        let mut nav_target: Option<PathBuf> = None;
+        let mut new_sort: Option<SortKey> = None;
+        let mut rename_req: Option<String> = None;
+        let mut new_folder_req = false;
+        let mut props_req = false;
+        let mut copy_req = false;
+        let mut cut_req = false;
+        let mut paste_req = false;
+        let mut delete_req = false;
+        let can_paste = self.clipboard.is_some() && !self.file_op_running();
+
+        let arrow = |k: SortKey| {
+            // ⏶/⏷ (not ▲/▼): the latter exist only in the monospace font
+            // and render as boxes in a proportional label.
+            if k == sort_key {
+                if sort_asc {
+                    " ⏶"
+                } else {
+                    " ⏷"
+                }
+            } else {
+                ""
+            }
+        };
+        // Left-aligned header, vertically centered (so it lines up with the
+        // right-aligned headers, which are also center-aligned).
+        let header_cell = |ui: &mut egui::Ui, label: String, out: &mut Option<SortKey>, k: SortKey| {
+            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                if ui
+                    .add(egui::Label::new(egui::RichText::new(label).strong()).sense(Sense::click()))
+                    .clicked()
+                {
+                    *out = Some(k);
+                }
+            });
+        };
+        // Right-aligned header, for the numeric/date columns. The leading
+        // add_space (right_to_left places it at the far right) keeps the text
+        // off the panel edge.
+        let header_cell_r = |ui: &mut egui::Ui, label: String, out: &mut Option<SortKey>, k: SortKey| {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.add_space(8.0);
+                if ui
+                    .add(egui::Label::new(egui::RichText::new(label).strong()).sense(Sense::click()))
+                    .clicked()
+                {
+                    *out = Some(k);
+                }
+            });
+        };
+        // Right-aligned data cell wrapper (with the same right padding).
+        let cell_r = |ui: &mut egui::Ui, add: &mut dyn FnMut(&mut egui::Ui)| {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.add_space(8.0);
+                add(ui);
+            });
+        };
+
+        let mut table = TableBuilder::new(ui)
+            .striped(true)
+            .resizable(true) // drag the header separators; widths persist
+            .sense(Sense::click_and_drag()) // rows are drag sources
+            // Name is the flexible column and must stay NON-resizable: a
+            // resizable column keeps its stored width, so it wouldn't shrink
+            // when the list narrows (e.g. the Details panel opens) and the
+            // other columns would be pushed off the edge. Resize the others;
+            // Name absorbs the difference.
+            .column(Column::remainder().at_least(220.0).clip(true).resizable(false))
+            .column(Column::auto().at_least(90.0))
+            .column(Column::auto().at_least(90.0))
+            .column(Column::auto().at_least(90.0));
+        if let Some(row) = scroll_target {
+            table = table.scroll_to_row(row, None);
+        }
+        table
+            .header(22.0, |mut h| {
+                h.col(|ui| header_cell(ui, format!("Name{}", arrow(SortKey::Name)), &mut new_sort, SortKey::Name));
+                h.col(|ui| header_cell_r(ui, format!("Size{}", arrow(SortKey::Size)), &mut new_sort, SortKey::Size));
+                h.col(|ui| header_cell(ui, format!("Type{}", arrow(SortKey::Kind)), &mut new_sort, SortKey::Kind));
+                h.col(|ui| header_cell_r(ui, format!("Modified{}", arrow(SortKey::Modified)), &mut new_sort, SortKey::Modified));
+            })
+            .body(|body| {
+                body.rows(20.0, entries.len(), |mut row| {
+                    let row_index = row.index();
+                    let e = &entries[row_index];
+                    // File-type color, shared with the City palette so the two
+                    // views read the same. Folders keep the folder glyph.
+                    let cat = (!e.is_dir).then(|| categorize(&e.name));
+                    let is_cut = cut_paths.contains(&cur.join(&e.name));
+                    row.set_selected(sel.contains(&e.name));
+                    row.col(|ui| {
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 6.0;
+                            match cat {
+                                None => {
+                                    ui.label("📁");
+                                }
+                                Some(c) => {
+                                    // Painted, not a glyph: "●" isn't in egui's
+                                    // proportional fonts (it rendered as a box).
+                                    let (r, _) =
+                                        ui.allocate_exact_size(Vec2::new(10.0, 10.0), Sense::hover());
+                                    ui.painter().circle_filled(r.center(), 4.0, category_color(c));
+                                }
+                            }
+                            // A cut item is dimmed until the paste completes.
+                            if is_cut {
+                                ui.weak(&e.name);
+                            } else {
+                                ui.label(&e.name);
+                            }
+                        });
+                    });
+                    row.col(|ui| {
+                        cell_r(ui, &mut |ui| {
+                            if e.is_dir {
+                                // Folder size from a covering scan, if we have one.
+                                if let Some(sz) = folder_sizes
+                                    .as_ref()
+                                    .and_then(|m| m.get(&e.name.to_lowercase()))
+                                {
+                                    ui.monospace(human_size(*sz));
+                                }
+                            } else {
+                                ui.monospace(human_size(e.size));
+                            }
+                        });
+                    });
+                    row.col(|ui| match cat {
+                        None => {
+                            ui.weak("Folder");
+                        }
+                        Some(c) => {
+                            ui.colored_label(category_color(c), c.label());
+                        }
+                    });
+                    row.col(|ui| {
+                        cell_r(ui, &mut |ui| {
+                            if let Some(m) = e.modified {
+                                ui.weak(humanize_age(m));
+                            }
+                        });
+                    });
+                    let full = cur.join(&e.name);
+                    // Hover: the full (unclipped) name + essentials, like Explorer.
+                    // (`on_hover_ui` is lazy — the text is built only when shown.)
+                    let resp = row.response().on_hover_ui(|ui| {
+                        ui.label(row_tooltip(e, folder_sizes.as_ref()));
+                    });
+                    row_rects.push((row_index, resp.rect));
+                    // Drag source: dragging a selected row drags the whole
+                    // selection; dragging an unselected row drags just it.
+                    // Primary button only — a right-drag must not move files.
+                    if resp.drag_started_by(egui::PointerButton::Primary) {
+                        let paths: Vec<PathBuf> = if sel.contains(&e.name) {
+                            entries.iter().filter(|x| sel.contains(&x.name)).map(|x| cur.join(&x.name)).collect()
+                        } else {
+                            vec![full.clone()]
+                        };
+                        egui::DragAndDrop::set_payload(&resp.ctx, DragFiles { paths });
+                        drag_start = Some(row_index);
+                    }
+                    // Drop target: a folder row (not one being dragged).
+                    if e.is_dir {
+                        if let Some(p) = resp.dnd_hover_payload::<DragFiles>() {
+                            if p.can_drop_into(&full) {
+                                drop_hover_rect = Some(resp.rect);
+                                if let Some(p) = resp.dnd_release_payload::<DragFiles>() {
+                                    drop_target = Some((full.clone(), p.paths.clone()));
+                                }
+                            }
+                        }
+                    }
+                    if resp.clicked() {
+                        click = Some(row.index());
+                    }
+                    if resp.secondary_clicked() {
+                        menu_row = Some(row.index());
+                    }
+                    if resp.double_clicked() {
+                        if e.is_dir {
+                            nav_target = Some(full.clone());
+                        } else {
+                            open_path(&full);
+                        }
+                    }
+                    // A keyboard-opened menu (Shift+F10) anchors to the row
+                    // instead of the pointer, for as long as it stays open.
+                    let popup = if lead == Some(row_index) && (kbd_req || kbd_open) {
+                        egui::Popup::menu(&resp)
+                            .open_memory(kbd_req.then_some(egui::SetOpenCommand::Bool(true)))
+                    } else {
+                        egui::Popup::context_menu(&resp)
+                    };
+                    popup.show(|ui| {
+                        if ui.button("Open").clicked() {
+                            if e.is_dir {
+                                nav_target = Some(full.clone()); // enter it in SECTOR
+                            } else {
+                                open_path(&full); // launch its default app
+                            }
+                            ui.close();
+                        }
+                        let reveal_label =
+                            if e.is_dir { "Open in Explorer" } else { "Reveal in Explorer" };
+                        if ui.button(reveal_label).clicked() {
+                            reveal_in_explorer(&full, e.is_dir);
+                            ui.close();
+                        }
+                        ui.separator();
+                        if ui.button("Copy path").clicked() {
+                            ui.ctx().copy_text(full.to_string_lossy().into_owned());
+                            ui.close();
+                        }
+                        if ui.button("Copy name").clicked() {
+                            ui.ctx().copy_text(e.name.clone());
+                            ui.close();
+                        }
+                        ui.separator();
+                        if ui.button("Copy").clicked() {
+                            copy_req = true;
+                            ui.close();
+                        }
+                        if ui.button("Cut").clicked() {
+                            cut_req = true;
+                            ui.close();
+                        }
+                        if ui.add_enabled(can_paste, egui::Button::new("Paste")).clicked() {
+                            paste_req = true;
+                            ui.close();
+                        }
+                        if ui.button("Delete").clicked() {
+                            delete_req = true;
+                            ui.close();
+                        }
+                        ui.separator();
+                        if ui.button("Rename…").clicked() {
+                            rename_req = Some(e.name.clone());
+                            ui.close();
+                        }
+                        if ui.button("New folder…").clicked() {
+                            new_folder_req = true;
+                            ui.close();
+                        }
+                        ui.separator();
+                        if ui.button("Properties").clicked() {
+                            props_req = true;
+                            ui.close();
+                        }
+                    });
+                });
+            });
+
+        // Restore entries + selection, then apply deferred mutations.
+        self.pane.entries = entries;
+        self.pane.folder_sizes = folder_sizes;
+        self.pane.sel = sel;
+        // Rubber-band selection: every frame of the drag, select the rows the
+        // band touches (on top of `base`), and paint the band.
+        if let Some((start, base)) = self.pane.marquee.as_ref().map(|m| (m.start, m.base.clone())) {
+            if let Some(cur_pos) = ui.ctx().pointer_latest_pos() {
+                let band = Rect::from_two_pos(start, cur_pos);
+                let hit: Vec<usize> =
+                    row_rects.iter().filter(|(_, r)| r.intersects(band)).map(|(i, _)| *i).collect();
+                let mut sel = base;
+                for &i in &hit {
+                    sel.insert(self.pane.entries[i].name.clone());
+                }
+                self.pane.sel = sel;
+                if let (Some(&lo), Some(&hi)) = (hit.iter().min(), hit.iter().max()) {
+                    self.pane.anchor = Some(lo);
+                    self.pane.lead = Some(hi);
+                }
+                let accent = lead_color;
+                ui.painter().rect(
+                    band,
+                    0.0_f32,
+                    Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 40),
+                    Stroke::new(1.0, accent),
+                    egui::StrokeKind::Inside,
+                );
+                ui.ctx().request_repaint();
+            }
+            if bg.drag_stopped() || !ui.ctx().input(|i| i.pointer.any_down()) {
+                self.pane.marquee = None;
+            }
+        }
+        // Focus cursor: a thin outline around the lead row — but only when it
+        // says something the selection highlight doesn't: the cursor has been
+        // moved off the selection (Ctrl+Arrow), or several rows are selected
+        // and this is the one the keyboard acts on. A plain single selection
+        // gets no extra mark.
+        if list_focus {
+            if let Some(l) = self.pane.lead {
+                let on_selection = self.pane.entries.get(l).is_some_and(|e| self.pane.sel.contains(&e.name));
+                if !on_selection || self.pane.sel.len() > 1 {
+                    if let Some((_, r)) = row_rects.iter().find(|(i, _)| *i == l) {
+                        ui.painter().rect_stroke(
+                            r.shrink(0.5),
+                            2.0_f32,
+                            Stroke::new(1.0, lead_color.gamma_multiply(0.7)),
+                            egui::StrokeKind::Inside,
+                        );
+                    }
+                }
+            }
+        }
+        // Drag-and-drop: highlight the hovered folder row; select the row a
+        // drag started on (Explorer does); perform a drop (Ctrl = copy).
+        if let Some(r) = drop_hover_rect {
+            ui.painter().rect_stroke(r, 3.0_f32, Stroke::new(2.0, lead_color), egui::StrokeKind::Inside);
+        }
+        if let Some(i) = drag_start {
+            if !self.pane.entries.get(i).is_some_and(|e| self.pane.sel.contains(&e.name)) {
+                self.pane.select_only(i);
+            }
+            self.focus_pane = Focus::List;
+        }
+        if let Some((dest, paths)) = drop_target {
+            let copy = ui.ctx().input(|i| i.modifiers.ctrl);
+            self.start_transfer(paths, dest, !copy);
+        }
+        // Keyboard context menu: the request was consumed by the lead row
+        // this frame; once the menu closes, stop anchoring to it.
+        if self.pane.kbd_menu_req {
+            self.pane.kbd_menu_req = false;
+            self.pane.kbd_menu_open = true;
+        }
+        if self.pane.kbd_menu_open && !egui::Popup::is_any_open(ui.ctx()) {
+            self.pane.kbd_menu_open = false;
+        }
+        // Apply a click: Shift = range, Ctrl = toggle, plain = select one.
+        if let Some(i) = click {
+            if mods.shift {
+                self.pane.select_range_to(i);
+            } else if mods.ctrl {
+                self.pane.toggle_at(i);
+            } else {
+                self.pane.select_only(i);
+            }
+            self.focus_pane = Focus::List; // keyboard now drives the list
+        }
+        // A right-click on an unselected row selects just it (keeps a
+        // multi-selection when right-clicking within it).
+        if let Some(i) = menu_row {
+            let in_sel =
+                self.pane.entries.get(i).map(|e| self.pane.sel.contains(&e.name)).unwrap_or(false);
+            if !in_sel {
+                self.pane.select_only(i);
+            }
+        }
+        if let Some(k) = new_sort {
+            if self.pane.sort_key == k {
+                self.pane.sort_asc = !self.pane.sort_asc;
+            } else {
+                self.pane.sort_key = k;
+                self.pane.sort_asc = true;
+            }
+            // Re-sort the full listing IN PLACE (no directory re-read), then
+            // re-apply the filter (which preserves the selection by name).
+            let mut es = std::mem::take(&mut self.pane.all_entries);
+            self.pane.sort_entries(&mut es);
+            self.pane.all_entries = es;
+            self.apply_filter();
+            self.pane.scroll_target = self.pane.lead; // keep the selection visible
+        }
+        if let Some(t) = nav_target {
+            self.navigate_to(t);
+        }
+        if let Some(name) = rename_req {
+            self.open_rename(name);
+        }
+        if new_folder_req {
+            self.open_new_folder();
+        }
+        if props_req {
+            self.props_visible = true;
+        }
+        // The selection now reflects the right-clicked row (or a kept
+        // multi-selection); copy/cut act on all of it.
+        if copy_req {
+            self.clip_selected(false);
+        }
+        if cut_req {
+            self.clip_selected(true);
+        }
+        if paste_req {
+            self.start_paste();
+        }
+        if delete_req {
+            self.request_delete();
+        }
+    }
+
 
     /// Keyboard navigation for the folder tree (when it has focus): ↑/↓ move &
     /// navigate, → expand/first-child, ← collapse/parent, Home/End to the ends.
