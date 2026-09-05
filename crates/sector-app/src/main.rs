@@ -154,6 +154,15 @@ impl DragFiles {
     }
 }
 
+/// A rubber-band (marquee) selection in progress: a drag that started on
+/// empty space in the list. Rows the band touches are selected live.
+struct Marquee {
+    /// Where the drag started (screen space).
+    start: Pos2,
+    /// The selection to ADD to (Ctrl/Shift held at the start), else empty.
+    base: HashSet<String>,
+}
+
 /// A deferred action from the file list's background (empty-space) menu.
 enum BgAct {
     Deselect,
@@ -618,6 +627,8 @@ struct SectorApp {
     /// Files currently being dragged over the window (from Explorer or any
     /// app), for the drop overlay. 0 when nothing is hovering.
     drop_hover: usize,
+    /// A rubber-band selection being dragged out on the list's empty space.
+    marquee: Option<Marquee>,
     /// Was a popup/menu open when this frame began? A popup closed by Esc is
     /// already gone by the time the shortcuts run, so without this the same
     /// Esc would go on to clear the selection.
@@ -721,6 +732,7 @@ impl Default for SectorApp {
             cur_entry: None,
             cur_dir_size: None,
             drop_hover: 0,
+            marquee: None,
             menu_open_at_start: false,
             sb_visible: true,
             focus_pane: Pane::List,
@@ -2426,10 +2438,19 @@ impl SectorApp {
             // on top of it: a click on empty space deselects, a right-click opens
             // the folder's own menu (Paste / New folder / …). Present even when
             // the folder is empty or unreadable.
-            let bg = ui.interact(ui.max_rect(), egui::Id::new("files_bg"), Sense::click());
+            let bg = ui.interact(ui.max_rect(), egui::Id::new("files_bg"), Sense::click_and_drag());
             let mut bg_act: Option<BgAct> = None;
             if bg.clicked() {
                 bg_act = Some(BgAct::Deselect);
+            }
+            // A drag from empty space starts a rubber-band selection. Ctrl/Shift
+            // add to the current selection; a plain drag replaces it.
+            if bg.drag_started() {
+                let additive = ui.ctx().input(|i| i.modifiers.ctrl || i.modifiers.shift);
+                let base = if additive { self.sel.clone() } else { HashSet::new() };
+                let start = bg.interact_pointer_pos().unwrap_or(bg.rect.min);
+                self.marquee = Some(Marquee { start, base });
+                self.focus_pane = Pane::List;
             }
             let can_paste_here = self.clipboard.is_some() && !self.file_op_running();
             bg.context_menu(|ui| {
@@ -2513,6 +2534,8 @@ impl SectorApp {
             let mut drag_start: Option<usize> = None;
             let mut drop_target: Option<(PathBuf, Vec<PathBuf>)> = None;
             let mut drop_hover_rect: Option<Rect> = None;
+            // Screen rects of the rows rendered this frame (for the marquee).
+            let mut row_rects: Vec<(usize, Rect)> = Vec::new();
             let mut click: Option<usize> = None;
             let mut menu_row: Option<usize> = None;
             let mut nav_target: Option<PathBuf> = None;
@@ -2660,6 +2683,7 @@ impl SectorApp {
                         let full = cur.join(&e.name);
                         // Hover: the full (unclipped) name + essentials, like Explorer.
                         let resp = row.response().on_hover_text(row_tooltip(e, folder_sizes.as_ref()));
+                        row_rects.push((row_index, resp.rect));
                         // Drag source: dragging a selected row drags the whole
                         // selection; dragging an unselected row drags just it.
                         if resp.drag_started() {
@@ -2766,6 +2790,36 @@ impl SectorApp {
             self.entries = entries;
             self.folder_sizes = folder_sizes;
             self.sel = sel;
+            // Rubber-band selection: every frame of the drag, select the rows the
+            // band touches (on top of `base`), and paint the band.
+            if let Some((start, base)) = self.marquee.as_ref().map(|m| (m.start, m.base.clone())) {
+                if let Some(cur_pos) = ui.ctx().pointer_latest_pos() {
+                    let band = Rect::from_two_pos(start, cur_pos);
+                    let hit: Vec<usize> =
+                        row_rects.iter().filter(|(_, r)| r.intersects(band)).map(|(i, _)| *i).collect();
+                    let mut sel = base;
+                    for &i in &hit {
+                        sel.insert(self.entries[i].name.clone());
+                    }
+                    self.sel = sel;
+                    if let (Some(&lo), Some(&hi)) = (hit.iter().min(), hit.iter().max()) {
+                        self.anchor = Some(lo);
+                        self.lead = Some(hi);
+                    }
+                    let accent = lead_color;
+                    ui.painter().rect(
+                        band,
+                        0.0_f32,
+                        Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 40),
+                        Stroke::new(1.0, accent),
+                        egui::StrokeKind::Inside,
+                    );
+                    ui.ctx().request_repaint();
+                }
+                if bg.drag_stopped() || !ui.ctx().input(|i| i.pointer.any_down()) {
+                    self.marquee = None;
+                }
+            }
             // Drag-and-drop: highlight the hovered folder row; select the row a
             // drag started on (Explorer does); perform a drop (Ctrl = copy).
             if let Some(r) = drop_hover_rect {

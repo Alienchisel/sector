@@ -33,8 +33,9 @@ went.
   toggle that applies to the list and the folder tree alike.
 - **Details** panel (`Alt+Enter`, or the toolbar toggle) — path, sizes, dates,
   attributes.
-- **Multi-select** — click / `Ctrl`-click / `Shift`-click / `Ctrl+A`; click empty
-  space to deselect.
+- **Multi-select** — click / `Ctrl`-click / `Shift`-click / `Ctrl+A`, or drag a
+  rubber band from empty space (`Ctrl`/`Shift` to add); click empty space to
+  deselect.
 - **Mouse** — side buttons go Back/Forward, and right-clicking those buttons
   lists the history. The `›` chevrons in the breadcrumb list a folder's
   subfolders. Right-click empty space for the folder's own menu (Paste, New
