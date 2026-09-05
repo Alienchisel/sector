@@ -24,10 +24,13 @@ went.
   **double-click it** to fit the widest visible row.
 - **Navigation** — a clickable breadcrumb (or `Alt+D` / `Ctrl+L` / `F4` to type
   a path), plus **Back/Forward/Up** (`Alt+←` / `Alt+→` / `Backspace` or `Alt+↑`)
-  with history.
-- **List** — Name / Size / Type / Modified, sortable, virtualized for huge
-  folders, file-type–colored. Folder sizes appear when a scan covers the folder.
-- **Filter** the current folder as you type (`Ctrl+F`), and a **hidden-files** toggle.
+  with history — each puts you back on the item you were on.
+- **List** — Name / Size / Type / Modified, sortable (remembered across
+  launches), resizable, virtualized for huge folders, file-type–colored. Folder
+  sizes appear when a scan covers the folder. The status bar shows the folder's
+  totals and the drive's free space.
+- **Filter** the current folder as you type (`Ctrl+F`), and a **hidden-files**
+  toggle that applies to the list and the folder tree alike.
 - **Details** panel (`Alt+Enter`, or the toolbar toggle) — path, sizes, dates,
   attributes.
 - **Multi-select** — click / `Ctrl`-click / `Shift`-click / `Ctrl+A`.

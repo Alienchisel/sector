@@ -158,6 +158,27 @@ enum SortKey {
     Modified,
 }
 
+impl SortKey {
+    /// Stable name for persistence (see [`Settings`]).
+    fn name(self) -> &'static str {
+        match self {
+            SortKey::Name => "name",
+            SortKey::Size => "size",
+            SortKey::Kind => "kind",
+            SortKey::Modified => "modified",
+        }
+    }
+
+    fn from_name(s: &str) -> Self {
+        match s {
+            "size" => SortKey::Size,
+            "kind" => SortKey::Kind,
+            "modified" => SortKey::Modified,
+            _ => SortKey::Name,
+        }
+    }
+}
+
 /// A short human "kind" for a listing entry (a `&'static str`, so sorting and
 /// drawing the Type column don't allocate).
 fn entry_kind(e: &Entry) -> &'static str {
@@ -379,6 +400,8 @@ fn main() -> eframe::Result<()> {
                 app.current_dir = PathBuf::from(&s.current_dir);
                 app.addr_edit = s.current_dir;
                 app.show_hidden = s.show_hidden;
+                app.sort_key = SortKey::from_name(&s.sort_key);
+                app.sort_asc = s.sort_asc;
             }
             Ok(Box::new(app))
         }),
@@ -444,8 +467,13 @@ struct SectorApp {
     show_hidden: bool,
     entries_err: Option<String>,
     entries_dirty: bool,
-    back_stack: Vec<PathBuf>,
-    fwd_stack: Vec<PathBuf>,
+    /// History: each entry is a folder plus the item you were on in it, so
+    /// Back/Forward put you back where you were (like `go_up` does).
+    back_stack: Vec<(PathBuf, Option<String>)>,
+    fwd_stack: Vec<(PathBuf, Option<String>)>,
+    /// Free / total bytes of the drive holding `current_dir` (one call per
+    /// navigation), for the status bar. `None` if unknown.
+    drive_space: Option<(u64, u64)>,
     sort_key: SortKey,
     sort_asc: bool,
     /// Selected entries, by name (stable across sort/filter). Source of truth for
@@ -585,6 +613,7 @@ impl Default for SectorApp {
             entries_dirty: true,
             back_stack: Vec::new(),
             fwd_stack: Vec::new(),
+            drive_space: None,
             sort_key: SortKey::Name,
             sort_asc: true,
             sel: HashSet::new(),
@@ -657,6 +686,15 @@ struct Settings {
     current_dir: String,
     #[serde(default)]
     show_hidden: bool,
+    /// File-list sort column (a [`SortKey::name`]) and direction.
+    #[serde(default)]
+    sort_key: String,
+    #[serde(default = "default_true")]
+    sort_asc: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl Default for Settings {
@@ -667,6 +705,8 @@ impl Default for Settings {
             replay_mode: false,
             current_dir: "C:\\".to_string(),
             show_hidden: false,
+            sort_key: "name".to_string(),
+            sort_asc: true,
         }
     }
 }
@@ -868,7 +908,8 @@ impl SectorApp {
             self.entries_dirty = true;
             return;
         }
-        self.back_stack.push(self.current_dir.clone());
+        let leaving = (self.current_dir.clone(), self.lead_name());
+        self.back_stack.push(leaving);
         self.fwd_stack.clear();
         self.current_dir = path;
         self.entries_dirty = true;
@@ -879,25 +920,40 @@ impl SectorApp {
         self.sb_reveal();
     }
 
+    /// The name of the item the cursor is on (to restore it when we return).
+    fn lead_name(&self) -> Option<String> {
+        self.lead_entry().map(|e| e.name.clone())
+    }
+
+    /// Jump to a history entry, returning the entry for where we were (folder +
+    /// item on the cursor) for the opposite stack. Once the folder loads, the
+    /// remembered item is re-selected and scrolled into view.
+    fn hop(&mut self, to: (PathBuf, Option<String>)) -> (PathBuf, Option<String>) {
+        let leaving = (self.current_dir.clone(), self.lead_name());
+        let (path, name) = to;
+        self.current_dir = path.clone();
+        self.entries_dirty = true;
+        self.clear_selection();
+        self.filter.clear();
+        self.sync_addr();
+        self.sb_reveal();
+        if let Some(n) = name {
+            self.select_after_reload = Some((path, n));
+        }
+        leaving
+    }
+
     fn go_back(&mut self) {
-        if let Some(p) = self.back_stack.pop() {
-            self.fwd_stack.push(std::mem::replace(&mut self.current_dir, p));
-            self.entries_dirty = true;
-            self.clear_selection();
-            self.filter.clear();
-            self.sync_addr();
-            self.sb_reveal();
+        if let Some(to) = self.back_stack.pop() {
+            let left = self.hop(to);
+            self.fwd_stack.push(left);
         }
     }
 
     fn go_forward(&mut self) {
-        if let Some(p) = self.fwd_stack.pop() {
-            self.back_stack.push(std::mem::replace(&mut self.current_dir, p));
-            self.entries_dirty = true;
-            self.clear_selection();
-            self.filter.clear();
-            self.sync_addr();
-            self.sb_reveal();
+        if let Some(to) = self.fwd_stack.pop() {
+            let left = self.hop(to);
+            self.back_stack.push(left);
         }
     }
 
@@ -1024,6 +1080,7 @@ impl SectorApp {
     }
 
     fn reload_entries(&mut self) {
+        self.drive_space = drive_space(&self.current_dir);
         // Refresh folder sizes first so the initial sort (by Size) can use them.
         self.recompute_folder_sizes();
         match list_dir(&self.current_dir) {
@@ -1117,8 +1174,12 @@ impl SectorApp {
         } else {
             String::new()
         };
+        let space = self
+            .drive_space
+            .map(|(free, total)| format!(" · {} free of {}", human_size(free), human_size(total)))
+            .unwrap_or_default();
         self.status_summary = format!(
-            "{prefix}{} items · {} folders · {} files · {}",
+            "{prefix}{} items · {} folders · {} files · {}{space}",
             commas(n as u64),
             commas(folders as u64),
             commas((n - folders) as u64),
@@ -1670,10 +1731,11 @@ impl SectorApp {
         if let Some(c) = self.sb_cache.get(path) {
             return c.clone();
         }
+        let show_hidden = self.show_hidden;
         let mut dirs: Vec<PathBuf> = match list_dir(path) {
             Ok(es) => es
                 .into_iter()
-                .filter(|e| e.is_dir && !e.is_symlink)
+                .filter(|e| e.is_dir && !e.is_symlink && (show_hidden || !e.is_hidden))
                 .map(|e| path.join(&e.name))
                 .collect(),
             Err(_) => Vec::new(),
@@ -1944,10 +2006,11 @@ impl SectorApp {
                 ui.separator();
                 if ui
                     .checkbox(&mut self.show_hidden, "Hidden")
-                    .on_hover_text("Show hidden / system files")
+                    .on_hover_text("Show hidden / system files (list and folder tree)")
                     .changed()
                 {
                     changed = true;
+                    self.sb_cache.clear(); // the tree obeys it too
                 }
                 if changed {
                     self.apply_filter();
@@ -2229,6 +2292,7 @@ impl SectorApp {
 
             let mut table = TableBuilder::new(ui)
                 .striped(true)
+                .resizable(true) // drag the header separators; widths persist
                 .sense(Sense::click())
                 .column(Column::remainder().at_least(220.0).clip(true))
                 .column(Column::auto().at_least(90.0))
@@ -3410,6 +3474,35 @@ fn enumerate_drives() -> Vec<PathBuf> {
     vec![PathBuf::from("/")]
 }
 
+/// Free (available to this user) and total bytes of the volume holding `path`
+/// — any folder on it will do. `None` if the volume can't be queried (e.g. a
+/// disconnected share).
+#[cfg(target_os = "windows")]
+fn drive_space(path: &Path) -> Option<(u64, u64)> {
+    use std::os::windows::ffi::OsStrExt;
+    extern "system" {
+        fn GetDiskFreeSpaceExW(
+            dir: *const u16,
+            free_to_caller: *mut u64,
+            total: *mut u64,
+            total_free: *mut u64,
+        ) -> i32;
+    }
+    // A bare share root ("\\srv\share") needs its trailing backslash.
+    let mut s = path.as_os_str().to_os_string();
+    if path.file_name().is_none() && !path.to_string_lossy().ends_with('\\') {
+        s.push("\\");
+    }
+    let wide: Vec<u16> = s.encode_wide().chain(std::iter::once(0)).collect();
+    let (mut avail, mut total, mut total_free) = (0u64, 0u64, 0u64);
+    let ok = unsafe { GetDiskFreeSpaceExW(wide.as_ptr(), &mut avail, &mut total, &mut total_free) };
+    (ok != 0 && total > 0).then_some((avail, total))
+}
+#[cfg(not(target_os = "windows"))]
+fn drive_space(_path: &Path) -> Option<(u64, u64)> {
+    None
+}
+
 /// Is `path` on a network drive? Network locations have NO Recycle Bin, so a
 /// "delete" there is permanent — the confirmation must say so. Uses
 /// `GetDriveTypeW` on the volume root (mapped drive "Y:\" or UNC "\\srv\share\").
@@ -3706,6 +3799,8 @@ impl eframe::App for SectorApp {
             replay_mode: self.anim_mode == AnimMode::Replay,
             current_dir: self.current_dir.to_string_lossy().into_owned(),
             show_hidden: self.show_hidden,
+            sort_key: self.sort_key.name().to_string(),
+            sort_asc: self.sort_asc,
         };
         eframe::set_value(storage, "settings", &s);
     }
@@ -4717,6 +4812,52 @@ mod tests {
         bytes.extend_from_slice(&0i32.to_le_bytes()); // fWide = 0
         bytes.extend_from_slice(b"C:\\a\0D:\\b\0\0");
         assert_eq!(hdrop_decode(&bytes), vec![PathBuf::from(r"C:\a"), PathBuf::from(r"D:\b")]);
+    }
+
+    /// A minimal listing entry for app-state tests.
+    fn entry(name: &str) -> Entry {
+        Entry {
+            name: name.into(),
+            is_dir: false,
+            size: 0,
+            modified: None,
+            created: None,
+            is_symlink: false,
+            is_hidden: false,
+            readonly: false,
+        }
+    }
+
+    #[test]
+    fn history_restores_the_item_you_were_on() {
+        let mut app = SectorApp::default();
+        app.current_dir = PathBuf::from("/a");
+        app.entries = vec![entry("one"), entry("two")];
+        app.lead = Some(1);
+
+        app.navigate_to(PathBuf::from("/b"));
+        assert_eq!(app.back_stack, vec![(PathBuf::from("/a"), Some("two".to_string()))]);
+        assert!(app.fwd_stack.is_empty());
+
+        // In /b the cursor is on nothing; Back must return to /a AND re-select "two".
+        app.entries.clear();
+        app.lead = None;
+        app.go_back();
+        assert_eq!(app.current_dir, PathBuf::from("/a"));
+        assert_eq!(app.select_after_reload, Some((PathBuf::from("/a"), "two".to_string())));
+        assert_eq!(app.fwd_stack, vec![(PathBuf::from("/b"), None)]);
+
+        app.go_forward();
+        assert_eq!(app.current_dir, PathBuf::from("/b"));
+        assert_eq!(app.back_stack, vec![(PathBuf::from("/a"), None)]); // cursor wasn't restored yet (no reload) — recorded as-is
+    }
+
+    #[test]
+    fn sort_key_round_trips_through_its_name() {
+        for k in [SortKey::Name, SortKey::Size, SortKey::Kind, SortKey::Modified] {
+            assert!(SortKey::from_name(k.name()) == k);
+        }
+        assert!(SortKey::from_name("") == SortKey::Name); // old settings files
     }
 
     #[test]
