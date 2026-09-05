@@ -2043,11 +2043,15 @@ impl SectorApp {
                 TreeAct::Delete => self.request_delete_dir(path.clone()),
                 TreeAct::Rename => self.open_rename_dir_at(path.clone()),
                 TreeAct::NewFolder => {
+                    // Load the target folder NOW so the proposed name (and the
+                    // clash check) are against its listing, not the old one's.
                     self.navigate_to(path.clone());
+                    self.reload_entries();
                     self.open_new_folder();
                 }
                 TreeAct::Props => {
                     self.navigate_to(path.clone());
+                    self.reload_entries(); // Details describes this folder at once
                     self.clear_selection();
                     self.props_visible = true;
                 }
@@ -2481,9 +2485,10 @@ impl SectorApp {
             if bg.clicked() {
                 bg_act = Some(BgAct::Deselect);
             }
-            // A drag from empty space starts a rubber-band selection. Ctrl/Shift
-            // add to the current selection; a plain drag replaces it.
-            if bg.drag_started() {
+            // A (left-button) drag from empty space starts a rubber-band
+            // selection. Ctrl/Shift add to the current selection; a plain drag
+            // replaces it.
+            if bg.drag_started_by(egui::PointerButton::Primary) {
                 let additive = ui.ctx().input(|i| i.modifiers.ctrl || i.modifiers.shift);
                 let base = if additive { self.sel.clone() } else { HashSet::new() };
                 let start = bg.interact_pointer_pos().unwrap_or(bg.rect.min);
@@ -2720,11 +2725,15 @@ impl SectorApp {
                         });
                         let full = cur.join(&e.name);
                         // Hover: the full (unclipped) name + essentials, like Explorer.
-                        let resp = row.response().on_hover_text(row_tooltip(e, folder_sizes.as_ref()));
+                        // (`on_hover_ui` is lazy — the text is built only when shown.)
+                        let resp = row.response().on_hover_ui(|ui| {
+                            ui.label(row_tooltip(e, folder_sizes.as_ref()));
+                        });
                         row_rects.push((row_index, resp.rect));
                         // Drag source: dragging a selected row drags the whole
                         // selection; dragging an unselected row drags just it.
-                        if resp.drag_started() {
+                        // Primary button only — a right-drag must not move files.
+                        if resp.drag_started_by(egui::PointerButton::Primary) {
                             let paths: Vec<PathBuf> = if sel.contains(&e.name) {
                                 entries.iter().filter(|x| sel.contains(&x.name)).map(|x| cur.join(&x.name)).collect()
                             } else {
