@@ -40,7 +40,8 @@ went.
   lists the history. The `›` chevrons in the breadcrumb list a folder's
   subfolders. Right-click empty space for the folder's own menu (Paste, New
   folder, …), right-click a folder in the tree for its menu, and hover a row for
-  its full name and details.
+  its full name and details. `Ctrl`+wheel (or `Ctrl+=` / `Ctrl+-` / `Ctrl+0`)
+  zooms the whole UI, remembered across launches.
 
 ### File operations
 

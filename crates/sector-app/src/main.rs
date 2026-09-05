@@ -4289,6 +4289,15 @@ impl eframe::App for SectorApp {
         let ctx = ui.ctx().clone();
         self.menu_open_at_start = egui::Popup::is_any_open(&ctx);
 
+        // Ctrl+wheel (and touchpad pinch) zoom the UI, like Ctrl+= / Ctrl+- do.
+        // egui already turns those gestures into a zoom delta (and keeps them
+        // away from the scroll areas); it just doesn't apply it by itself.
+        let zoom = ctx.input(|i| i.zoom_delta());
+        if zoom != 1.0 {
+            let z = (ctx.zoom_factor() * zoom).clamp(0.5, 3.0);
+            ctx.set_zoom_factor(z);
+        }
+
         // Reflect the current folder in the window/taskbar title (only on change).
         let title = format!("{} — {}", sector_core::APP_NAME, self.current_dir.display());
         if title != self.last_title {
