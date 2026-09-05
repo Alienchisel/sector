@@ -74,6 +74,9 @@ Flip to **City** to render the current folder as a 2.5D isometric cityscape:
 
 - **Area = size** · **Height = file count** · **Color = file type**
 - **Live discovery build** — the map rises as it scans, not a blank spinner.
+- **Auto-scan** — entering a local folder with no cityscape yet starts its
+  scan so you watch it build; network drives and drive roots wait for **Scan**
+  (a toggle in the City bar turns this off).
 - **Instant reopen** — each scan is cached compactly, so reopening an 82 TB drive
   takes ~1 second instead of minutes.
 - **Freshness (local NTFS)** — the USN change journal tells you whether a cached

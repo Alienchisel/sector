@@ -496,3 +496,23 @@ Bolting a tree onto the City would make it a list-view's chrome wrapped around a
 picture, instead of a committed spatial map. Keeping the tree with the working
 view gives each mode a crisp reason to exist: **Files is for working, City is for
 seeing.** ("for now" — a later split/side-by-side layout isn't foreclosed.)
+
+## D20 — Auto-scan local folders on entry (network drives and drive roots still prompt)
+
+**Decided (2026-09-05):** Entering a folder in the City view that has no
+cityscape — no loaded parent tree to re-root into (D18's within-tree re-root
+now covers drilling down) and no cache — starts its scan automatically **if
+the folder is on a local drive and is not a drive root.** Network drives and
+drive roots keep the explicit **Scan** prompt. A persisted toggle ("Auto-scan
+local", default on) turns it off.
+
+**Why.** D18's "a deep scan stays deliberate" exists to protect the NAS: a
+ten-minute walk that hammers a share must not fire because someone clicked a
+folder. That reasoning does not apply to a local subfolder, which scans in
+seconds — and the live discovery build (D12) *is* the experience, cancellable
+at any moment. Requiring a click to see it was friction with nothing to
+protect. Drive roots stay deliberate because a full local drive is a
+minute-plus and millions of nodes.
+
+**Supersedes:** the blanket "never auto-fired" clause of D18 for local,
+non-root folders. Everything else in D18 stands.

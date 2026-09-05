@@ -252,6 +252,8 @@ safest-first — destructive ops must be bulletproof (see D16, D1).
   **Within-tree re-root ✅** (2026-09-05): navigating to a folder inside the
   loaded tree (address bar, Up, Back, the Files tree) re-roots the City there
   instantly instead of reloading; the City's own breadcrumb is gone.
+  **Auto-scan local ✅** (D20): a local, non-root folder with no cityscape is
+  scanned on entry; network drives and drive roots still prompt.
 - **E3 — Read-only actions  ✅**: double-click / Enter opens (default app for
   files, in-app navigate for folders), right-click menu (Open · Reveal/Open in
   Explorer · Copy path · Copy name), Backspace = up. **Properties/Details panel ✅** (in-app,

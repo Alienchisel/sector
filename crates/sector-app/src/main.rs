@@ -525,6 +525,7 @@ fn main() -> eframe::Result<()> {
                 app.show_hidden = s.show_hidden;
                 app.sort_key = SortKey::from_name(&s.sort_key);
                 app.sort_asc = s.sort_asc;
+                app.auto_scan_local = s.auto_scan_local;
             }
             Ok(Box::new(app))
         }),
@@ -548,6 +549,9 @@ enum ScanState {
 struct SectorApp {
     /// Worker threads to use for the next scan (tunable — see DEFAULT_THREADS).
     threads: usize,
+    /// D20: scan a LOCAL folder automatically on entering it with no
+    /// cityscape (never a network drive or a drive root).
+    auto_scan_local: bool,
     scan: ScanState,
     /// Current drill-down root (navigates via the tree's parent chain).
     root: NodeId,
@@ -718,6 +722,7 @@ impl Default for SectorApp {
     fn default() -> Self {
         SectorApp {
             threads: DEFAULT_THREADS,
+            auto_scan_local: true,
             scan: ScanState::Idle,
             root: Tree::ROOT,
             // Blend "dark-but-breathing" density (D15): a touch more street
@@ -829,6 +834,9 @@ struct Settings {
     sort_key: String,
     #[serde(default = "default_true")]
     sort_asc: bool,
+    /// D20: auto-scan local folders on entering them without a cityscape.
+    #[serde(default = "default_true")]
+    auto_scan_local: bool,
 }
 
 fn default_true() -> bool {
@@ -845,6 +853,7 @@ impl Default for Settings {
             show_hidden: false,
             sort_key: "name".to_string(),
             sort_asc: true,
+            auto_scan_local: true,
         }
     }
 }
@@ -981,6 +990,20 @@ impl SectorApp {
         self.refresh_status_summary();
     }
 
+    /// No cityscape for the current folder: auto-scan it if that's a LOCAL,
+    /// non-root folder and the setting is on (D20 — the live discovery build is
+    /// the point, and a local subfolder is seconds); otherwise the idle
+    /// scan-prompt (network drives and drive roots always wait for Scan).
+    fn city_no_cache(&mut self) {
+        let dir = &self.current_dir;
+        let eligible = self.auto_scan_local && dir.parent().is_some() && !is_network_path(dir);
+        if eligible {
+            self.start_scan();
+        } else {
+            self.city_idle();
+        }
+    }
+
     /// Drop the City to its idle scan-prompt: cancel any running scan and
     /// clear the scene.
     fn city_idle(&mut self) {
@@ -1013,7 +1036,7 @@ impl SectorApp {
         if has_cache {
             self.start_cache_load();
         } else {
-            self.city_idle();
+            self.city_no_cache();
         }
         self.city_root = Some(cur.clone());
         self.city_synced_dir = Some(cur);
@@ -4310,6 +4333,7 @@ impl eframe::App for SectorApp {
             show_hidden: self.show_hidden,
             sort_key: self.sort_key.name().to_string(),
             sort_asc: self.sort_asc,
+            auto_scan_local: self.auto_scan_local,
         };
         eframe::set_value(storage, "settings", &s);
     }
@@ -4363,7 +4387,7 @@ impl eframe::App for SectorApp {
                     Ok(lc) => self.install_cache(lc),
                     Err(e) => {
                         eprintln!("[sector] cache: load failed: {e}");
-                        self.city_idle();
+                        self.city_no_cache();
                     }
                 }
             }
@@ -4673,6 +4697,10 @@ impl eframe::App for SectorApp {
                         )
                         .on_hover_text("Replay duration — drag to change the pace, then Load cached again.");
                     }
+
+                    ui.separator();
+                    ui.checkbox(&mut self.auto_scan_local, "Auto-scan local")
+                        .on_hover_text("Entering a local folder that has no cityscape yet starts its scan (watch it build). Network drives and drive roots always wait for Scan.");
 
                     // Offer an instant load if a cache exists for this folder
                     // (age precomputed in sync_city — no per-frame stat).
