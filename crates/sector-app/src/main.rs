@@ -176,22 +176,32 @@ struct LoadedCache {
     dominant: Vec<FileCategory>,
 }
 
+/// Why a cache couldn't be loaded. `unusable` means the FILE is the problem
+/// (older format, corrupt, wrong folder) and may be deleted; a read error or a
+/// dead worker says nothing about the file, so it must be kept.
+struct CacheLoadError {
+    msg: String,
+    unusable: bool,
+}
+
 /// Read + validate + prepare a cache file for `dir`. Pure; runs off-thread.
-fn load_cache_file(cp: &Path, dir: &Path) -> Result<LoadedCache, String> {
-    let bytes = std::fs::read(cp).map_err(|e| format!("read {}: {e}", cp.display()))?;
+fn load_cache_file(cp: &Path, dir: &Path) -> Result<LoadedCache, CacheLoadError> {
+    let keep = |msg: String| CacheLoadError { msg, unusable: false };
+    let bad = |msg: String| CacheLoadError { msg, unusable: true };
+    let bytes = std::fs::read(cp).map_err(|e| keep(format!("couldn't read {}: {e}", cp.display())))?;
     let (tree, stats) = Tree::from_cache_bytes(&bytes).ok_or_else(|| {
-        match Tree::cache_format_version(&bytes) {
+        bad(match Tree::cache_format_version(&bytes) {
             Some(v) if v != Tree::CACHE_FORMAT => {
                 format!("it was written by an older SECTOR (format v{v}, current v{})", Tree::CACHE_FORMAT)
             }
             _ => "the file is corrupt".to_string(),
-        }
+        })
     })?;
     // Verify the cache is really THIS folder — guards against a (rare) hash-key
     // collision or a mismatched/renamed file loading the wrong tree.
     let cached_root = tree.node(Tree::ROOT).name.to_string();
     if normalize_cache_key(&cached_root) != normalize_cache_key(&dir.to_string_lossy()) {
-        return Err(format!("root mismatch — cached {cached_root:?} != {dir:?}"));
+        return Err(bad(format!("the file is for {cached_root:?}, not this folder")));
     }
     let dominant = tree.dominant_categories();
     eprintln!("[sector] cache: loaded {} nodes, {} files for {}", tree.len(), stats.files, dir.display());
@@ -720,7 +730,7 @@ struct SectorApp {
     city_note: Option<String>,
     /// A cache load in progress on a background thread, and the folder it is
     /// for (a result that arrives after navigating elsewhere is dropped).
-    cache_load: Option<(Receiver<Result<LoadedCache, String>>, PathBuf)>,
+    cache_load: Option<(Receiver<Result<LoadedCache, CacheLoadError>>, PathBuf)>,
     /// The path the loaded City tree is rooted at (its scan/cache-load target).
     city_root: Option<PathBuf>,
     /// The location the City view currently represents (root, or a drilled-in
@@ -949,7 +959,7 @@ impl SectorApp {
         let dir = self.current_dir.clone();
         let Some(cp) = cache_path_for(&dir.to_string_lossy()) else {
             eprintln!("[sector] cache: no cache dir");
-            self.city_idle();
+            self.city_no_cache();
             return;
         };
         // The City now belongs to this load: stop any running scan and clear
@@ -1031,6 +1041,7 @@ impl SectorApp {
         self.reveal_start = None;
         self.menu_target = None;
         self.cache_freshness = Freshness::Unknown;
+        self.city_note = None;
     }
 
     /// Point the City at `current_dir` (E2). Instant cache-load if one exists;
@@ -2071,8 +2082,9 @@ impl SectorApp {
         if scroll_here {
             resp.scroll_to_me(Some(egui::Align::Center));
         }
-        // A click on the triangle toggles; anywhere else navigates.
-        if resp.clicked() {
+        // A click on the triangle toggles; anywhere else navigates — unless the
+        // click merely dismissed a menu.
+        if resp.clicked() && !self.menu_open_at_start {
             if resp.interact_pointer_pos().map(|p| tri_rect.contains(p)).unwrap_or(false) {
                 toggle = true;
             } else {
@@ -2308,7 +2320,8 @@ impl SectorApp {
                     }
                 });
             }
-            if bar.clicked() {
+            if bar.clicked() && !self.menu_open_at_start {
+                // (A click that merely dismissed a chevron menu doesn't count.)
                 self.begin_addr_edit();
             }
             if let Some(p) = go {
@@ -2572,13 +2585,16 @@ impl SectorApp {
             // the folder is empty or unreadable.
             let bg = ui.interact(ui.max_rect(), egui::Id::new("files_bg"), Sense::click_and_drag());
             let mut bg_act: Option<BgAct> = None;
-            if bg.clicked() {
+            // (A click that merely dismissed a context menu doesn't deselect or
+            // start a band — Windows consumes that click too.)
+            let dismissing = self.menu_open_at_start;
+            if bg.clicked() && !dismissing {
                 bg_act = Some(BgAct::Deselect);
             }
             // A (left-button) drag from empty space starts a rubber-band
             // selection. Ctrl/Shift add to the current selection; a plain drag
             // replaces it.
-            if bg.drag_started_by(egui::PointerButton::Primary) {
+            if bg.drag_started_by(egui::PointerButton::Primary) && !dismissing {
                 let additive = ui.ctx().input(|i| i.modifiers.ctrl || i.modifiers.shift);
                 let base = if additive { self.sel.clone() } else { HashSet::new() };
                 let start = bg.interact_pointer_pos().unwrap_or(bg.rect.min);
@@ -4383,13 +4399,15 @@ impl eframe::App for SectorApp {
 
         // Poll a background cache load (City). A result for a folder we've
         // since left is dropped; sync_city will start the right one.
-        let mut loaded: Option<(Result<LoadedCache, String>, PathBuf)> = None;
+        let mut loaded: Option<(Result<LoadedCache, CacheLoadError>, PathBuf)> = None;
         if let Some((rx, dir)) = &self.cache_load {
             match rx.try_recv() {
                 Ok(r) => loaded = Some((r, dir.clone())),
                 Err(std::sync::mpsc::TryRecvError::Empty) => ctx.request_repaint(),
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    loaded = Some((Err("cache loader stopped unexpectedly".into()), dir.clone()));
+                    // The worker died; that says nothing about the file.
+                    let e = CacheLoadError { msg: "the loader stopped unexpectedly".into(), unusable: false };
+                    loaded = Some((Err(e), dir.clone()));
                 }
             }
         }
@@ -4399,12 +4417,12 @@ impl eframe::App for SectorApp {
                 match result {
                     Ok(lc) => self.install_cache(lc),
                     Err(e) => {
-                        eprintln!("[sector] cache: load failed: {e}");
-                        // A cache that can't be loaded (older format, corrupt,
-                        // wrong folder) is useless: drop the file so the
-                        // "Load cached" button stops offering it, and say why.
-                        // A plain read error keeps the file (it may be transient).
-                        if !e.starts_with("read ") {
+                        eprintln!("[sector] cache: load failed: {}", e.msg);
+                        // An UNUSABLE file (older format, corrupt, wrong folder)
+                        // is deleted so the "Load cached" button stops offering
+                        // it and a rescan writes a fresh one. A read error or a
+                        // dead worker keeps the file.
+                        if e.unusable {
                             if let Some(cp) = cache_path_for(&dir.to_string_lossy()) {
                                 let _ = std::fs::remove_file(cp);
                             }
@@ -4413,7 +4431,8 @@ impl eframe::App for SectorApp {
                         self.city_no_cache();
                         if matches!(self.scan, ScanState::Idle) {
                             self.city_note = Some(format!(
-                                "Couldn't load the cached scan — {e}. Press Scan to rebuild it."
+                                "Couldn't load the cached scan — {}. Press Scan to rebuild it.",
+                                e.msg
                             ));
                         }
                     }
@@ -4464,7 +4483,11 @@ impl eframe::App for SectorApp {
                 // end of this frame so the crystallize re-layout gets the lock
                 // first). Skip cancelled/partial scans.
                 if let Some(st) = stats {
-                    if !st.cancelled {
+                    // Not for a cancelled scan, nor for a root that couldn't be
+                    // read at all (nothing found + errors): that "cache" would
+                    // only hide the real, unreadable folder behind an empty city.
+                    let unreadable = st.dirs == 0 && st.files == 0 && st.errors > 0;
+                    if !st.cancelled && !unreadable {
                         if let Some(cp) = cache_path_for(&root_name) {
                             let mark = self.pending_usn_mark.unwrap_or(UsnMark::NONE);
                             let cs = CacheStats {
@@ -5051,7 +5074,11 @@ impl eframe::App for SectorApp {
             // Route through navigate_to so a City drill joins the shared history
             // (Back undoes it), updates the address bar, and reveals the Files
             // tree — then mark it synced so this doesn't trigger a City re-sync.
-            if t != self.current_dir {
+            // Case-insensitive: the tree has the real casing, `current_dir` has
+            // whatever was typed — a case-only difference is the same folder,
+            // and must not push a phantom history entry.
+            let same = t.to_string_lossy().to_lowercase() == self.current_dir.to_string_lossy().to_lowercase();
+            if !same {
                 self.navigate_to(t);
             }
             self.city_synced_dir = Some(self.current_dir.clone());
