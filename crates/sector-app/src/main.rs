@@ -2202,7 +2202,9 @@ impl SectorApp {
             let mut go: Option<PathBuf> = None;
             let segs = breadcrumb_segments(&self.current_dir);
             let last = segs.len().saturating_sub(1);
-            ui.spacing_mut().item_spacing.x = 2.0;
+            // Breathing room between segments and their chevrons (the chevrons
+            // are buttons now, so a tight gap reads as one run of text).
+            ui.spacing_mut().item_spacing.x = 7.0;
             for (i, (label, path)) in segs.iter().enumerate() {
                 if i == last {
                     ui.strong(label); // current folder — not a link
