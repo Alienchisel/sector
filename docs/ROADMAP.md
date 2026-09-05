@@ -268,7 +268,10 @@ safest-first — destructive ops must be bulletproof (see D16, D1).
   **Undo ✅** (Ctrl+Z): a session undo stack of rename / new folder / paste
   (per-item records, so a partial paste undoes what actually happened) /
   delete (restored from the Recycle Bin via `trash::os_limited`). Reversals run
-  on the background worker and never overwrite. *Redo not yet.*
+  on the background worker and never overwrite. **Redo ✅** (Ctrl+Y /
+  Ctrl+Shift+Z): every reversal yields its exact inverse (from where things
+  actually landed), which goes on the opposite stack; a new operation clears
+  redo.
   **Inbound drag-and-drop ✅** — files dropped on the window (from Explorer or
   any app) are copied into the current folder via the paste engine, with a
   full-window drop overlay. Copy only: the OS drag owns the keyboard, and

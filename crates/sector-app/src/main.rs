@@ -92,34 +92,47 @@ struct DeleteOutcome {
     error: Option<String>,
 }
 
-/// One undoable file operation (session-only; Ctrl+Z pops the latest).
-#[derive(Clone)]
+/// A reversal to execute — what Undo (or Redo) actually does. Each one, once
+/// run, yields its own inverse, which is what makes Redo possible.
+#[derive(Clone, Debug, PartialEq)]
 enum UndoOp {
-    /// Undo by renaming `from` (the current name) back to `to`.
+    /// Rename `from` (the current name) to `to`.
     Rename { from: PathBuf, to: PathBuf },
-    /// Undo by removing the folder — only while it is still empty.
-    NewFolder { path: PathBuf },
-    /// A paste-copy: undo by deleting the copies (Recycle Bin where possible).
-    Copied { dsts: Vec<PathBuf> },
-    /// A paste-move: undo by moving each `dst` back to `src`.
-    Moved { pairs: Vec<(PathBuf, PathBuf)> },
-    /// A delete to the Recycle Bin: undo by restoring these original paths.
-    Recycled { paths: Vec<PathBuf> },
+    /// Remove a folder — only while it is empty.
+    RemoveDir { path: PathBuf },
+    /// Re-create an (empty) folder.
+    MakeDir { path: PathBuf },
+    /// Send these to the Recycle Bin (permanent on network drives).
+    Trash { paths: Vec<PathBuf> },
+    /// Move each `.1` back to `.0` (its original name at its original parent).
+    MoveBack { pairs: Vec<(PathBuf, PathBuf)> },
+    /// Restore these original paths from the Recycle Bin.
+    Restore { paths: Vec<PathBuf> },
 }
 
-impl UndoOp {
-    fn label(&self) -> &'static str {
-        match self {
-            UndoOp::Rename { .. } => "rename",
-            UndoOp::NewFolder { .. } => "new folder",
-            UndoOp::Copied { .. } => "copy",
-            UndoOp::Moved { .. } => "move",
-            UndoOp::Recycled { .. } => "delete",
-        }
+/// An undo/redo stack entry: the reversal to run, labelled with the USER's
+/// action it reverses ("Undo rename", "Redo delete").
+#[derive(Clone)]
+struct UndoEntry {
+    op: UndoOp,
+    label: &'static str,
+}
+
+impl UndoEntry {
+    fn new(op: UndoOp, label: &'static str) -> Self {
+        UndoEntry { op, label }
     }
 }
 
-/// How many operations Undo remembers.
+/// What a reversal achieved: the item to select, and the inverse operation
+/// (built from where things actually landed) for the opposite stack.
+#[derive(Debug)]
+struct UndoDone {
+    select: Option<PathBuf>,
+    inverse: Option<UndoOp>,
+}
+
+/// How many operations Undo (and Redo) remember.
 const UNDO_CAP: usize = 50;
 /// How many folders the Back/Forward history menus list.
 const HISTORY_MENU: usize = 12;
@@ -595,11 +608,14 @@ struct SectorApp {
     confirm_delete: Option<Vec<PathBuf>>,
     /// A background delete-to-Recycle-Bin in progress.
     delete_job: Option<Receiver<DeleteOutcome>>,
-    /// Undo stack, newest last (session-only).
-    undo: Vec<UndoOp>,
-    /// An undo running on a background thread, with the op being undone (so
-    /// the view can follow a renamed/removed current folder afterwards).
-    undo_job: Option<(Receiver<Result<Option<PathBuf>, String>>, UndoOp)>,
+    /// Undo stack, newest last (session-only). Any new operation clears `redo`.
+    undo: Vec<UndoEntry>,
+    /// Redo stack: the inverses of what Undo has run, newest last.
+    redo: Vec<UndoEntry>,
+    /// A reversal running on a background thread: the receiver, the entry
+    /// being run (so the view can follow a renamed/removed current folder),
+    /// and whether it is a redo (which stack gets the inverse).
+    undo_job: Option<(Receiver<Result<UndoDone, String>>, UndoEntry, bool)>,
     /// Transient error from the last edit/paste, shown in the footer.
     op_error: Option<String>,
     /// True while the address bar has (or just lost) focus — suppresses the file
@@ -717,6 +733,7 @@ impl Default for SectorApp {
             confirm_delete: None,
             delete_job: None,
             undo: Vec::new(),
+            redo: Vec::new(),
             undo_job: None,
             op_error: None,
             cache_mtime: None,
@@ -1442,7 +1459,7 @@ impl SectorApp {
                 let target = self.current_dir.join(&name);
                 std::fs::create_dir(&target)
                     .map_err(|e| format!("Couldn't create the folder: {e}"))?;
-                self.push_undo(UndoOp::NewFolder { path: target });
+                self.push_undo(UndoEntry::new(UndoOp::RemoveDir { path: target }, "new folder"));
                 self.after_edit(name);
             }
             PromptKind::Rename { orig } => {
@@ -1462,7 +1479,7 @@ impl SectorApp {
                     return Err("An item with that name already exists.".into());
                 }
                 std::fs::rename(&src, &dst).map_err(|e| format!("Couldn't rename: {e}"))?;
-                self.push_undo(UndoOp::Rename { from: dst, to: src });
+                self.push_undo(UndoEntry::new(UndoOp::Rename { from: dst, to: src }, "rename"));
                 self.after_edit(name);
             }
             PromptKind::RenameDir { dir } => {
@@ -1485,7 +1502,10 @@ impl SectorApp {
                     return Err("An item with that name already exists.".into());
                 }
                 std::fs::rename(dir, &dst).map_err(|e| format!("Couldn't rename: {e}"))?;
-                self.push_undo(UndoOp::Rename { from: dst.clone(), to: dir.clone() });
+                self.push_undo(UndoEntry::new(
+                    UndoOp::Rename { from: dst.clone(), to: dir.clone() },
+                    "rename",
+                ));
                 // Follow the folder to its new name if we're in it (or inside
                 // it) — in place, not a history step.
                 if self.sb_expanded.remove(dir) {
@@ -1733,26 +1753,38 @@ impl SectorApp {
         self.paste_job.is_some() || self.delete_job.is_some() || self.undo_job.is_some()
     }
 
-    fn push_undo(&mut self, op: UndoOp) {
-        self.undo.push(op);
+    /// Record a new user operation. This forks history: the redo stack goes.
+    fn push_undo(&mut self, entry: UndoEntry) {
+        self.undo.push(entry);
         if self.undo.len() > UNDO_CAP {
             self.undo.remove(0);
         }
+        self.redo.clear();
     }
 
     /// Ctrl+Z: reverse the most recent operation on a background thread.
     fn start_undo(&mut self) {
+        self.start_reversal(false);
+    }
+
+    /// Ctrl+Y: re-apply the most recently undone operation.
+    fn start_redo(&mut self) {
+        self.start_reversal(true);
+    }
+
+    fn start_reversal(&mut self, redo: bool) {
         if self.file_op_running() {
             return;
         }
-        let Some(op) = self.undo.pop() else { return };
+        let stack = if redo { &mut self.redo } else { &mut self.undo };
+        let Some(entry) = stack.pop() else { return };
         let (tx, rx) = channel();
-        let work = op.clone();
+        let work = entry.op.clone();
         std::thread::spawn(move || {
             let _ = tx.send(run_undo(work));
         });
         self.op_error = None;
-        self.undo_job = Some((rx, op));
+        self.undo_job = Some((rx, entry, redo));
     }
 
     /// Refresh views after a background op touched `item`; if it lives in the
@@ -2376,12 +2408,13 @@ impl SectorApp {
             let mut cancel_paste = false;
             let mut clear_err = false;
             let mut undo_req = false;
+            let mut redo_req = false;
             egui::Panel::bottom("files_status").show(ui, |ui| {
                 ui.horizontal(|ui| {
                     // A running paste/delete/undo takes over the footer with a spinner.
-                    if let Some((_, op)) = &self.undo_job {
+                    if let Some((_, entry, redo)) = &self.undo_job {
                         ui.spinner();
-                        ui.label(format!("Undoing {}…", op.label()));
+                        ui.label(format!("{} {}…", if *redo { "Redoing" } else { "Undoing" }, entry.label));
                     } else if self.delete_job.is_some() {
                         ui.spinner();
                         ui.label("Moving to Recycle Bin…");
@@ -2407,14 +2440,16 @@ impl SectorApp {
                             let verb = if c.cut { "cut" } else { "copied" };
                             ui.weak(format!("📋 {} {verb}", c.paths.len()));
                         }
-                        if let Some(op) = self.undo.last() {
+                        if let Some(e) = self.undo.last() {
                             ui.separator();
-                            if ui
-                                .small_button(format!("↶ Undo {}", op.label()))
-                                .on_hover_text("Ctrl+Z")
-                                .clicked()
-                            {
+                            if ui.small_button(format!("↶ Undo {}", e.label)).on_hover_text("Ctrl+Z").clicked() {
                                 undo_req = true;
+                            }
+                        }
+                        if let Some(e) = self.redo.last() {
+                            ui.separator();
+                            if ui.small_button(format!("↷ Redo {}", e.label)).on_hover_text("Ctrl+Y").clicked() {
+                                redo_req = true;
                             }
                         }
                     }
@@ -2422,6 +2457,9 @@ impl SectorApp {
             });
             if undo_req {
                 self.start_undo();
+            }
+            if redo_req {
+                self.start_redo();
             }
             if cancel_paste {
                 if let Some(job) = &self.paste_job {
@@ -3034,6 +3072,14 @@ impl SectorApp {
             // Ctrl+Z: undo the last rename / new folder / paste / delete.
             if ui.input(|i| i.modifiers.ctrl && !i.modifiers.shift && i.key_pressed(egui::Key::Z)) {
                 self.start_undo();
+            }
+            // Ctrl+Y / Ctrl+Shift+Z: redo.
+            if ui.input(|i| {
+                i.modifiers.ctrl
+                    && ((!i.modifiers.shift && i.key_pressed(egui::Key::Y))
+                        || (i.modifiers.shift && i.key_pressed(egui::Key::Z)))
+            }) {
+                self.start_redo();
             }
             // Delete → Recycle Bin (with a confirmation).
             if ui.input(|i| i.key_pressed(egui::Key::Delete)) {
@@ -3742,8 +3788,9 @@ fn move_back(dst: &Path, src: &Path) -> Result<PathBuf, String> {
     Ok(target)
 }
 
-/// Worker body for Undo: reverse `op`. Returns the item to select afterwards.
-fn run_undo(op: UndoOp) -> Result<Option<PathBuf>, String> {
+/// Worker body for Undo/Redo: execute the reversal `op`. Returns the item to
+/// select afterwards and the inverse to put on the opposite stack.
+fn run_undo(op: UndoOp) -> Result<UndoDone, String> {
     match op {
         UndoOp::Rename { from, to } => {
             let case_only = name_of(&from).to_lowercase() == name_of(&to).to_lowercase();
@@ -3751,43 +3798,63 @@ fn run_undo(op: UndoOp) -> Result<Option<PathBuf>, String> {
                 return Err(format!("Can't undo the rename: something is now named “{}”.", name_of(&to)));
             }
             std::fs::rename(&from, &to).map_err(|e| format!("Couldn't undo the rename: {e}"))?;
-            Ok(Some(to))
+            let inverse = Some(UndoOp::Rename { from: to.clone(), to: from });
+            Ok(UndoDone { select: Some(to), inverse })
         }
-        UndoOp::NewFolder { path } => {
+        UndoOp::RemoveDir { path } => {
             // remove_dir refuses a non-empty folder — exactly the safety we want.
             std::fs::remove_dir(&path).map_err(|e| {
                 format!("Couldn't remove “{}” — it may no longer be empty ({e}).", name_of(&path))
             })?;
-            Ok(None)
+            Ok(UndoDone { select: None, inverse: Some(UndoOp::MakeDir { path }) })
         }
-        UndoOp::Copied { dsts } => {
+        UndoOp::MakeDir { path } => {
+            std::fs::create_dir(&path)
+                .map_err(|e| format!("Couldn't re-create “{}”: {e}", name_of(&path)))?;
+            let inverse = Some(UndoOp::RemoveDir { path: path.clone() });
+            Ok(UndoDone { select: Some(path), inverse })
+        }
+        UndoOp::Trash { paths } => {
             let mut errors = Vec::new();
-            for d in &dsts {
+            let mut recycled = Vec::new();
+            for d in &paths {
                 let r = if is_network_path(d) {
-                    remove_any(d).map_err(|e| e.to_string())
+                    remove_any(d).map(|()| false).map_err(|e| e.to_string())
                 } else {
-                    trash::delete(d).map_err(|e| e.to_string())
+                    trash::delete(d).map(|()| true).map_err(|e| e.to_string())
                 };
-                if let Err(e) = r {
-                    errors.push(format!("{}: {e}", name_of(d)));
+                match r {
+                    Ok(true) => recycled.push(d.clone()),
+                    Ok(false) => {}
+                    Err(e) => errors.push(format!("{}: {e}", name_of(d))),
                 }
             }
-            if errors.is_empty() {
-                Ok(None)
-            } else {
-                Err(format!("Couldn't remove some copies: {}", errors.join("; ")))
+            if !errors.is_empty() {
+                return Err(format!("Couldn't remove some items: {}", errors.join("; ")));
             }
+            // Only what reached the Recycle Bin can be brought back.
+            let inverse = (!recycled.is_empty()).then_some(UndoOp::Restore { paths: recycled });
+            Ok(UndoDone { select: None, inverse })
         }
-        UndoOp::Moved { pairs } => {
-            let mut last = None;
+        UndoOp::MoveBack { pairs } => {
+            // Reverse order (later items first), recording where each actually
+            // landed — a taken name means "… - Copy" — so the inverse is exact.
+            let mut landed: Vec<(PathBuf, PathBuf)> = Vec::new();
             for (src, dst) in pairs.iter().rev() {
-                last = Some(move_back(dst, src).map_err(|e| {
-                    format!("Couldn't move “{}” back: {e}", name_of(dst))
-                })?);
+                let t = move_back(dst, src)
+                    .map_err(|e| format!("Couldn't move “{}” back: {e}", name_of(dst)))?;
+                landed.push((dst.clone(), t));
             }
-            Ok(last)
+            landed.reverse();
+            let select = landed.first().map(|(_, t)| t.clone());
+            Ok(UndoDone { select, inverse: Some(UndoOp::MoveBack { pairs: landed }) })
         }
-        UndoOp::Recycled { paths } => restore_from_trash(&paths),
+        UndoOp::Restore { paths } => {
+            let restored = restore_from_trash(&paths)?;
+            let select = restored.last().cloned();
+            let inverse = (!restored.is_empty()).then_some(UndoOp::Trash { paths: restored });
+            Ok(UndoDone { select, inverse })
+        }
     }
 }
 
@@ -3795,7 +3862,7 @@ fn run_undo(op: UndoOp) -> Result<Option<PathBuf>, String> {
 /// came from each path). Never overwrites: the trash crate refuses to restore
 /// over an existing file.
 #[cfg(any(windows, target_os = "linux"))]
-fn restore_from_trash(paths: &[PathBuf]) -> Result<Option<PathBuf>, String> {
+fn restore_from_trash(paths: &[PathBuf]) -> Result<Vec<PathBuf>, String> {
     use trash::os_limited::{list, restore_all};
     let items = list().map_err(|e| format!("Couldn't read the Recycle Bin: {e}"))?;
     // The shell reports the original location in ITS casing (NTFS is
@@ -3815,14 +3882,14 @@ fn restore_from_trash(paths: &[PathBuf]) -> Result<Option<PathBuf>, String> {
             None => return Err(format!("“{}” isn't in the Recycle Bin any more.", name_of(p))),
         }
     }
-    let restored_last = picked.last().map(|(_, p)| p.clone());
+    let restored: Vec<PathBuf> = picked.iter().map(|(_, p)| p.clone()).collect();
     let idx: Vec<usize> = picked.iter().map(|(i, _)| *i).collect();
     let chosen = items.into_iter().enumerate().filter(|(i, _)| idx.contains(i)).map(|(_, it)| it);
     restore_all(chosen).map_err(|e| format!("Couldn't restore from the Recycle Bin: {e}"))?;
-    Ok(restored_last)
+    Ok(restored)
 }
 #[cfg(not(any(windows, target_os = "linux")))]
-fn restore_from_trash(_paths: &[PathBuf]) -> Result<Option<PathBuf>, String> {
+fn restore_from_trash(_paths: &[PathBuf]) -> Result<Vec<PathBuf>, String> {
     Err("Restoring from the trash isn't supported on this platform.".into())
 }
 
@@ -4296,12 +4363,13 @@ impl eframe::App for SectorApp {
             // Whatever completed is real (even on a partial failure) — that is
             // what Undo reverses.
             if !out.done.is_empty() {
-                let op = if paste_was_cut {
-                    UndoOp::Moved { pairs: out.done.clone() }
+                let entry = if paste_was_cut {
+                    UndoEntry::new(UndoOp::MoveBack { pairs: out.done.clone() }, "move")
                 } else {
-                    UndoOp::Copied { dsts: out.done.iter().map(|(_, d)| d.clone()).collect() }
+                    let dsts = out.done.iter().map(|(_, d)| d.clone()).collect();
+                    UndoEntry::new(UndoOp::Trash { paths: dsts }, "copy")
                 };
-                self.push_undo(op);
+                self.push_undo(entry);
             }
             self.op_error = out.error;
             self.entries_dirty = true;
@@ -4331,7 +4399,7 @@ impl eframe::App for SectorApp {
             self.entries_dirty = true;
             self.sb_cache.clear();
             if !out.recycled.is_empty() {
-                self.push_undo(UndoOp::Recycled { paths: out.recycled });
+                self.push_undo(UndoEntry::new(UndoOp::Restore { paths: out.recycled }, "delete"));
             }
             match out.error {
                 None => {
@@ -4346,8 +4414,8 @@ impl eframe::App for SectorApp {
         }
 
         // Poll a background undo for completion.
-        let mut undo_done: Option<Result<Option<PathBuf>, String>> = None;
-        if let Some((rx, _)) = &self.undo_job {
+        let mut undo_done: Option<Result<UndoDone, String>> = None;
+        if let Some((rx, _, _)) = &self.undo_job {
             match rx.try_recv() {
                 Ok(r) => undo_done = Some(r),
                 Err(std::sync::mpsc::TryRecvError::Empty) => ctx.request_repaint(),
@@ -4357,14 +4425,24 @@ impl eframe::App for SectorApp {
             }
         }
         if let Some(result) = undo_done {
-            let (_, op) = self.undo_job.take().expect("undo job present");
+            let (_, entry, was_redo) = self.undo_job.take().expect("undo job present");
             self.entries_dirty = true;
             self.sb_cache.clear();
             match result {
-                Ok(item) => {
+                Ok(done) => {
                     self.op_error = None;
-                    // Follow the folder we're IN if the undo renamed it.
-                    if let UndoOp::Rename { from, to } = &op {
+                    // The inverse goes on the opposite stack (NOT via push_undo,
+                    // which would fork history and clear redo).
+                    if let Some(inv) = done.inverse {
+                        let e = UndoEntry::new(inv, entry.label);
+                        if was_redo {
+                            self.undo.push(e);
+                        } else {
+                            self.redo.push(e);
+                        }
+                    }
+                    // Follow the folder we're IN if the reversal renamed it.
+                    if let UndoOp::Rename { from, to } = &entry.op {
                         if let Some(p) = reroot(&self.current_dir, from, to) {
                             self.current_dir = p;
                             self.sync_addr();
@@ -4372,7 +4450,7 @@ impl eframe::App for SectorApp {
                         }
                     }
                     self.step_out_if_gone();
-                    if let Some(p) = item {
+                    if let Some(p) = done.select {
                         self.after_op(&p);
                     }
                 }
@@ -5183,11 +5261,20 @@ mod tests {
         assert_eq!(out.done[0].1, dest.join("m - Copy.txt")); // auto-renamed on paste
 
         // Undo puts it back under its ORIGINAL name, leaving "theirs" untouched.
-        let sel = run_undo(UndoOp::Moved { pairs: out.done }).unwrap();
-        assert_eq!(sel, Some(d.join("m.txt")));
+        let done = run_undo(UndoOp::MoveBack { pairs: out.done }).unwrap();
+        assert_eq!(done.select, Some(d.join("m.txt")));
         assert_eq!(std::fs::read(d.join("m.txt")).unwrap(), b"mine");
         assert_eq!(std::fs::read(dest.join("m.txt")).unwrap(), b"theirs");
         assert!(!dest.join("m - Copy.txt").exists());
+
+        // Redo (the inverse) moves it into dest again — back to "m - Copy.txt",
+        // since "m.txt" there is still taken — and yields the undo for THAT.
+        let inv = done.inverse.unwrap();
+        assert_eq!(inv, UndoOp::MoveBack { pairs: vec![(dest.join("m - Copy.txt"), d.join("m.txt"))] });
+        let redone = run_undo(inv).unwrap();
+        assert_eq!(std::fs::read(dest.join("m - Copy.txt")).unwrap(), b"mine");
+        assert!(!d.join("m.txt").exists());
+        assert_eq!(redone.inverse, Some(UndoOp::MoveBack { pairs: vec![(d.join("m.txt"), dest.join("m - Copy.txt"))] }));
         std::fs::remove_dir_all(&d).ok();
     }
 
@@ -5198,20 +5285,30 @@ mod tests {
         std::fs::write(d.join("a.txt"), b"x").unwrap();
         std::fs::rename(d.join("a.txt"), d.join("b.txt")).unwrap();
         let op = UndoOp::Rename { from: d.join("b.txt"), to: d.join("a.txt") };
-        assert_eq!(run_undo(op.clone()).unwrap(), Some(d.join("a.txt")));
+        let done = run_undo(op.clone()).unwrap();
+        assert_eq!(done.select, Some(d.join("a.txt")));
         assert!(d.join("a.txt").exists() && !d.join("b.txt").exists());
-        std::fs::rename(d.join("a.txt"), d.join("b.txt")).unwrap();
+        // Redo is the mirror image, and its own inverse is the original undo.
+        let inv = done.inverse.unwrap();
+        assert_eq!(inv, UndoOp::Rename { from: d.join("a.txt"), to: d.join("b.txt") });
+        assert_eq!(run_undo(inv).unwrap().inverse, Some(op.clone()));
+        assert!(d.join("b.txt").exists() && !d.join("a.txt").exists());
         std::fs::write(d.join("a.txt"), b"newcomer").unwrap();
         assert!(run_undo(op).unwrap_err().contains("something is now named"));
         assert_eq!(std::fs::read(d.join("a.txt")).unwrap(), b"newcomer"); // untouched
 
-        // New folder: undo removes it while empty, refuses once it has content.
+        // New folder: undo removes it while empty, refuses once it has content;
+        // redo re-creates it.
         std::fs::create_dir(d.join("nf")).unwrap();
-        assert!(run_undo(UndoOp::NewFolder { path: d.join("nf") }).is_ok());
+        let done = run_undo(UndoOp::RemoveDir { path: d.join("nf") }).unwrap();
         assert!(!d.join("nf").exists());
+        assert_eq!(done.inverse, Some(UndoOp::MakeDir { path: d.join("nf") }));
+        let redone = run_undo(done.inverse.unwrap()).unwrap();
+        assert!(d.join("nf").is_dir());
+        assert_eq!(redone.inverse, Some(UndoOp::RemoveDir { path: d.join("nf") }));
         std::fs::create_dir(d.join("nf2")).unwrap();
         std::fs::write(d.join("nf2/keep.txt"), b"!").unwrap();
-        assert!(run_undo(UndoOp::NewFolder { path: d.join("nf2") }).is_err());
+        assert!(run_undo(UndoOp::RemoveDir { path: d.join("nf2") }).is_err());
         assert!(d.join("nf2/keep.txt").exists());
         std::fs::remove_dir_all(&d).ok();
     }
@@ -5229,11 +5326,17 @@ mod tests {
             return;
         }
         assert!(!f.exists());
-        let sel = run_undo(UndoOp::Recycled { paths: vec![f.clone()] }).unwrap();
-        assert_eq!(sel, Some(f.clone()));
+        let done = run_undo(UndoOp::Restore { paths: vec![f.clone()] }).unwrap();
+        assert_eq!(done.select, Some(f.clone()));
         assert_eq!(std::fs::read(&f).unwrap(), b"bring me back");
         // A second undo of the same delete finds nothing to restore.
-        assert!(run_undo(UndoOp::Recycled { paths: vec![f.clone()] }).unwrap_err().contains("isn't in"));
+        assert!(run_undo(UndoOp::Restore { paths: vec![f.clone()] }).unwrap_err().contains("isn't in"));
+        // Redo (the inverse) trashes it again, and THAT yields a restore.
+        let inv = done.inverse.unwrap();
+        assert_eq!(inv, UndoOp::Trash { paths: vec![f.clone()] });
+        let redone = run_undo(inv).unwrap();
+        assert!(!f.exists());
+        assert_eq!(redone.inverse, Some(UndoOp::Restore { paths: vec![f.clone()] }));
         std::fs::remove_dir_all(&d).ok();
     }
 
