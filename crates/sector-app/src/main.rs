@@ -167,6 +167,30 @@ impl DragFiles {
     }
 }
 
+/// A cached scan, read and prepared on a background thread (deserialising
+/// millions of nodes and computing their dominant categories takes seconds
+/// for a big drive — far too long for the UI thread).
+struct LoadedCache {
+    tree: Tree,
+    stats: CacheStats,
+    dominant: Vec<FileCategory>,
+}
+
+/// Read + validate + prepare a cache file for `dir`. Pure; runs off-thread.
+fn load_cache_file(cp: &Path, dir: &Path) -> Result<LoadedCache, String> {
+    let bytes = std::fs::read(cp).map_err(|e| format!("read {}: {e}", cp.display()))?;
+    let (tree, stats) = Tree::from_cache_bytes(&bytes).ok_or("deserialize failed")?;
+    // Verify the cache is really THIS folder — guards against a (rare) hash-key
+    // collision or a mismatched/renamed file loading the wrong tree.
+    let cached_root = tree.node(Tree::ROOT).name.to_string();
+    if normalize_cache_key(&cached_root) != normalize_cache_key(&dir.to_string_lossy()) {
+        return Err(format!("root mismatch — cached {cached_root:?} != {dir:?}"));
+    }
+    let dominant = tree.dominant_categories();
+    eprintln!("[sector] cache: loaded {} nodes, {} files for {}", tree.len(), stats.files, dir.display());
+    Ok(LoadedCache { tree, stats, dominant })
+}
+
 /// A rubber-band (marquee) selection in progress: a drag that started on
 /// empty space in the list. Rows the band touches are selected live.
 struct Marquee {
@@ -680,6 +704,9 @@ struct SectorApp {
     /// Freshness of the currently-loaded cache vs the live volume (E6). Only
     /// meaningful right after a cache-load.
     cache_freshness: Freshness,
+    /// A cache load in progress on a background thread, and the folder it is
+    /// for (a result that arrives after navigating elsewhere is dropped).
+    cache_load: Option<(Receiver<Result<LoadedCache, String>>, PathBuf)>,
     /// The path the loaded City tree is rooted at (its scan/cache-load target).
     city_root: Option<PathBuf>,
     /// The location the City view currently represents (root, or a drilled-in
@@ -764,6 +791,7 @@ impl Default for SectorApp {
             sb_roots: Vec::new(),
             sb_expanded: HashSet::new(),
             sb_cache: HashMap::new(),
+            cache_load: None,
             city_root: None,
             city_synced_dir: None,
         }
@@ -893,45 +921,36 @@ impl SectorApp {
         };
     }
 
-    /// Load a previously-cached scan for the current folder — instant, no walk.
-    /// Returns `false` if there was no readable/valid cache (caller decides what
-    /// to show instead).
-    fn load_cached(&mut self) -> bool {
-        let Some(cp) = cache_path_for(&self.current_dir.to_string_lossy()) else {
-            eprintln!("[sector] load_cached: no cache dir");
-            return false;
+    /// Start loading the current folder's cached scan on a background thread.
+    /// The City shows a loading state meanwhile; [`Self::install_cache`] runs
+    /// when the result arrives (if we're still in that folder).
+    fn start_cache_load(&mut self) {
+        let dir = self.current_dir.clone();
+        let Some(cp) = cache_path_for(&dir.to_string_lossy()) else {
+            eprintln!("[sector] cache: no cache dir");
+            self.city_idle();
+            return;
         };
-        let bytes = match std::fs::read(&cp) {
-            Ok(b) => b,
-            Err(e) => {
-                eprintln!("[sector] load_cached: read {} failed: {e}", cp.display());
-                return false;
-            }
-        };
-        eprintln!("[sector] load_cached: read {} bytes from {}", bytes.len(), cp.display());
-        let Some((tree, cs)) = Tree::from_cache_bytes(&bytes) else {
-            eprintln!("[sector] load_cached: DESERIALIZE FAILED");
-            return false;
-        };
-        // Verify the cache is really THIS folder — guards against a (rare) hash-key
-        // collision or a mismatched/renamed file loading the wrong tree.
-        let cached_root = tree.node(Tree::ROOT).name.to_string();
-        if normalize_cache_key(&cached_root)
-            != normalize_cache_key(&self.current_dir.to_string_lossy())
-        {
-            eprintln!(
-                "[sector] load_cached: root mismatch — cached {cached_root:?} != {:?}",
-                self.current_dir
-            );
-            return false;
-        }
-        eprintln!("[sector] load_cached: OK — {} nodes, {} files", tree.len(), cs.files);
+        // The City now belongs to this load: stop any running scan and clear
+        // the old scene (never leave another folder's city up mislabelled).
+        self.city_idle();
+        self.city_root = Some(dir.clone());
+        self.city_synced_dir = Some(dir.clone());
+        let (tx, rx) = channel();
+        let key_dir = dir.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(load_cache_file(&cp, &key_dir));
+        });
+        self.cache_load = Some((rx, dir));
+    }
+
+    /// Put a loaded cache on screen as the City (the fast, UI-thread half).
+    fn install_cache(&mut self, lc: LoadedCache) {
+        let cs = lc.stats;
         // E6: is this cached view still current per the USN journal?
         let mark = UsnMark { journal_id: cs.usn_journal_id, next_usn: cs.usn_next };
         self.cache_freshness = usn_freshness(&self.current_dir, &mark);
-        eprintln!("[sector] load_cached: freshness {:?}", self.cache_freshness);
-        let tree = Arc::new(Mutex::new(tree));
-        self.dominant = Some(tree.lock().unwrap_or_else(|e| e.into_inner()).dominant_categories());
+        self.dominant = Some(lc.dominant);
         let stats = ScanStats {
             dirs: cs.dirs,
             files: cs.files,
@@ -947,17 +966,11 @@ impl SectorApp {
         self.menu_target = None;
         self.city_root = Some(self.current_dir.clone());
         self.city_synced_dir = Some(self.current_dir.clone());
-        // A scan of the previous location may still be running (sync_city on a
-        // navigation lands here) — stop it, or it runs to completion into a tree
-        // nobody reads and its result is thrown away.
-        if let ScanState::Running { cancel, .. } = &self.scan {
-            cancel.store(true, Ordering::Relaxed);
-        }
         // No scanner thread; the dead channel is never polled because `stats`
         // is already `Some`.
         let (_tx, rx) = channel();
         self.scan = ScanState::Running {
-            tree,
+            tree: Arc::new(Mutex::new(lc.tree)),
             progress: Arc::new(Progress::default()),
             cancel: Arc::new(AtomicBool::new(false)),
             stats_rx: rx,
@@ -966,7 +979,22 @@ impl SectorApp {
         };
         self.recompute_folder_sizes(); // the tree now covers this folder
         self.refresh_status_summary();
-        true
+    }
+
+    /// Drop the City to its idle scan-prompt: cancel any running scan and
+    /// clear the scene.
+    fn city_idle(&mut self) {
+        if let ScanState::Running { cancel, .. } = &self.scan {
+            cancel.store(true, Ordering::Relaxed);
+        }
+        self.scan = ScanState::Idle;
+        self.root = Tree::ROOT;
+        self.tiles.clear();
+        self.scape = Scape::default();
+        self.dominant = None;
+        self.reveal_start = None;
+        self.menu_target = None;
+        self.cache_freshness = Freshness::Unknown;
     }
 
     /// Point the City at `current_dir` (E2). Instant cache-load if one exists;
@@ -979,20 +1007,13 @@ impl SectorApp {
             .and_then(|p| std::fs::metadata(p).ok());
         self.cache_mtime = md.as_ref().and_then(|m| m.modified().ok());
         let has_cache = md.is_some();
-        // Try the cache; if it's missing OR fails to load (corrupt/truncated),
-        // drop to an idle scan-prompt rather than leaving the previous folder's
-        // cityscape on screen mislabeled as this one.
-        if !(has_cache && self.load_cached()) {
-            // Cancel any scan of the old location and clear the cityscape.
-            if let ScanState::Running { cancel, .. } = &self.scan {
-                cancel.store(true, Ordering::Relaxed);
-            }
-            self.scan = ScanState::Idle;
-            self.root = Tree::ROOT;
-            self.tiles.clear();
-            self.scape = Scape::default();
-            self.dominant = None;
-            self.reveal_start = None;
+        // Load the cache in the background; if there is none, drop to an idle
+        // scan-prompt rather than leaving the previous folder's cityscape on
+        // screen mislabelled as this one.
+        if has_cache {
+            self.start_cache_load();
+        } else {
+            self.city_idle();
         }
         self.city_root = Some(cur.clone());
         self.city_synced_dir = Some(cur);
@@ -4327,6 +4348,31 @@ impl eframe::App for SectorApp {
             self.clipboard = sys_clipboard::read().map(|f| Clipboard { paths: f.paths, cut: f.cut });
         }
 
+        // Poll a background cache load (City). A result for a folder we've
+        // since left is dropped; sync_city will start the right one.
+        let mut loaded: Option<(Result<LoadedCache, String>, PathBuf)> = None;
+        if let Some((rx, dir)) = &self.cache_load {
+            match rx.try_recv() {
+                Ok(r) => loaded = Some((r, dir.clone())),
+                Err(std::sync::mpsc::TryRecvError::Empty) => ctx.request_repaint(),
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    loaded = Some((Err("cache loader stopped unexpectedly".into()), dir.clone()));
+                }
+            }
+        }
+        if let Some((result, dir)) = loaded {
+            self.cache_load = None;
+            if dir == self.current_dir {
+                match result {
+                    Ok(lc) => self.install_cache(lc),
+                    Err(e) => {
+                        eprintln!("[sector] cache: load failed: {e}");
+                        self.city_idle();
+                    }
+                }
+            }
+        }
+
         // Poll the background scan for completion.
         let mut just_finished = false;
         if let ScanState::Running { stats_rx, stats, progress, started, .. } = &mut self.scan {
@@ -4592,7 +4638,8 @@ impl eframe::App for SectorApp {
         // ---- Top bar --------------------------------------------------------
         egui::Panel::top("bar").show(ui, |ui| {
             ui.horizontal(|ui| {
-                let scanning = matches!(&self.scan, ScanState::Running { stats: None, .. });
+                let scanning = matches!(&self.scan, ScanState::Running { stats: None, .. })
+                    || self.cache_load.is_some();
                 ui.add_enabled_ui(!scanning, |ui| {
                     let scanned = self.city_root.as_deref() == Some(self.current_dir.as_path())
                         && matches!(&self.scan, ScanState::Running { stats: Some(_), .. });
@@ -4630,7 +4677,7 @@ impl eframe::App for SectorApp {
                             .on_hover_text("Reopen the last scan of this path instantly, without walking the filesystem.")
                             .clicked()
                         {
-                            self.load_cached();
+                            self.start_cache_load();
                         }
                     }
                     // E6: freshness of the loaded cache vs the live NTFS volume.
@@ -4661,10 +4708,17 @@ impl eframe::App for SectorApp {
 
             match &self.scan {
                 ScanState::Idle => {
-                    ui.label(format!(
-                        "No cityscape for {} yet — press Scan to build one.",
-                        self.current_dir.display()
-                    ));
+                    if self.cache_load.is_some() {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label(format!("Loading the cached scan of {}…", self.current_dir.display()));
+                        });
+                    } else {
+                        ui.label(format!(
+                            "No cityscape for {} yet — press Scan to build one.",
+                            self.current_dir.display()
+                        ));
+                    }
                 }
                 ScanState::Running {
                     tree,
@@ -4736,7 +4790,7 @@ impl eframe::App for SectorApp {
         egui::CentralPanel::default().show(ui, |ui| {
             let ScanState::Running { tree, stats, .. } = &self.scan else {
                 ui.centered_and_justified(|ui| {
-                    ui.weak("No scan yet.");
+                    ui.weak(if self.cache_load.is_some() { "Loading cached scan…" } else { "No scan yet." });
                 });
                 return;
             };
