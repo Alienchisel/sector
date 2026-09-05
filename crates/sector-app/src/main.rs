@@ -179,7 +179,14 @@ struct LoadedCache {
 /// Read + validate + prepare a cache file for `dir`. Pure; runs off-thread.
 fn load_cache_file(cp: &Path, dir: &Path) -> Result<LoadedCache, String> {
     let bytes = std::fs::read(cp).map_err(|e| format!("read {}: {e}", cp.display()))?;
-    let (tree, stats) = Tree::from_cache_bytes(&bytes).ok_or("deserialize failed")?;
+    let (tree, stats) = Tree::from_cache_bytes(&bytes).ok_or_else(|| {
+        match Tree::cache_format_version(&bytes) {
+            Some(v) if v != Tree::CACHE_FORMAT => {
+                format!("it was written by an older SECTOR (format v{v}, current v{})", Tree::CACHE_FORMAT)
+            }
+            _ => "the file is corrupt".to_string(),
+        }
+    })?;
     // Verify the cache is really THIS folder — guards against a (rare) hash-key
     // collision or a mismatched/renamed file loading the wrong tree.
     let cached_root = tree.node(Tree::ROOT).name.to_string();
@@ -708,6 +715,9 @@ struct SectorApp {
     /// Freshness of the currently-loaded cache vs the live volume (E6). Only
     /// meaningful right after a cache-load.
     cache_freshness: Freshness,
+    /// Why the City has nothing to show (e.g. the cached scan couldn't be
+    /// loaded) — shown in the City bar instead of the bare scan-prompt.
+    city_note: Option<String>,
     /// A cache load in progress on a background thread, and the folder it is
     /// for (a result that arrives after navigating elsewhere is dropped).
     cache_load: Option<(Receiver<Result<LoadedCache, String>>, PathBuf)>,
@@ -796,6 +806,7 @@ impl Default for SectorApp {
             sb_roots: Vec::new(),
             sb_expanded: HashSet::new(),
             sb_cache: HashMap::new(),
+            city_note: None,
             cache_load: None,
             city_root: None,
             city_synced_dir: None,
@@ -911,6 +922,7 @@ impl SectorApp {
         self.tiles.clear();
         self.scape = Scape::default();
         self.crystallize = false;
+        self.city_note = None;
         self.reveal_start = None; // a leftover cache-load animation must not drive a live scan
         self.dominant = None;
         self.menu_target = None;
@@ -943,6 +955,7 @@ impl SectorApp {
         // The City now belongs to this load: stop any running scan and clear
         // the old scene (never leave another folder's city up mislabelled).
         self.city_idle();
+        self.city_note = None;
         self.city_root = Some(dir.clone());
         self.city_synced_dir = Some(dir.clone());
         let (tx, rx) = channel();
@@ -4387,7 +4400,22 @@ impl eframe::App for SectorApp {
                     Ok(lc) => self.install_cache(lc),
                     Err(e) => {
                         eprintln!("[sector] cache: load failed: {e}");
+                        // A cache that can't be loaded (older format, corrupt,
+                        // wrong folder) is useless: drop the file so the
+                        // "Load cached" button stops offering it, and say why.
+                        // A plain read error keeps the file (it may be transient).
+                        if !e.starts_with("read ") {
+                            if let Some(cp) = cache_path_for(&dir.to_string_lossy()) {
+                                let _ = std::fs::remove_file(cp);
+                            }
+                            self.cache_mtime = None;
+                        }
                         self.city_no_cache();
+                        if matches!(self.scan, ScanState::Idle) {
+                            self.city_note = Some(format!(
+                                "Couldn't load the cached scan — {e}. Press Scan to rebuild it."
+                            ));
+                        }
                     }
                 }
             }
@@ -4746,6 +4774,8 @@ impl eframe::App for SectorApp {
                             ui.spinner();
                             ui.label(format!("Loading the cached scan of {}…", self.current_dir.display()));
                         });
+                    } else if let Some(note) = &self.city_note {
+                        ui.colored_label(egui::Color32::from_rgb(230, 170, 80), note);
                     } else {
                         ui.label(format!(
                             "No cityscape for {} yet — press Scan to build one.",

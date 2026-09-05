@@ -328,6 +328,16 @@ impl Tree {
         Ok(out)
     }
 
+    /// The current cache format version (what [`Self::to_cache_bytes`] writes).
+    pub const CACHE_FORMAT: u16 = CACHE_VERSION;
+
+    /// The format version stamped on `bytes`, or `None` if they aren't a SECTOR
+    /// cache at all. Lets a caller tell "older format" from "corrupt".
+    pub fn cache_format_version(bytes: &[u8]) -> Option<u16> {
+        (bytes.len() >= 6 && bytes[..4] == CACHE_MAGIC)
+            .then(|| u16::from_le_bytes([bytes[4], bytes[5]]))
+    }
+
     /// Rebuild a tree (and its stats) from cache bytes. Returns `None` if the
     /// bytes are malformed or from an incompatible version.
     pub fn from_cache_bytes(bytes: &[u8]) -> Option<(Tree, CacheStats)> {
