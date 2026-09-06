@@ -2543,6 +2543,15 @@ impl SectorApp {
         (!e.is_dir && is_previewable_image(&e.name)).then(|| self.pane.current_dir.join(&e.name))
     }
 
+    /// Drop all decoded thumbnails and any in-flight/failed decode — used on a
+    /// refresh, since a file on disk may have changed and its preview is now
+    /// stale. Keyed by path, the cache would otherwise return the old image.
+    fn invalidate_thumbs(&mut self) {
+        self.thumbs.clear();
+        self.thumb_pending = None;
+        self.thumb_failed.clear();
+    }
+
     /// The thumbnail state for `path`: a ready texture (moved to most-recent),
     /// or `None` while decoding / after a failure. Starts a decode if needed.
     fn thumb_state_for(&mut self, path: &Path) -> Option<(egui::TextureHandle, (u32, u32))> {
@@ -3073,6 +3082,7 @@ impl SectorApp {
                 }
                 self.pane.entries_dirty = true;
                 self.sb_cache.clear();
+                self.invalidate_thumbs();
             }
             if ui.input(|i| i.key_pressed(egui::Key::Backspace)) {
                 self.go_up();
@@ -4975,9 +4985,11 @@ impl eframe::App for SectorApp {
             && !self.was_focused
             && self.prompt.is_none()
             && self.confirm_delete.is_none()
+            && !self.pane.addr_editing // don't overwrite a path being typed
         {
             self.pane.entries_dirty = true;
             self.sb_cache.clear();
+            self.invalidate_thumbs(); // a file may have been edited while away
         }
         self.was_focused = focused;
 
