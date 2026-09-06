@@ -2484,8 +2484,7 @@ impl SectorApp {
         // Back / Forward: a click steps once; a right-click lists the history so
         // you can jump straight to a folder (browser-style).
         let (mut back_n, mut fwd_n) = (0usize, 0usize);
-        let back = ui
-            .add_enabled(!self.pane.back_stack.is_empty(), egui::Button::new("◀"))
+        let back = nav_button(ui, NavArrow::Left, !self.pane.back_stack.is_empty())
             .on_hover_text("Back (right-click for history)");
         if back.clicked() {
             back_n = 1;
@@ -2498,8 +2497,7 @@ impl SectorApp {
                 }
             }
         });
-        let fwd = ui
-            .add_enabled(!self.pane.fwd_stack.is_empty(), egui::Button::new("▶"))
+        let fwd = nav_button(ui, NavArrow::Right, !self.pane.fwd_stack.is_empty())
             .on_hover_text("Forward (right-click for history)");
         if fwd.clicked() {
             fwd_n = 1;
@@ -2518,8 +2516,7 @@ impl SectorApp {
         for _ in 0..fwd_n {
             self.go_forward();
         }
-        if ui
-            .add_enabled(self.pane.current_dir.parent().is_some(), egui::Button::new("⬆"))
+        if nav_button(ui, NavArrow::Up, self.pane.current_dir.parent().is_some())
             .on_hover_text("Up")
             .clicked()
         {
@@ -4696,6 +4693,35 @@ mod sys_clipboard {
     }
     #[cfg(not(windows))]
     pub fn clear() {}
+}
+
+/// Direction of a painted navigation arrow.
+#[derive(Clone, Copy)]
+enum NavArrow {
+    Left,
+    Right,
+    Up,
+}
+
+/// A Back / Forward / Up button with a PAINTED triangle, so the three match in
+/// size and style — glyphs from the bundled fonts don't (◀▶ come from one emoji
+/// font, an up arrow from another, at different proportions).
+fn nav_button(ui: &mut egui::Ui, dir: NavArrow, enabled: bool) -> egui::Response {
+    let r = ui.add_enabled(enabled, egui::Button::new("   ").min_size(Vec2::new(26.0, 20.0)));
+    let c = r.rect.center();
+    let s = 4.5; // half-size of the triangle
+    let pts = match dir {
+        NavArrow::Left => vec![c + Vec2::new(-s, 0.0), c + Vec2::new(s, -s), c + Vec2::new(s, s)],
+        NavArrow::Right => vec![c + Vec2::new(s, 0.0), c + Vec2::new(-s, -s), c + Vec2::new(-s, s)],
+        NavArrow::Up => vec![c + Vec2::new(0.0, -s), c + Vec2::new(s, s), c + Vec2::new(-s, s)],
+    };
+    let color = if enabled {
+        ui.visuals().widgets.interact(&r).fg_stroke.color
+    } else {
+        ui.visuals().widgets.noninteractive.fg_stroke.color
+    };
+    ui.painter().add(Shape::convex_polygon(pts, color, Stroke::NONE));
+    r
 }
 
 /// Hand-drawn tooltip near the cursor. egui's widget tooltip anchors to the
