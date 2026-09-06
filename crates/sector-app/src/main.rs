@@ -471,14 +471,33 @@ fn prune_cache_dir(dir: &std::path::Path, keep_path: &std::path::Path, keep_byte
 /// Rough "N ago" from a file-modified time.
 fn humanize_age(modified: SystemTime) -> String {
     let secs = SystemTime::now().duration_since(modified).map(|d| d.as_secs()).unwrap_or(0);
+    age_label(secs)
+}
+
+/// The scale behind [`humanize_age`]: minutes, hours, days for about a month,
+/// then months, then years with the months remainder — "496d ago" says less
+/// than "1y 4mo ago".
+fn age_label(secs: u64) -> String {
+    const DAY: u64 = 86_400;
+    let days = secs / DAY;
     if secs < 90 {
         "just now".to_string()
     } else if secs < 5400 {
         format!("{}m ago", secs / 60)
     } else if secs < 129_600 {
         format!("{}h ago", secs / 3600)
+    } else if days < 30 {
+        format!("{days}d ago")
+    } else if days < 365 {
+        format!("{}mo ago", (days / 30).max(1))
     } else {
-        format!("{}d ago", secs / 86_400)
+        let years = days / 365;
+        let months = (days % 365) / 30;
+        if months == 0 {
+            format!("{years}y ago")
+        } else {
+            format!("{years}y {months}mo ago")
+        }
     }
 }
 
@@ -5913,6 +5932,20 @@ mod tests {
             assert!(SortKey::from_name(k.name()) == k);
         }
         assert!(SortKey::from_name("") == SortKey::Name); // old settings files
+    }
+
+    #[test]
+    fn age_labels_change_unit_with_scale() {
+        const D: u64 = 86_400;
+        assert_eq!(age_label(30), "just now");
+        assert_eq!(age_label(5 * 60), "5m ago");
+        assert_eq!(age_label(3 * 3600), "3h ago");
+        assert_eq!(age_label(12 * D), "12d ago");
+        assert_eq!(age_label(45 * D), "1mo ago");
+        assert_eq!(age_label(200 * D), "6mo ago");
+        assert_eq!(age_label(365 * D), "1y ago");
+        assert_eq!(age_label(496 * D), "1y 4mo ago"); // the screenshot's case
+        assert_eq!(age_label(1000 * D), "2y 9mo ago");
     }
 
     #[test]
