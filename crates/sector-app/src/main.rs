@@ -255,6 +255,23 @@ fn row_tooltip(e: &Entry, sizes: Option<&HashMap<String, u64>>) -> String {
     s
 }
 
+/// A drive-letter path with the letter in its canonical UPPER case ("y:\\Media"
+/// → "Y:\\Media"). Windows treats them as the same drive, but a typed or
+/// restored lower-case letter would otherwise show beside the tree's
+/// upper-case one as if they were two different places.
+fn canonical_drive_case(p: PathBuf) -> PathBuf {
+    let s = p.to_string_lossy();
+    let b = s.as_bytes();
+    if b.len() >= 2 && b[0].is_ascii_lowercase() && b[1] == b':' {
+        let mut t = String::with_capacity(s.len());
+        t.push(b[0].to_ascii_uppercase() as char);
+        t.push_str(&s[1..]);
+        PathBuf::from(t)
+    } else {
+        p
+    }
+}
+
 /// The last path component for messages (or the whole path for a root).
 fn name_of(p: &Path) -> String {
     p.file_name()
@@ -537,8 +554,8 @@ fn main() -> eframe::Result<()> {
                 app.replay_secs = s.replay_secs.clamp(0.5, 60.0);
                 app.threads = s.threads.clamp(1, 256);
                 app.anim_mode = if s.replay_mode { AnimMode::Replay } else { AnimMode::Reveal };
-                app.pane.current_dir = PathBuf::from(&s.current_dir);
-                app.pane.addr_edit = s.current_dir;
+                app.pane.current_dir = canonical_drive_case(PathBuf::from(&s.current_dir));
+                app.pane.addr_edit = app.pane.current_dir.to_string_lossy().into_owned();
                 app.show_hidden = s.show_hidden;
                 app.pane.sort_key = SortKey::from_name(&s.sort_key);
                 app.pane.sort_asc = s.sort_asc;
@@ -1161,6 +1178,7 @@ impl Pane {
 
     /// Returns whether the location actually changed.
     fn navigate_to(&mut self, path: PathBuf) -> bool {
+        let path = canonical_drive_case(path);
         if path == self.current_dir {
             self.entries_dirty = true;
             return false;
@@ -5874,6 +5892,19 @@ mod tests {
         assert_eq!(reroot(Path::new("/x/old/a/b"), from, to), Some(PathBuf::from("/x/new/a/b"))); // inside it
         assert_eq!(reroot(Path::new("/x/older"), from, to), None); // a sibling with a common prefix is NOT inside
         assert_eq!(reroot(Path::new("/y"), from, to), None);
+    }
+
+    #[test]
+    fn drive_letter_is_canonicalised_to_upper_case() {
+        assert_eq!(canonical_drive_case(PathBuf::from(r"y:\Media")), PathBuf::from(r"Y:\Media"));
+        assert_eq!(canonical_drive_case(PathBuf::from(r"y:\")), PathBuf::from(r"Y:\"));
+        assert_eq!(canonical_drive_case(PathBuf::from(r"Y:\Media")), PathBuf::from(r"Y:\Media")); // untouched
+        assert_eq!(canonical_drive_case(PathBuf::from(r"\\nas\media")), PathBuf::from(r"\\nas\media")); // UNC untouched
+        assert_eq!(canonical_drive_case(PathBuf::from("/tmp/x")), PathBuf::from("/tmp/x"));
+        // Through navigation: the location and history entries come out canonical.
+        let mut app = SectorApp::default();
+        app.navigate_to(PathBuf::from(r"y:\Media"));
+        assert_eq!(app.pane.current_dir, PathBuf::from(r"Y:\Media"));
     }
 
     #[test]
