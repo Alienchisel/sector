@@ -567,6 +567,13 @@ fn main() -> eframe::Result<()> {
                 // the handle with the foreground colour, which on the dark theme
                 // is a near-white bar.
                 s.spacing.scroll = egui::style::ScrollStyle::solid();
+                // Selection: a saturated blue with near-white text. The dark
+                // theme's default is two close greys — a selected row's text
+                // reads poorly on it. This colour also drives the tree's
+                // current-folder highlight, the list focus outline and the
+                // marquee, so they sharpen too.
+                s.visuals.selection.bg_fill = Color32::from_rgb(0x2c, 0x5c, 0xa8);
+                s.visuals.selection.stroke.color = Color32::from_rgb(0xf2, 0xf6, 0xff);
             });
             if let Some(rs) = &cc.wgpu_render_state {
                 let info = rs.adapter.get_info();
