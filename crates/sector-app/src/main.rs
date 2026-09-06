@@ -4716,7 +4716,7 @@ fn nav_button(ui: &mut egui::Ui, dir: NavArrow, enabled: bool) -> egui::Response
         NavArrow::Up => vec![c + Vec2::new(0.0, -s), c + Vec2::new(s, s), c + Vec2::new(-s, s)],
     };
     let color = if enabled {
-        ui.visuals().widgets.interact(&r).fg_stroke.color
+        ui.style().interact(&r).fg_stroke.color
     } else {
         ui.visuals().widgets.noninteractive.fg_stroke.color
     };
