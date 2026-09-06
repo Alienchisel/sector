@@ -4883,6 +4883,29 @@ fn decode_thumb(path: &Path) -> Result<ThumbDecoded, String> {
     Ok(ThumbDecoded { image, orig })
 }
 
+/// A modal's action row: buttons right-aligned as a group (primary on the
+/// left of Cancel, the group flush right — the Windows arrangement), the
+/// primary emphasised. Returns (primary_clicked, cancel_clicked).
+fn dialog_buttons(ui: &mut egui::Ui, primary: &str) -> (bool, bool) {
+    let (mut ok, mut cancel) = (false, false);
+    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+        // right_to_left: the first widget added sits at the far right.
+        if ui.button("Cancel").clicked() {
+            cancel = true;
+        }
+        ui.add_space(6.0);
+        let accent = ui.visuals().selection.bg_fill;
+        let text = egui::RichText::new(primary).color(Color32::WHITE);
+        if ui
+            .add(egui::Button::new(text).fill(accent).min_size(Vec2::new(96.0, 0.0)))
+            .clicked()
+        {
+            ok = true;
+        }
+    });
+    (ok, cancel)
+}
+
 /// Hand-drawn tooltip near the cursor. egui's widget tooltip anchors to the
 /// widget rect — our widget is the whole panel, so it would land in the corner;
 /// we draw our own at the pointer instead.
@@ -5819,15 +5842,10 @@ impl eframe::App for SectorApp {
                     ui.label(format!("{what} will be moved to the Recycle Bin."));
                 }
                 ui.add_space(10.0);
-                ui.horizontal(|ui| {
-                    let label = if permanent { "Delete" } else { "Move to Recycle Bin" };
-                    if ui.button(label).clicked() {
-                        confirm = true;
-                    }
-                    if ui.button("Cancel").clicked() {
-                        cancel = true;
-                    }
-                });
+                let label = if permanent { "Delete" } else { "Move to Recycle Bin" };
+                let (ok, no) = dialog_buttons(ui, label);
+                confirm |= ok;
+                cancel |= no;
                 // Enter confirms a recoverable recycle; a PERMANENT delete must be
                 // an explicit click (no accidental Enter). Esc/backdrop cancels.
                 if !permanent && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
@@ -5893,14 +5911,9 @@ impl eframe::App for SectorApp {
                     ui.colored_label(egui::Color32::from_rgb(224, 108, 108), e);
                 }
                 ui.add_space(10.0);
-                ui.horizontal(|ui| {
-                    if ui.button("OK").clicked() {
-                        commit = true;
-                    }
-                    if ui.button("Cancel").clicked() {
-                        cancel = true;
-                    }
-                });
+                let (ok, no) = dialog_buttons(ui, "OK");
+                commit |= ok;
+                cancel |= no;
             });
             // Esc or a click on the backdrop closes (cancels) the dialog.
             if cancel || modal.should_close() {
