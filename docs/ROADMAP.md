@@ -207,6 +207,10 @@ Deliberately *not* scheduled — captured so they don't distract us:
   plinth — a metro area. Blocks carry a drive index beside the node so hover /
   drill consult the right tree. Must stay deliberate (never auto-scanned).
   Medium-large. Fits D9.
+- **Preview pane** (larger, preview-only, Alt+P; later). A dedicated pane for
+  bigger previews and more types (PDF, text, …), sharing the Details
+  thumbnail's decode/cache. The Details pane already shows an image thumbnail
+  (2026-09-06). 
 - **Flat 2D view** (user idea, 2026-09-06). A `Camera` mode: `view` returns
   (x, y), no side faces, no shadows, height dropped or shown as brightness.
   Hover/drill unchanged (they act on projected quads). Small — do first.

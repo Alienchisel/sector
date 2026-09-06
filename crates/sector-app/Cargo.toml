@@ -28,3 +28,6 @@ sector-core = { path = "../sector-core" }
 sector-scan = { path = "../sector-scan" }
 dirs = "5"
 trash = "5.2.7"
+# Thumbnail decoding for the Details preview (raster formats only; the GPU
+# upload is egui's, the decode is OS-agnostic so it checks on Linux).
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "bmp", "webp"] }

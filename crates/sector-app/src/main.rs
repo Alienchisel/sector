@@ -801,6 +801,13 @@ struct SectorApp {
     /// The block selected in the City (single-click). Highlighted, and the
     /// target of Enter / Details. Node ids are stable within the loaded tree.
     city_sel: Option<NodeId>,
+    /// Decoded thumbnails for the Details preview (most-recent last, capped),
+    /// each with its original pixel size.
+    thumbs: Vec<(PathBuf, egui::TextureHandle, (u32, u32))>,
+    /// A thumbnail decode in flight (its path + the worker's channel).
+    thumb_pending: Option<(PathBuf, Receiver<Result<ThumbDecoded, String>>)>,
+    /// Paths whose decode failed — don't retry them (silent, no preview).
+    thumb_failed: HashSet<PathBuf>,
     /// Files currently being dragged over the window (from Explorer or any
     /// app), for the drop overlay. 0 when nothing is hovering.
     drop_hover: usize,
@@ -896,6 +903,9 @@ impl Default for SectorApp {
             op_error: None,
             props_visible: false,
             city_sel: None,
+            thumbs: Vec::new(),
+            thumb_pending: None,
+            thumb_failed: HashSet::new(),
             drop_hover: 0,
             menu_open_at_start: false,
             sb_visible: true,
@@ -2519,12 +2529,49 @@ impl SectorApp {
         }
     }
 
+    /// The Files-view selected item's path when it's a previewable image.
+    fn selected_image_path(&self) -> Option<PathBuf> {
+        if self.view != View::List {
+            return None;
+        }
+        let e = self.pane.entries.get(self.pane.op_target()?)?;
+        (!e.is_dir && is_previewable_image(&e.name)).then(|| self.pane.current_dir.join(&e.name))
+    }
+
+    /// The thumbnail state for `path`: a ready texture (moved to most-recent),
+    /// or `None` while decoding / after a failure. Starts a decode if needed.
+    fn thumb_state_for(&mut self, path: &Path) -> Option<(egui::TextureHandle, (u32, u32))> {
+        if let Some(i) = self.thumbs.iter().position(|(p, ..)| p == path) {
+            let entry = self.thumbs.remove(i);
+            let out = (entry.1.clone(), entry.2);
+            self.thumbs.push(entry);
+            return Some(out);
+        }
+        if self.thumb_failed.contains(path) {
+            return None;
+        }
+        if self.thumb_pending.as_ref().map(|(p, _)| p.as_path()) != Some(path) {
+            // Start (or replace) the decode. Dropping the old receiver lets its
+            // worker's send fail; the superseded result is simply discarded.
+            let (tx, rx) = channel();
+            let p = path.to_path_buf();
+            std::thread::spawn(move || {
+                let _ = tx.send(decode_thumb(&p));
+            });
+            self.thumb_pending = Some((path.to_path_buf(), rx));
+        }
+        None
+    }
+
     /// The right-hand Details panel (both views), if `props_visible`.
     fn show_details_panel(&mut self, ui: &mut egui::Ui) {
         if !self.props_visible {
             return;
         }
         let props = self.selected_properties();
+        // Preview: a decoded thumbnail for a selected image (Files view).
+        let img_path = self.selected_image_path();
+        let preview = img_path.as_ref().map(|p| (self.thumb_state_for(p), p.clone()));
         let mut close = false;
         egui::Panel::right("props_panel")
             .resizable(true)
@@ -2540,6 +2587,30 @@ impl SectorApp {
                     });
                 });
                 ui.separator();
+                if let Some((state, _)) = &preview {
+                    ui.add_space(2.0);
+                    match state {
+                        Some((tex, (ow, oh))) => {
+                            ui.vertical_centered(|ui| {
+                                ui.add(
+                                    egui::Image::new(egui::load::SizedTexture::from_handle(tex))
+                                        .max_height(200.0)
+                                        .max_width(ui.available_width())
+                                        .maintain_aspect_ratio(true),
+                                );
+                                ui.weak(format!("{ow} × {oh}"));
+                            });
+                        }
+                        None => {
+                            ui.horizontal(|ui| {
+                                ui.spinner();
+                                ui.weak("Loading preview…");
+                            });
+                            ui.ctx().request_repaint();
+                        }
+                    }
+                    ui.separator();
+                }
                 match &props {
                     Some(fields) => {
                         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
@@ -4771,6 +4842,42 @@ fn nav_button(ui: &mut egui::Ui, dir: NavArrow, enabled: bool) -> egui::Response
     r
 }
 
+/// Longest edge of a decoded thumbnail (downscaled on the worker).
+const THUMB_MAX: u32 = 256;
+/// How many decoded thumbnails to keep (most-recent). ~256KB each.
+const THUMB_CACHE: usize = 8;
+
+/// A finished thumbnail decode: the egui image and the ORIGINAL pixel size.
+struct ThumbDecoded {
+    image: egui::ColorImage,
+    orig: (u32, u32),
+}
+
+/// Does this name look like a raster image we can decode? (A cheap gate so we
+/// don't spawn a decode that will only fail; the decode is still fallible.)
+fn is_previewable_image(name: &str) -> bool {
+    matches!(
+        Path::new(name).extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase()).as_deref(),
+        Some("jpg" | "jpeg" | "png" | "gif" | "bmp" | "webp")
+    )
+}
+
+/// Decode `path` and downscale to a thumbnail. Off-thread (a big JPEG must not
+/// touch a frame); OS-agnostic, so it checks and could be tested on Linux.
+fn decode_thumb(path: &Path) -> Result<ThumbDecoded, String> {
+    let reader = image::ImageReader::open(path)
+        .map_err(|e| e.to_string())?
+        .with_guessed_format()
+        .map_err(|e| e.to_string())?;
+    let img = reader.decode().map_err(|e| e.to_string())?;
+    let orig = (img.width(), img.height());
+    // `thumbnail` keeps aspect and is fast; a no-op if already small.
+    let small = img.thumbnail(THUMB_MAX, THUMB_MAX).to_rgba8();
+    let size = [small.width() as usize, small.height() as usize];
+    let image = egui::ColorImage::from_rgba_unmultiplied(size, small.as_raw());
+    Ok(ThumbDecoded { image, orig })
+}
+
 /// Hand-drawn tooltip near the cursor. egui's widget tooltip anchors to the
 /// widget rect — our widget is the whole panel, so it would land in the corner;
 /// we draw our own at the pointer instead.
@@ -4839,6 +4946,29 @@ impl eframe::App for SectorApp {
         if seq != self.clip_seq {
             self.clip_seq = seq;
             self.clipboard = sys_clipboard::read().map(|f| Clipboard { paths: f.paths, cut: f.cut });
+        }
+
+        // Poll a background thumbnail decode; upload the texture here (UI thread).
+        if let Some((path, rx)) = &self.thumb_pending {
+            match rx.try_recv() {
+                Ok(Ok(dec)) => {
+                    let name = format!("thumb:{}", path.display());
+                    let tex = ctx.load_texture(name, dec.image, egui::TextureOptions::LINEAR);
+                    let p = path.clone();
+                    self.thumb_pending = None;
+                    self.thumbs.push((p, tex, dec.orig));
+                    if self.thumbs.len() > THUMB_CACHE {
+                        self.thumbs.remove(0);
+                    }
+                }
+                Ok(Err(e)) => {
+                    eprintln!("[sector] thumbnail: {} — {e}", path.display());
+                    self.thumb_failed.insert(path.clone());
+                    self.thumb_pending = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => ctx.request_repaint(),
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => self.thumb_pending = None,
+            }
         }
 
         // Poll a background cache load (City). A result for a folder we've
@@ -6208,6 +6338,23 @@ mod tests {
         assert_eq!(age_label(365 * D), "1y ago");
         assert_eq!(age_label(496 * D), "1y 4mo ago"); // the screenshot's case
         assert_eq!(age_label(1000 * D), "2y 9mo ago");
+    }
+
+    #[test]
+    fn decode_thumb_downscales_and_reports_original_size() {
+        let d = scratch("thumb");
+        let path = d.join("wide.png");
+        // A 300×100 image → thumbnail's long edge is clamped to THUMB_MAX,
+        // aspect preserved; the ORIGINAL size is reported.
+        image::RgbaImage::from_pixel(300, 100, image::Rgba([200, 40, 40, 255]))
+            .save(&path)
+            .unwrap();
+        let t = decode_thumb(&path).unwrap();
+        assert_eq!(t.orig, (300, 100));
+        assert_eq!(t.image.size, [THUMB_MAX as usize, (THUMB_MAX / 3) as usize]);
+        assert!(is_previewable_image("wide.png") && !is_previewable_image("notes.txt"));
+        assert!(decode_thumb(&d.join("missing.png")).is_err());
+        std::fs::remove_dir_all(&d).ok();
     }
 
     #[test]
