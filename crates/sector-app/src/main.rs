@@ -811,6 +811,10 @@ struct SectorApp {
     /// Files currently being dragged over the window (from Explorer or any
     /// app), for the drop overlay. 0 when nothing is hovering.
     drop_hover: usize,
+    /// Whether the window had focus last frame — a false→true transition
+    /// refreshes the current folder, so an external edit (e.g. a file you
+    /// opened and changed) shows without a manual F5.
+    was_focused: bool,
     /// Was a popup/menu open when this frame began? A popup closed by Esc is
     /// already gone by the time the shortcuts run, so without this the same
     /// Esc would go on to clear the selection.
@@ -908,6 +912,7 @@ impl Default for SectorApp {
             thumb_failed: HashSet::new(),
             drop_hover: 0,
             menu_open_at_start: false,
+            was_focused: true,
             sb_visible: true,
             pins: Vec::new(),
             qa_known: None,
@@ -4930,6 +4935,22 @@ impl eframe::App for SectorApp {
             let z = (ctx.zoom_factor() * zoom).clamp(0.5, 3.0);
             ctx.set_zoom_factor(z);
         }
+
+        // Regained window focus: re-read the current folder so an external
+        // change (a file edited in another app, something added/removed) shows
+        // without a manual F5. Only the current listing + the tree cache; the
+        // selection is preserved by name. Not while a modal (rename / delete)
+        // is up, so it can't yank state mid-dialog.
+        let focused = ctx.input(|i| i.focused);
+        if focused
+            && !self.was_focused
+            && self.prompt.is_none()
+            && self.confirm_delete.is_none()
+        {
+            self.pane.entries_dirty = true;
+            self.sb_cache.clear();
+        }
+        self.was_focused = focused;
 
         // Reflect the current folder in the window/taskbar title (only on change).
         let title = format!("{} — {}", sector_core::APP_NAME, self.pane.current_dir.display());

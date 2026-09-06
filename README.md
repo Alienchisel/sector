@@ -71,7 +71,9 @@ went.
   last rename, new folder, paste (copy or move, even a partial one), or delete
   (restored from the Recycle Bin), and re-applies it again. Never overwrites: a
   reversal that would collide stops and says so.
-- **Refresh** with `F5` / `Ctrl+R`.
+- **Refresh** with `F5` / `Ctrl+R`; the current folder also refreshes when
+  SECTOR regains focus, so an external change (a file you edited elsewhere)
+  shows without one.
 
 ## City view (the visualizer)
 
