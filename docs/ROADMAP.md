@@ -199,9 +199,25 @@ and animation polish below.*
 
 Deliberately *not* scheduled — captured so they don't distract us:
 
-- **"Complete" mode — scan all drives at once.** Enumerate every fixed + mapped
-  drive and show them together (a metro area of cities, or a drive picker /
-  combined root). Fits D9 (multiple drives are a normal case). User idea, 2026-09.
+- **"Complete" mode — all drives at once** (user idea, 2026-09; plan
+  2026-09-06). Treemap the *drives* at the top level (a region of the plane
+  each, by size or equal), lay each drive's own tree into its region with the
+  existing `layout(tree, root, viewport, …)`, concatenate; each drive keeps its
+  own scan/cache (loaded in the background, several at once) and its own
+  plinth — a metro area. Blocks carry a drive index beside the node so hover /
+  drill consult the right tree. Must stay deliberate (never auto-scanned).
+  Medium-large. Fits D9.
+- **Flat 2D view** (user idea, 2026-09-06). A `Camera` mode: `view` returns
+  (x, y), no side faces, no shadows, height dropped or shown as brightness.
+  Hover/drill unchanged (they act on projected quads). Small — do first.
+- **Tree in the City, WinDirStat-style highlighting** (user idea, 2026-09-06).
+  Show the folder tree beside the City (revisits D19 — record as a new
+  decision; re-rooting made a tree beside the City sensible). Hover a tree
+  folder → outline its tile on the ground (nested layout: it encloses its
+  descendants) and brighten the blocks inside; hover a block → highlight its
+  path in the tree. Click keeps today's drill (re-root); a
+  "highlight-on-click / double-click to drill" variant is a small change if
+  hover feels wrong. Medium — do second.
 - ~~**Urban visual pass (D15).**~~ **Done** — see Step 3a.5 (plinth, shadows,
   night palette, neon tops). Remaining: haze / atmosphere, ambient occlusion.
 - ~~**Camera controls (later).**~~ **Done (2026-09-05)** via the scene/camera
