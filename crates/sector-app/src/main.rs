@@ -149,6 +149,8 @@ enum TreeAct {
     Rename,
     NewFolder,
     Props,
+    Pin,
+    Unpin,
 }
 
 /// The egui drag-and-drop payload for an internal drag: the paths being
@@ -270,6 +272,12 @@ fn canonical_drive_case(p: PathBuf) -> PathBuf {
     } else {
         p
     }
+}
+
+/// Are two paths the same folder, the Windows way (case-insensitive, trailing
+/// separators ignored)?
+fn same_folder(a: &Path, b: &Path) -> bool {
+    normalize_cache_key(&a.to_string_lossy()) == normalize_cache_key(&b.to_string_lossy())
 }
 
 /// The last path component for messages (or the whole path for a root).
@@ -579,6 +587,7 @@ fn main() -> eframe::Result<()> {
                 app.pane.sort_key = SortKey::from_name(&s.sort_key);
                 app.pane.sort_asc = s.sort_asc;
                 app.auto_scan_local = s.auto_scan_local;
+                app.pins = s.pins.iter().map(PathBuf::from).collect();
             }
             Ok(Box::new(app))
         }),
@@ -792,6 +801,14 @@ struct SectorApp {
 
     // ---- Folder-tree sidebar (E1b.2, Files view only — D19) ----
     sb_visible: bool,
+    /// Quick access: the user's pinned folders (persisted). The Windows known
+    /// folders (Desktop, Documents, …) are listed automatically before them.
+    pins: Vec<PathBuf>,
+    /// The known folders that exist, resolved once (`None` = not yet).
+    qa_known: Option<Vec<PathBuf>>,
+    /// The two tree sections' open state.
+    qa_open: bool,
+    drives_open: bool,
     /// Which part of the Files view the keyboard drives (focus follows your
     /// last click).
     focus_pane: Focus,
@@ -871,6 +888,10 @@ impl Default for SectorApp {
             drop_hover: 0,
             menu_open_at_start: false,
             sb_visible: true,
+            pins: Vec::new(),
+            qa_known: None,
+            qa_open: true,
+            drives_open: true,
             focus_pane: Focus::List,
             tree_scroll: false,
             sb_roots: Vec::new(),
@@ -921,6 +942,9 @@ struct Settings {
     /// D20: auto-scan local folders on entering them without a cityscape.
     #[serde(default = "default_true")]
     auto_scan_local: bool,
+    /// Quick-access pins (folder paths).
+    #[serde(default)]
+    pins: Vec<String>,
 }
 
 fn default_true() -> bool {
@@ -938,6 +962,7 @@ impl Default for Settings {
             sort_key: "name".to_string(),
             sort_asc: true,
             auto_scan_local: true,
+            pins: Vec::new(),
         }
     }
 }
@@ -2118,8 +2143,15 @@ impl SectorApp {
             self.sb_reveal();
         }
         let mut out = Vec::new();
-        for root in self.sb_roots.clone() {
-            self.sb_collect_visible(&root, &mut out);
+        if self.qa_open {
+            for p in self.quick_access() {
+                self.sb_collect_visible(&p, &mut out);
+            }
+        }
+        if self.drives_open {
+            for root in self.sb_roots.clone() {
+                self.sb_collect_visible(&root, &mut out);
+            }
         }
         out
     }
@@ -2150,7 +2182,8 @@ impl SectorApp {
                     .size()
                     .x
             });
-            let row_w = 22.0 + depth as f32 * 12.0 + text_w + 24.0; // triangle+indent+text+pad
+            // section indent + triangle + depth indent + text + pad
+            let row_w = 18.0 + 22.0 + depth as f32 * 12.0 + text_w + 24.0;
             max_w = max_w.max(row_w);
         }
         max_w.min(520.0)
@@ -2179,14 +2212,82 @@ impl SectorApp {
         dirs
     }
 
-    /// Render the drive roots and (recursively) their expanded subtrees.
+    /// Quick access: the Windows known folders that exist (Desktop, Documents,
+    /// Downloads, Pictures, Music, Videos — via the known-folder API, so a
+    /// OneDrive-redirected Desktop resolves to its real location), then the
+    /// user's pins, deduplicated.
+    fn quick_access(&mut self) -> Vec<PathBuf> {
+        let known = self
+            .qa_known
+            .get_or_insert_with(|| {
+                [
+                    dirs::desktop_dir(),
+                    dirs::document_dir(),
+                    dirs::download_dir(),
+                    dirs::picture_dir(),
+                    dirs::audio_dir(),
+                    dirs::video_dir(),
+                ]
+                .into_iter()
+                .flatten()
+                .filter(|p| p.is_dir())
+                .collect()
+            })
+            .clone();
+        let mut out = known;
+        for p in &self.pins {
+            if !out.iter().any(|k| same_folder(k, p)) {
+                out.push(p.clone());
+            }
+        }
+        out
+    }
+
+    fn is_pinned(&self, p: &Path) -> bool {
+        self.pins.iter().any(|q| same_folder(q, p))
+    }
+
+    fn pin(&mut self, p: PathBuf) {
+        if !self.is_pinned(&p) {
+            self.pins.push(p);
+        }
+    }
+
+    fn unpin(&mut self, p: &Path) {
+        self.pins.retain(|q| !same_folder(q, p));
+    }
+
+    /// Render the tree: a Quick access section (known folders + pins), then
+    /// the drive roots — each with (recursively) its expanded subtree.
     fn sidebar_tree(&mut self, ui: &mut egui::Ui) {
         if self.sb_roots.is_empty() {
             self.sb_roots = enumerate_drives();
             self.sb_reveal(); // open the path to wherever we start
         }
-        for root in self.sb_roots.clone() {
-            self.sb_node(ui, root, 0);
+        let qa = self.quick_access();
+        if !qa.is_empty() {
+            let h = egui::CollapsingHeader::new("Quick access")
+                .id_salt("qa")
+                .open(Some(self.qa_open))
+                .show(ui, |ui| {
+                    for p in qa {
+                        self.sb_node(ui, p, 0);
+                    }
+                });
+            if h.header_response.clicked() {
+                self.qa_open = !self.qa_open;
+            }
+        }
+        let h = egui::CollapsingHeader::new("Drives")
+            .id_salt("drives")
+            .open(Some(self.drives_open))
+            .show(ui, |ui| {
+                for root in self.sb_roots.clone() {
+                    self.sb_node(ui, root, 0);
+                }
+            });
+        if h.header_response.clicked() {
+            self.drives_open = !self.drives_open;
         }
     }
 
@@ -2287,6 +2388,7 @@ impl SectorApp {
         // Right-click: act on THIS folder (not necessarily the current one).
         let is_root = path.parent().is_none();
         let can_paste = self.clipboard.is_some() && !self.file_op_running();
+        let pinned = self.is_pinned(&path);
         let mut act: Option<TreeAct> = None;
         resp.context_menu(|ui| {
             let mut item = |ui: &mut egui::Ui, enabled: bool, label: &str, a: TreeAct| {
@@ -2299,6 +2401,11 @@ impl SectorApp {
             item(ui, true, if open { "Collapse" } else { "Expand" }, TreeAct::Toggle);
             item(ui, true, "Open in Explorer", TreeAct::Reveal);
             item(ui, true, "Copy path", TreeAct::CopyPath);
+            if pinned {
+                item(ui, true, "Unpin from Quick access", TreeAct::Unpin);
+            } else {
+                item(ui, true, "Pin to Quick access", TreeAct::Pin);
+            }
             ui.separator();
             item(ui, !is_root, "Copy", TreeAct::Clip(false));
             item(ui, !is_root, "Cut", TreeAct::Clip(true));
@@ -2334,6 +2441,8 @@ impl SectorApp {
                     self.pane.clear_selection();
                     self.props_visible = true;
                 }
+                TreeAct::Pin => self.pin(path.clone()),
+                TreeAct::Unpin => self.unpin(&path),
             }
         }
 
@@ -3134,6 +3243,7 @@ impl SectorApp {
         let mut nav_target: Option<PathBuf> = None;
         let mut new_sort: Option<SortKey> = None;
         let mut rename_req: Option<String> = None;
+        let mut pin_req: Option<PathBuf> = None;
         let mut new_folder_req = false;
         let mut props_req = false;
         let mut copy_req = false;
@@ -3349,6 +3459,10 @@ impl SectorApp {
                             ui.ctx().copy_text(e.name.clone());
                             ui.close();
                         }
+                        if e.is_dir && ui.button("Pin to Quick access").clicked() {
+                            pin_req = Some(full.clone());
+                            ui.close();
+                        }
                         ui.separator();
                         if ui.button("Copy").clicked() {
                             copy_req = true;
@@ -3502,6 +3616,9 @@ impl SectorApp {
         }
         if let Some(name) = rename_req {
             self.open_rename(name);
+        }
+        if let Some(p) = pin_req {
+            self.pin(p);
         }
         if new_folder_req {
             self.open_new_folder();
@@ -4616,6 +4733,7 @@ impl eframe::App for SectorApp {
             sort_key: self.pane.sort_key.name().to_string(),
             sort_asc: self.pane.sort_asc,
             auto_scan_local: self.auto_scan_local,
+            pins: self.pins.iter().map(|p| p.to_string_lossy().into_owned()).collect(),
         };
         eframe::set_value(storage, "settings", &s);
     }
@@ -4930,6 +5048,24 @@ impl eframe::App for SectorApp {
             self.start_transfer(dropped, dest, false);
         }
         self.drop_hover = ctx.input(|i| i.raw.hovered_files.len());
+
+        // Ctrl+1 … Ctrl+9: jump to the nth Quick access folder (both views).
+        if kb_free {
+            const NUMS: [egui::Key; 9] = [
+                egui::Key::Num1, egui::Key::Num2, egui::Key::Num3, egui::Key::Num4, egui::Key::Num5,
+                egui::Key::Num6, egui::Key::Num7, egui::Key::Num8, egui::Key::Num9,
+            ];
+            let hit = ctx.input(|i| {
+                (i.modifiers.ctrl && !i.modifiers.shift)
+                    .then(|| NUMS.iter().position(|k| i.key_pressed(*k)))
+                    .flatten()
+            });
+            if let Some(n) = hit {
+                if let Some(p) = self.quick_access().get(n).cloned() {
+                    self.navigate_to(p);
+                }
+            }
+        }
 
         // Mouse side buttons (browser-style Back / Forward), in both views.
         if self.prompt.is_none() && self.confirm_delete.is_none() {

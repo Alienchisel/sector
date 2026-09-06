@@ -13,6 +13,10 @@ went.
 
 ## Files view (the explorer)
 
+- **Quick access** at the top of the folder tree: Desktop, Documents,
+  Downloads, Pictures, Music and Videos (resolved through Windows, so a
+  OneDrive-redirected Desktop is found), plus your own pins — right-click any
+  folder → **Pin to Quick access**. `Ctrl+1`…`Ctrl+9` jump to them.
 - **Folder tree + file list**, fully keyboard-drivable. **Tab** switches panes;
   arrows move; **→/←** open/close tree folders; type letters to **jump**
   (type-ahead) in either pane. `Ctrl+↑/↓` moves the cursor without selecting
