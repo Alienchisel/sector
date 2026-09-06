@@ -2471,7 +2471,7 @@ impl SectorApp {
             item(ui, !is_root, "Rename…", TreeAct::Rename);
             item(ui, true, "New folder…", TreeAct::NewFolder);
             ui.separator();
-            item(ui, true, "Properties", TreeAct::Props);
+            item(ui, true, "Details", TreeAct::Props);
         });
         if let Some(a) = act {
             self.focus_pane = Focus::Tree;
@@ -2584,7 +2584,7 @@ impl SectorApp {
             .min_size(220.0)
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.strong("Properties");
+                    ui.strong("Details");
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui.button("×").clicked() {
                             close = true;
@@ -2813,7 +2813,7 @@ impl SectorApp {
                     self.sb_visible = !self.sb_visible;
                 }
                 if ui
-                    .button("New folder")
+                    .button("New folder…")
                     .on_hover_text("New folder (Ctrl+Shift+N)")
                     .clicked()
                 {
@@ -3289,7 +3289,7 @@ impl SectorApp {
             item(ui, true, "Refresh", BgAct::Refresh);
             ui.separator();
             item(ui, true, "Open in Explorer", BgAct::Reveal);
-            item(ui, true, "Properties", BgAct::Props);
+            item(ui, true, "Details", BgAct::Props);
         });
         if let Some(a) = bg_act {
             self.focus_pane = Focus::List;
@@ -3610,7 +3610,7 @@ impl SectorApp {
                             ui.close();
                         }
                         ui.separator();
-                        if ui.button("Properties").clicked() {
+                        if ui.button("Details").clicked() {
                             props_req = true;
                             ui.close();
                         }
@@ -4886,7 +4886,7 @@ fn decode_thumb(path: &Path) -> Result<ThumbDecoded, String> {
 /// A modal's action row: buttons right-aligned as a group (primary on the
 /// left of Cancel, the group flush right — the Windows arrangement), the
 /// primary emphasised. Returns (primary_clicked, cancel_clicked).
-fn dialog_buttons(ui: &mut egui::Ui, primary: &str) -> (bool, bool) {
+fn dialog_buttons(ui: &mut egui::Ui, primary: &str, danger: bool) -> (bool, bool) {
     let (mut ok, mut cancel) = (false, false);
     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
         // right_to_left: the first widget added sits at the far right.
@@ -4894,10 +4894,16 @@ fn dialog_buttons(ui: &mut egui::Ui, primary: &str) -> (bool, bool) {
             cancel = true;
         }
         ui.add_space(6.0);
-        let accent = ui.visuals().selection.bg_fill;
+        // A destructive, irreversible action (a permanent delete) gets a red
+        // primary; an ordinary one gets the accent.
+        let fill = if danger {
+            Color32::from_rgb(0xb0, 0x3a, 0x32)
+        } else {
+            ui.visuals().selection.bg_fill
+        };
         let text = egui::RichText::new(primary).color(Color32::WHITE);
         if ui
-            .add(egui::Button::new(text).fill(accent).min_size(Vec2::new(96.0, 0.0)))
+            .add(egui::Button::new(text).fill(fill).min_size(Vec2::new(96.0, 0.0)))
             .clicked()
         {
             ok = true;
@@ -5380,7 +5386,7 @@ impl eframe::App for SectorApp {
                         ui.add(
                             egui::Slider::new(&mut self.replay_secs, 1.0..=60.0)
                                 .suffix("s")
-                                .text("dur"),
+                                .text("Duration"),
                         )
                         .on_hover_text("Replay duration — drag to change the pace, then Load cached again.");
                     }
@@ -5843,7 +5849,7 @@ impl eframe::App for SectorApp {
                 }
                 ui.add_space(10.0);
                 let label = if permanent { "Delete" } else { "Move to Recycle Bin" };
-                let (ok, no) = dialog_buttons(ui, label);
+                let (ok, no) = dialog_buttons(ui, label, permanent);
                 confirm |= ok;
                 cancel |= no;
                 // Enter confirms a recoverable recycle; a PERMANENT delete must be
@@ -5911,7 +5917,7 @@ impl eframe::App for SectorApp {
                     ui.colored_label(egui::Color32::from_rgb(224, 108, 108), e);
                 }
                 ui.add_space(10.0);
-                let (ok, no) = dialog_buttons(ui, "OK");
+                let (ok, no) = dialog_buttons(ui, "OK", false);
                 commit |= ok;
                 cancel |= no;
             });
