@@ -516,3 +516,19 @@ minute-plus and millions of nodes.
 
 **Supersedes:** the blanket "never auto-fired" clause of D18 for local,
 non-root folders. Everything else in D18 stands.
+
+## D21 — Network drives hidden by default (temporary)
+
+**Decided (2026-09-06):** The tree shows only local drives; mapped network
+(NAS) drives are hidden behind a "Network drives" toggle at the foot of the
+folder tree, **off by default**. A saved location on a network drive is
+redirected to a local drive at startup, and network pins are hidden while the
+toggle is off — so SECTOR does not enumerate or touch a hidden NAS drive.
+
+**Why.** The NAS work is on the back burner and one NAS drive is failing (bad
+sectors); the user wants SECTOR focused on the two local SSDs (C:, D:) and not
+walking the failing disk. Scanning is read-only metadata (no file contents),
+so it doesn't *cause* bad sectors, but there's no reason to keep walking a
+dying drive. Temporary: flip the toggle (or the default) to bring the NAS back.
+This does not undo D7/D9 (network drives are first-class) — it's a current
+visibility default, not a design reversal.

@@ -274,6 +274,15 @@ fn canonical_drive_case(p: PathBuf) -> PathBuf {
     }
 }
 
+/// The first non-network drive root (fallback C:\\), for opening somewhere safe
+/// when a saved location is on a now-hidden network drive.
+fn first_local_root() -> PathBuf {
+    enumerate_drives()
+        .into_iter()
+        .find(|p| !is_network_path(p))
+        .unwrap_or_else(|| PathBuf::from("C:\\\\"))
+}
+
 /// Are two paths the same folder, the Windows way (case-insensitive, trailing
 /// separators ignored)?
 fn same_folder(a: &Path, b: &Path) -> bool {
@@ -595,6 +604,13 @@ fn main() -> eframe::Result<()> {
                 app.pane.sort_asc = s.sort_asc;
                 app.auto_scan_local = s.auto_scan_local;
                 app.pins = s.pins.iter().map(PathBuf::from).collect();
+                app.show_network_drives = s.show_network_drives;
+                // Don't open onto a hidden network location (would list the NAS).
+                if !app.show_network_drives && is_network_path(&app.pane.current_dir) {
+                    let home = first_local_root();
+                    app.pane.current_dir = home.clone();
+                    app.pane.addr_edit = home.to_string_lossy().into_owned();
+                }
             }
             Ok(Box::new(app))
         }),
@@ -830,6 +846,10 @@ struct SectorApp {
     /// The two tree sections' open state.
     qa_open: bool,
     drives_open: bool,
+    /// Show mapped network drives (NAS) in the tree. Off by default for now —
+    /// the NAS work is back-burnered and one drive is failing; hiding them
+    /// keeps SECTOR from touching them at all.
+    show_network_drives: bool,
     /// Which part of the Files view the keyboard drives (focus follows your
     /// last click).
     focus_pane: Focus,
@@ -918,6 +938,7 @@ impl Default for SectorApp {
             qa_known: None,
             qa_open: true,
             drives_open: true,
+            show_network_drives: false,
             focus_pane: Focus::List,
             tree_scroll: false,
             sb_roots: Vec::new(),
@@ -971,6 +992,9 @@ struct Settings {
     /// Quick-access pins (folder paths).
     #[serde(default)]
     pins: Vec<String>,
+    /// Show mapped network drives in the tree (default off — NAS back-burnered).
+    #[serde(default)]
+    show_network_drives: bool,
 }
 
 fn default_true() -> bool {
@@ -989,6 +1013,7 @@ impl Default for Settings {
             sort_asc: true,
             auto_scan_local: true,
             pins: Vec::new(),
+            show_network_drives: false,
         }
     }
 }
@@ -2195,7 +2220,7 @@ impl SectorApp {
     /// subtrees, matching `sb_node`'s render order incl. the 400-child cap).
     fn sb_visible_nodes(&mut self) -> Vec<PathBuf> {
         if self.sb_roots.is_empty() {
-            self.sb_roots = enumerate_drives();
+            self.sb_roots = self.visible_drive_roots();
             self.sb_reveal();
         }
         let mut out = Vec::new();
@@ -2296,7 +2321,30 @@ impl SectorApp {
                 out.push(p.clone());
             }
         }
+        // Hide pins that live on a network drive while those are hidden.
+        if !self.show_network_drives {
+            out.retain(|p| !is_network_path(p));
+        }
         out
+    }
+
+    /// Toggle network drives: repopulate the roots, and if turning them off
+    /// while sitting on one, step to a local drive so it isn't listed.
+    fn set_show_network_drives(&mut self, show: bool) {
+        self.show_network_drives = show;
+        self.sb_roots.clear(); // repopulate with the new filter
+        self.sb_cache.clear();
+        if !show && is_network_path(&self.pane.current_dir) {
+            self.navigate_to(first_local_root());
+        }
+    }
+
+    /// Drive roots to show in the tree — network drives hidden unless enabled.
+    fn visible_drive_roots(&self) -> Vec<PathBuf> {
+        enumerate_drives()
+            .into_iter()
+            .filter(|p| self.show_network_drives || !is_network_path(p))
+            .collect()
     }
 
     fn is_pinned(&self, p: &Path) -> bool {
@@ -2317,7 +2365,7 @@ impl SectorApp {
     /// the drive roots — each with (recursively) its expanded subtree.
     fn sidebar_tree(&mut self, ui: &mut egui::Ui) {
         if self.sb_roots.is_empty() {
-            self.sb_roots = enumerate_drives();
+            self.sb_roots = self.visible_drive_roots();
             self.sb_reveal(); // open the path to wherever we start
         }
         let qa = self.quick_access();
@@ -2890,6 +2938,17 @@ impl SectorApp {
                     // (Scrollbars are solid app-wide — see the style setup in
                     // main — so the bar reserves its own space and the full-width
                     // row text can't run under it.)
+                    // Network-drives toggle, pinned at the bottom of the tree.
+                    egui::Panel::bottom("tree_net_toggle").show(ui, |ui| {
+                        let mut show = self.show_network_drives;
+                        if ui
+                            .checkbox(&mut show, "Network drives")
+                            .on_hover_text("Show mapped network (NAS) drives in the tree. Off keeps SECTOR from touching them.")
+                            .changed()
+                        {
+                            self.set_show_network_drives(show);
+                        }
+                    });
                     egui::ScrollArea::vertical()
                         .auto_shrink([false, false])
                         .show(ui, |ui| {
@@ -4958,6 +5017,7 @@ impl eframe::App for SectorApp {
             sort_asc: self.pane.sort_asc,
             auto_scan_local: self.auto_scan_local,
             pins: self.pins.iter().map(|p| p.to_string_lossy().into_owned()).collect(),
+            show_network_drives: self.show_network_drives,
         };
         eframe::set_value(storage, "settings", &s);
     }
