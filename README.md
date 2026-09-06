@@ -77,6 +77,8 @@ went.
 Flip to **City** to render the current folder as a 2.5D isometric cityscape:
 
 - **Area = size** · **Height = file count** · **Color = file type**
+- **Click a block** to select it (its Details show on the right); **double-click**
+  or **Enter** drills in, **Backspace** goes up. Drag orbits, wheel zooms.
 - **Live discovery build** — the map rises as it scans, not a blank spinner.
 - **Auto-scan** — entering a local folder with no cityscape yet starts its
   scan so you watch it build; network drives and drive roots wait for **Scan**

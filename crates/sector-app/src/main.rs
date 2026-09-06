@@ -798,6 +798,9 @@ struct SectorApp {
     op_error: Option<String>,
     /// Show the right-hand Properties panel for the selection.
     props_visible: bool,
+    /// The block selected in the City (single-click). Highlighted, and the
+    /// target of Enter / Details. Node ids are stable within the loaded tree.
+    city_sel: Option<NodeId>,
     /// Files currently being dragged over the window (from Explorer or any
     /// app), for the drop overlay. 0 when nothing is hovering.
     drop_hover: usize,
@@ -892,6 +895,7 @@ impl Default for SectorApp {
             undo_job: None,
             op_error: None,
             props_visible: false,
+            city_sel: None,
             drop_hover: 0,
             menu_open_at_start: false,
             sb_visible: true,
@@ -1479,6 +1483,7 @@ impl SectorApp {
         });
 
         self.root = Tree::ROOT;
+        self.city_sel = None;
         self.tiles.clear();
         self.scape = Scape::default();
         self.crystallize = false;
@@ -1542,6 +1547,7 @@ impl SectorApp {
             cancelled: false,
         };
         self.root = Tree::ROOT;
+        self.city_sel = None;
         self.scape = Scape::default();
         self.crystallize = true;
         self.reveal_start = Some(Instant::now()); // animate the city rising
@@ -1592,6 +1598,7 @@ impl SectorApp {
         self.menu_target = None;
         self.cache_freshness = Freshness::Unknown;
         self.city_note = None;
+        self.city_sel = None;
     }
 
     /// Point the City at `current_dir` (E2). Instant cache-load if one exists;
@@ -1866,6 +1873,10 @@ impl SectorApp {
     /// item — or, when the tree has focus or nothing is selected, the folder
     /// you're IN (as Explorer's details pane does).
     fn selected_properties(&self) -> Option<Vec<(&'static str, String)>> {
+        // City view: describe the selected block from the loaded tree.
+        if self.view == View::City {
+            return self.city_selected_properties();
+        }
         let tree_focus = self.focus_pane == Focus::Tree && self.sb_visible;
         let item = if tree_focus { None } else { self.pane.op_target().and_then(|i| self.pane.entries.get(i)) };
         match item {
@@ -1906,6 +1917,29 @@ impl SectorApp {
         let comps: Vec<&str> = cur_c[root_c.len()..].iter().map(String::as_str).collect();
         let t = tree.lock().ok()?;
         t.find_descendant(Tree::ROOT, &comps)
+    }
+
+    /// Details fields for the City's selected block (from the scan tree — it
+    /// has name, size, kind and counts, but no per-file dates).
+    fn city_selected_properties(&self) -> Option<Vec<(&'static str, String)>> {
+        let node_id = self.city_sel?;
+        let ScanState::Running { tree, .. } = &self.scan else { return None };
+        let t = tree.lock().ok()?;
+        if node_id.index() >= t.len() {
+            return None;
+        }
+        let node = t.node(node_id);
+        let comps = t.path_components(node_id);
+        let mut f: Vec<(&'static str, String)> = Vec::new();
+        f.push(("Name", node.name.to_string()));
+        f.push(("Location", joined_path(&comps[..comps.len().saturating_sub(1)])));
+        let is_dir = node.kind == NodeKind::Dir;
+        f.push(("Type", if is_dir { "Folder".into() } else { categorize(&node.name).label().to_string() }));
+        f.push(("Size", format!("{} ({} bytes)", human_size(node.subtree_size), commas(node.subtree_size))));
+        if is_dir {
+            f.push(("Contains", format!("{} items · {} files", commas(t.children(node_id).len() as u64), commas(node.file_count))));
+        }
+        Some(f)
     }
 
     /// The scanned subtree size of `dir`, if the City's completed (not
@@ -2485,6 +2519,53 @@ impl SectorApp {
         }
     }
 
+    /// The right-hand Details panel (both views), if `props_visible`.
+    fn show_details_panel(&mut self, ui: &mut egui::Ui) {
+        if !self.props_visible {
+            return;
+        }
+        let props = self.selected_properties();
+        let mut close = false;
+        egui::Panel::right("props_panel")
+            .resizable(true)
+            .default_size(300.0)
+            .min_size(220.0)
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.strong("Properties");
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("×").clicked() {
+                            close = true;
+                        }
+                    });
+                });
+                ui.separator();
+                match &props {
+                    Some(fields) => {
+                        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                            egui::Grid::new("props_grid")
+                                .num_columns(2)
+                                .spacing([12.0, 6.0])
+                                .striped(true)
+                                .show(ui, |ui| {
+                                    for (k, v) in fields {
+                                        ui.strong(*k);
+                                        ui.add(egui::Label::new(v).wrap());
+                                        ui.end_row();
+                                    }
+                                });
+                        });
+                    }
+                    None => {
+                        ui.weak("Select an item to see its details.");
+                    }
+                }
+            });
+        if close {
+            self.props_visible = false;
+        }
+    }
+
     /// The shared navigation strip: back / forward / up + the address bar. Drives
     /// `current_dir`, which BOTH views follow (E2).
     fn nav_bar(&mut self, ui: &mut egui::Ui) {
@@ -2710,49 +2791,8 @@ impl SectorApp {
             });
         });
 
-        // Right-hand Properties panel for the selection.
-        if self.props_visible {
-            let props = self.selected_properties();
-            let mut close = false;
-            egui::Panel::right("props_panel")
-                .resizable(true)
-                .default_size(300.0)
-                .min_size(220.0)
-                .show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.strong("Properties");
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui.button("×").clicked() {
-                                close = true;
-                            }
-                        });
-                    });
-                    ui.separator();
-                    match &props {
-                        Some(fields) => {
-                            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-                                egui::Grid::new("props_grid")
-                                    .num_columns(2)
-                                    .spacing([12.0, 6.0])
-                                    .striped(true)
-                                    .show(ui, |ui| {
-                                        for (k, v) in fields {
-                                            ui.strong(*k);
-                                            ui.add(egui::Label::new(v).wrap());
-                                            ui.end_row();
-                                        }
-                                    });
-                            });
-                        }
-                        None => {
-                            ui.weak("Select an item to see its details.");
-                        }
-                    }
-                });
-            if close {
-                self.props_visible = false;
-            }
-        }
+        // Right-hand Properties panel for the selection (shared with City).
+        self.show_details_panel(ui);
 
         if self.sb_visible {
             let panel_id = egui::Id::new("folder_tree");
@@ -5174,6 +5214,14 @@ impl eframe::App for SectorApp {
                     ui.separator();
                     ui.checkbox(&mut self.auto_scan_local, "Auto-scan local")
                         .on_hover_text("Entering a local folder that has no cityscape yet starts its scan (watch it build). Network drives and drive roots always wait for Scan.");
+                    ui.separator();
+                    if ui
+                        .selectable_label(self.props_visible, "Details")
+                        .on_hover_text("Details of the selected block (Alt+Enter)")
+                        .clicked()
+                    {
+                        self.props_visible = !self.props_visible;
+                    }
 
                     // Offer an instant load if a cache exists for this folder
                     // (age precomputed in sync_city — no per-frame stat).
@@ -5290,6 +5338,9 @@ impl eframe::App for SectorApp {
             });
         });
 
+        // Right-hand Details panel for the selected block (shared with Files).
+        self.show_details_panel(ui);
+
         // ---- Central: the treemap -------------------------------------------
         egui::CentralPanel::default().show(ui, |ui| {
             let ScanState::Running { tree, stats, .. } = &self.scan else {
@@ -5327,13 +5378,34 @@ impl eframe::App for SectorApp {
                 }
             }
 
+            let typing_city = ctx.memory(|m| m.focused()).is_some();
             // Backspace goes up a level (ignored while typing in the path box).
             if self.root != Tree::ROOT
-                && ctx.memory(|m| m.focused()).is_none()
+                && !typing_city
                 && ctx.input(|i| i.key_pressed(egui::Key::Backspace))
             {
                 let t = tree.lock().unwrap_or_else(|e| e.into_inner());
                 self.root = t.node(self.root).parent;
+                self.city_sel = None;
+            }
+            // Alt+Enter shows the selected block's Details.
+            if self.city_sel.is_some()
+                && !typing_city
+                && ctx.input(|i| i.modifiers.alt && i.key_pressed(egui::Key::Enter))
+            {
+                self.props_visible = true;
+            }
+            // Enter drills into the selected block (if it's a non-empty folder).
+            if let Some(sel) = self.city_sel {
+                if !typing_city && ctx.input(|i| !i.modifiers.alt && i.key_pressed(egui::Key::Enter)) {
+                    let t = tree.lock().unwrap_or_else(|e| e.into_inner());
+                    if sel != self.root
+                        && t.node(sel).kind == NodeKind::Dir
+                        && !t.children(sel).is_empty()
+                    {
+                        self.root = sel;
+                    }
+                }
             }
 
             // (Re)build the cityscape when the view changed, on crystallize, or —
@@ -5430,6 +5502,21 @@ impl eframe::App for SectorApp {
                     painter.add(Shape::convex_polygon(q.to_vec(), shade(b.color, *f), edge));
                 }
                 painter.add(Shape::convex_polygon(b.top.to_vec(), shade(b.color, F_TOP), edge));
+                // Persistent selection outline (single-click), in the selection
+                // colour — drawn under the hover halo so hover still reads.
+                if Some(b.node) == self.city_sel && Some(i) != hovered {
+                    let sel_c = ui.visuals().selection.bg_fill;
+                    let dark = Stroke::new(3.0, Color32::from_black_alpha(180));
+                    let bright = Stroke::new(1.8, sel_c);
+                    let faces: Vec<&[Pos2; 4]> =
+                        b.sides.iter().map(|(q, _)| q).chain(std::iter::once(&b.top)).collect();
+                    for f in &faces {
+                        painter.add(Shape::convex_polygon(f.to_vec(), Color32::TRANSPARENT, dark));
+                    }
+                    for f in &faces {
+                        painter.add(Shape::convex_polygon(f.to_vec(), Color32::TRANSPARENT, bright));
+                    }
+                }
                 if Some(i) == hovered {
                     // Halo outline: a dark stroke under a bright one, so the
                     // highlight is visible on ANY block color (incl. orange-on-
@@ -5474,8 +5561,14 @@ impl eframe::App for SectorApp {
                 if drillable {
                     ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
                 }
-                if response.clicked() && drillable {
+                // Single-click selects the block (highlight + Details); a
+                // double-click drills into it, matching the Files list.
+                if response.clicked() {
+                    self.city_sel = Some(node_id);
+                }
+                if response.double_clicked() && drillable {
                     self.root = node_id;
+                    self.city_sel = Some(node_id);
                 }
             }
 
