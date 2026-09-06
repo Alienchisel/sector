@@ -31,9 +31,10 @@ browsing, not a separate tool.
   confirmations, and never-overwrite copy semantics. See DECISIONS D16.
 - **Native.** A single self-contained Windows executable. No runtime, no install
   ceremony.
-- **Sees every drive.** Local disks, external drives, **and mapped network
-  drives (NAS)** — each handled the best way for its type, and none treated as
-  second-class. See DECISIONS D7, D9.
+- **Sees every drive.** Local disks, external drives, and mapped network
+  drives (NAS). Network drives are **hidden by default for now** (a
+  "Network drives" toggle at the foot of the folder tree brings them back;
+  SECTOR won't touch a hidden drive — see DECISIONS D21).
 
 ## Non-goals
 

@@ -117,6 +117,9 @@ Windows.
 - [`docs/DECISIONS.md`](docs/DECISIONS.md) — design decisions (D1–D19)
 - [`docs/README.md`](docs/README.md) — goals & non-goals
 
+> **Note (2026-09):** network (NAS) drives are hidden by default right now;
+> a *Network drives* toggle at the foot of the folder tree brings them back.
+
 ## Status
 
 Active development. **Windows-only by design** — it leans on Windows filesystem
