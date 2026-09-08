@@ -117,8 +117,9 @@ Windows.
 - [`docs/DECISIONS.md`](docs/DECISIONS.md) — design decisions (D1–D19)
 - [`docs/README.md`](docs/README.md) — goals & non-goals
 
-> **Note (2026-09):** network (NAS) drives are hidden by default right now;
-> a *Network drives* toggle at the foot of the folder tree brings them back.
+> **Note (2026-09):** the app is explorer-focused right now — the City
+> visualizer and network (NAS) drives are hidden by default. The **⚙ menu** in
+> the top strip re-enables either.
 
 ## Status
 

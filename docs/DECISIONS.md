@@ -532,3 +532,18 @@ so it doesn't *cause* bad sectors, but there's no reason to keep walking a
 dying drive. Temporary: flip the toggle (or the default) to bring the NAS back.
 This does not undo D7/D9 (network drives are first-class) — it's a current
 visibility default, not a design reversal.
+
+## D22 — City view hidden by default (temporary; explorer focus)
+
+**Decided (2026-09-08):** The City (2.5D visualizer) is hidden by default. The
+Files/City tabs only appear when "City view" is enabled from a new ⚙ settings
+menu in the top strip; while off, the view is forced to Files. All City code —
+scan, cache, camera, block selection — stays compiled and intact; only the UI
+entry points are gated.
+
+**Why.** The explorer is the daily-use surface and the current focus; the
+City's headline scenario (watching a huge NAS build) is paused with the NAS
+(D21). Hiding it gives a cleaner single-purpose explorer to polish and shrinks
+what each build has to exercise, without discarding the differentiator or the
+recent scene/camera work. Reversible in one click. Not a reversal of D16/D12 —
+a visibility default. The ⚙ menu also now hosts the D21 network-drives toggle.

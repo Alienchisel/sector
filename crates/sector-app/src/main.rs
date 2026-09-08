@@ -605,6 +605,7 @@ fn main() -> eframe::Result<()> {
                 app.auto_scan_local = s.auto_scan_local;
                 app.pins = s.pins.iter().map(PathBuf::from).collect();
                 app.show_network_drives = s.show_network_drives;
+                app.city_enabled = s.city_enabled;
                 // Don't open onto a hidden network location (would list the NAS).
                 if !app.show_network_drives && is_network_path(&app.pane.current_dir) {
                     let home = first_local_root();
@@ -850,6 +851,9 @@ struct SectorApp {
     /// the NAS work is back-burnered and one drive is failing; hiding them
     /// keeps SECTOR from touching them at all.
     show_network_drives: bool,
+    /// Show the City (visualizer) view. Off for now — the explorer is the
+    /// focus; the City code stays, just hidden behind the ⚙ menu.
+    city_enabled: bool,
     /// Which part of the Files view the keyboard drives (focus follows your
     /// last click).
     focus_pane: Focus,
@@ -939,6 +943,7 @@ impl Default for SectorApp {
             qa_open: true,
             drives_open: true,
             show_network_drives: false,
+            city_enabled: false,
             focus_pane: Focus::List,
             tree_scroll: false,
             sb_roots: Vec::new(),
@@ -995,6 +1000,9 @@ struct Settings {
     /// Show mapped network drives in the tree (default off — NAS back-burnered).
     #[serde(default)]
     show_network_drives: bool,
+    /// Show the City (visualizer) view (default off — explorer focus).
+    #[serde(default)]
+    city_enabled: bool,
 }
 
 fn default_true() -> bool {
@@ -1014,6 +1022,7 @@ impl Default for Settings {
             auto_scan_local: true,
             pins: Vec::new(),
             show_network_drives: false,
+            city_enabled: false,
         }
     }
 }
@@ -2938,17 +2947,6 @@ impl SectorApp {
                     // (Scrollbars are solid app-wide — see the style setup in
                     // main — so the bar reserves its own space and the full-width
                     // row text can't run under it.)
-                    // Network-drives toggle, pinned at the bottom of the tree.
-                    egui::Panel::bottom("tree_net_toggle").show(ui, |ui| {
-                        let mut show = self.show_network_drives;
-                        if ui
-                            .checkbox(&mut show, "Network drives")
-                            .on_hover_text("Show mapped network (NAS) drives in the tree. Off keeps SECTOR from touching them.")
-                            .changed()
-                        {
-                            self.set_show_network_drives(show);
-                        }
-                    });
                     egui::ScrollArea::vertical()
                         .auto_shrink([false, false])
                         .show(ui, |ui| {
@@ -5018,6 +5016,7 @@ impl eframe::App for SectorApp {
             auto_scan_local: self.auto_scan_local,
             pins: self.pins.iter().map(|p| p.to_string_lossy().into_owned()).collect(),
             show_network_drives: self.show_network_drives,
+            city_enabled: self.city_enabled,
         };
         eframe::set_value(storage, "settings", &s);
     }
@@ -5333,13 +5332,32 @@ impl eframe::App for SectorApp {
         }
 
         // ---- Top strip: identity + view mode + shared navigation -----------
+        // The City is optional (off for now); keep the view on Files while hidden.
+        if !self.city_enabled {
+            self.view = View::List;
+        }
         egui::Panel::top("mode").show(ui, |ui| {
             ui.horizontal(|ui| {
-                // (No app-name label here: the window title already says SECTOR.)
-                ui.selectable_value(&mut self.view, View::List, "Files");
-                ui.selectable_value(&mut self.view, View::City, "City");
+                // A small settings menu (the window title already shows SECTOR).
+                ui.menu_button("⚙", |ui| {
+                    ui.checkbox(&mut self.city_enabled, "City view")
+                        .on_hover_text("Show the 2.5D cityscape visualizer as a second view.");
+                    let mut net = self.show_network_drives;
+                    if ui
+                        .checkbox(&mut net, "Network drives")
+                        .on_hover_text("Show mapped network (NAS) drives in the folder tree. Off keeps SECTOR from touching them.")
+                        .changed()
+                    {
+                        self.set_show_network_drives(net);
+                    }
+                });
+                if self.city_enabled {
+                    ui.separator();
+                    ui.selectable_value(&mut self.view, View::List, "Files");
+                    ui.selectable_value(&mut self.view, View::City, "City");
+                }
                 ui.separator();
-                self.nav_bar(ui); // back / forward / up + address (both views)
+                self.nav_bar(ui); // back / forward / up + address
             });
         });
 
