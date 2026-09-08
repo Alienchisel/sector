@@ -2343,8 +2343,15 @@ impl SectorApp {
         self.show_network_drives = show;
         self.sb_roots.clear(); // repopulate with the new filter
         self.sb_cache.clear();
-        if !show && is_network_path(&self.pane.current_dir) {
-            self.navigate_to(first_local_root());
+        if !show {
+            // Step off a network location, and drop network folders from
+            // history so Back/Forward can't navigate onto (and list) a hidden
+            // drive.
+            self.pane.back_stack.retain(|(p, _)| !is_network_path(p));
+            self.pane.fwd_stack.retain(|(p, _)| !is_network_path(p));
+            if is_network_path(&self.pane.current_dir) {
+                self.navigate_to(first_local_root());
+            }
         }
     }
 
