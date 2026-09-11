@@ -35,7 +35,7 @@ went.
   totals and the drive's free space.
 - **Filter** the current folder as you type (`Ctrl+F`), and a **hidden-files**
   toggle that applies to the list and the folder tree alike.
-- **Details** panel (`Alt+Enter`, or the toolbar toggle) — path, sizes, dates,
+- **Details** panel (`Alt+Enter` opens, `Alt+Shift+P` toggles, or the toolbar toggle) — path, sizes, dates,
   attributes, and a **thumbnail preview** for images (jpg/png/gif/bmp/webp),
   decoded off the UI thread and cached.
 - **Multi-select** — click / `Ctrl`-click / `Shift`-click / `Ctrl+A`, or drag a

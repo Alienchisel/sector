@@ -5377,6 +5377,11 @@ impl eframe::App for SectorApp {
             && ctx.memory(|m| m.focused()).is_none()
             && !self.menu_open_at_start
             && !egui::Popup::is_any_open(&ctx);
+        // Alt+Shift+P toggles the Details pane (Explorer parity; Alt+Enter only
+        // opens it, the ⚙-less way to hide it from the keyboard).
+        if kb_free && ctx.input(|i| i.modifiers.alt && i.modifiers.shift && i.key_pressed(egui::Key::P)) {
+            self.props_visible = !self.props_visible;
+        }
         if kb_free
             && ctx.input(|i| {
                 i.key_pressed(egui::Key::F4)
