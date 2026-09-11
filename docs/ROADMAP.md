@@ -207,6 +207,15 @@ Deliberately *not* scheduled — captured so they don't distract us:
   plinth — a metro area. Blocks carry a drive index beside the node so hover /
   drill consult the right tree. Must stay deliberate (never auto-scanned).
   Medium-large. Fits D9.
+- **Thumbnail grid view** ("Large icons"; user idea, 2026-09-10). A second Files
+  layout beside the Details list: a grid of thumbnails, the image-friendly view.
+  Reuses the Details preview machinery — `decode_thumb` + the texture cache —
+  just laid out as cells instead of one pane; a folder/file glyph for
+  non-images. A List/Grid view toggle (persisted), a thumbnail size, and a
+  virtualized grid (only decode visible cells; the cache already caps + evicts,
+  and cancels superseded decodes). Highest-value of Explorer's icon/tile/content
+  layouts — the others (Tiles, Content, the size variants) are lower priority
+  once a grid exists. Medium.
 - **Recursive search** (Ctrl+F; user idea, 2026-09-10 — examine later). Today
   Ctrl+F focuses a *filter* that narrows the CURRENT folder's listing as you
   type; Windows Explorer's Ctrl+F box searches the folder AND its subfolders.
