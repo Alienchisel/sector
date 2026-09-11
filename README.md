@@ -27,7 +27,7 @@ went.
   expands or collapses it. Drag the divider to resize the tree, or
   **double-click it** to fit the widest visible row.
 - **Navigation** — a clickable breadcrumb; click the bar's empty space (or
-  `Alt+D` / `Ctrl+L` / `F4`) to type a path instead. Plus **Back/Forward/Up** (`Alt+←` / `Alt+→` / `Backspace` or `Alt+↑`)
+  `Alt+D` / `Ctrl+L` / `F4`) to type a path instead. Plus **Back/Forward/Up** (`Alt+←` or `Backspace` / `Alt+→` / `Alt+↑`)
   with history — each puts you back on the item you were on.
 - **List** — Name / Size / Type / Modified, sortable (remembered across
   launches), resizable, virtualized for huge folders, file-type–colored. Folder

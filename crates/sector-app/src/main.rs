@@ -3148,8 +3148,10 @@ impl SectorApp {
                 self.sb_cache.clear();
                 self.invalidate_thumbs();
             }
+            // Backspace = Back (history), matching modern Windows Explorer; Up is
+            // Alt+Up and the ↑ button.
             if ui.input(|i| i.key_pressed(egui::Key::Backspace)) {
-                self.go_up();
+                self.go_back();
             }
             // Tab switches focus between the tree and the list (consume it so egui
             // doesn't also use it for widget-focus traversal).
