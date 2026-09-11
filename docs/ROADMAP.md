@@ -207,6 +207,26 @@ Deliberately *not* scheduled — captured so they don't distract us:
   plinth — a metro area. Blocks carry a drive index beside the node so hover /
   drill consult the right tree. Must stay deliberate (never auto-scanned).
   Medium-large. Fits D9.
+- **Recursive search** (Ctrl+F; user idea, 2026-09-10 — examine later). Today
+  Ctrl+F focuses a *filter* that narrows the CURRENT folder's listing as you
+  type; Windows Explorer's Ctrl+F box searches the folder AND its subfolders.
+  Consider matching Windows. Design questions to settle first:
+  - **Filter vs search, one box or two.** Either replace the filter with a
+    search that starts shallow (instant, current folder) and expands into
+    subfolders in the background, or keep the instant filter and add a separate
+    "search here" (Enter, or a scope toggle). Leaning: one box, filter-first,
+    escalate to recursive on a short pause / Enter, so the common case stays
+    instant.
+  - **Background + cancellable.** A recursive walk must run off the UI thread
+    (reuse the sector-scan walker or list_dir), stream results into a flat
+    results view, and cancel when the query changes or you navigate — the same
+    superseded-result discipline as the thumbnail decoder.
+  - **Results view.** A flat list of matches with their parent folders (each row
+    navigable / revealable), replacing the folder listing while searching; clear
+    it on Esc / navigation.
+  - **SMB caveat.** Recursive search over a NAS is a full walk — slow and, right
+    now, exactly the thing we're keeping off the failing drive (D21). Gate it to
+    local drives, or make the depth/scope explicit.
 - **Preview pane** (larger, preview-only, Alt+P; later). A dedicated pane for
   bigger previews and more types (PDF, text, …), sharing the Details
   thumbnail's decode/cache. The Details pane already shows an image thumbnail
