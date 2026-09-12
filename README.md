@@ -103,6 +103,9 @@ The core, layout, and file-op logic are OS-agnostic and unit-tested; only the GU
 and the Windows-specific paths (USN, drive/network detection, Recycle Bin) require
 Windows.
 
+Text uses **Segoe UI** on Windows, with CJK and Segoe UI Historic (Cuneiform
+and other ancient scripts) loaded as fallbacks so unusual filenames render.
+
 ## Layout
 
 | Crate | Role |

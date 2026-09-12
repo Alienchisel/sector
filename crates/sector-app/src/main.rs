@@ -568,6 +568,28 @@ const RELAYOUT_THROTTLE: Duration = Duration::from_millis(600);
 /// tunable in the UI so it can be benchmarked on the real NAS.
 const DEFAULT_THREADS: usize = 48;
 
+/// Load a font from the Windows font directory into `fonts`' proportional
+/// family: `front` makes it the primary, otherwise it's appended as a fallback.
+/// Returns whether it loaded. Missing files are skipped silently.
+#[cfg(windows)]
+fn add_sys_font(fonts: &mut egui::FontDefinitions, key: &str, file: &str, front: bool) -> bool {
+    match std::fs::read(format!("C:\\\\Windows\\\\Fonts\\\\{file}")) {
+        Ok(bytes) => {
+            fonts
+                .font_data
+                .insert(key.to_owned(), Arc::new(egui::FontData::from_owned(bytes)));
+            let fam = fonts.families.entry(egui::FontFamily::Proportional).or_default();
+            if front {
+                fam.insert(0, key.to_owned());
+            } else {
+                fam.push(key.to_owned());
+            }
+            true
+        }
+        Err(_) => false,
+    }
+}
+
 fn main() -> eframe::Result<()> {
     env_logger::init();
 
@@ -604,22 +626,23 @@ fn main() -> eframe::Result<()> {
                 s.visuals.selection.bg_fill = Color32::from_rgb(0x2c, 0x5c, 0xa8);
                 s.visuals.selection.stroke.color = Color32::from_rgb(0xf2, 0xf6, 0xff);
             });
-            // Use Segoe UI (the native Windows UI font) for a crisper, native
-            // look; egui's bundled Ubuntu-Light stays as the fallback (and the
-            // emoji / monospace families are untouched). Falls back silently if
-            // Segoe isn't present.
+            // Fonts, loaded from the Windows font dir. Segoe UI is the primary
+            // (crisp, native); CJK and Segoe UI Historic (Cuneiform + other
+            // ancient scripts) are appended as fallbacks so filenames in those
+            // scripts render instead of boxes. egui's Ubuntu-Light/emoji stay in
+            // between. Missing files are skipped; a bad face epaint ignores.
             #[cfg(windows)]
-            if let Ok(bytes) = std::fs::read("C:\\\\Windows\\\\Fonts\\\\segoeui.ttf") {
+            {
                 let mut fonts = egui::FontDefinitions::default();
-                fonts
-                    .font_data
-                    .insert("segoe".to_owned(), Arc::new(egui::FontData::from_owned(bytes)));
-                fonts
-                    .families
-                    .entry(egui::FontFamily::Proportional)
-                    .or_default()
-                    .insert(0, "segoe".to_owned());
-                cc.egui_ctx.set_fonts(fonts);
+                let mut any = false;
+                any |= add_sys_font(&mut fonts, "segoe", "segoeui.ttf", true); // Latin/Cyrillic/Greek
+                any |= add_sys_font(&mut fonts, "cjk_jp", "YuGothR.ttc", false); // Japanese
+                any |= add_sys_font(&mut fonts, "cjk_sc", "msyh.ttc", false); // Simplified Chinese
+                any |= add_sys_font(&mut fonts, "cjk_kr", "malgun.ttf", false); // Korean
+                any |= add_sys_font(&mut fonts, "historic", "seguihis.ttf", false); // Cuneiform + ancient
+                if any {
+                    cc.egui_ctx.set_fonts(fonts);
+                }
             }
             if let Some(rs) = &cc.wgpu_render_state {
                 let info = rs.adapter.get_info();
