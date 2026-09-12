@@ -216,6 +216,11 @@ Deliberately *not* scheduled — captured so they don't distract us:
   and cancels superseded decodes). Highest-value of Explorer's icon/tile/content
   layouts — the others (Tiles, Content, the size variants) are lower priority
   once a grid exists. Medium.
+  - **Ctrl+scroll to resize thumbnails** (Windows parity; user idea,
+    2026-09-11). Conflict to resolve: SECTOR already uses Ctrl+wheel for UI
+    zoom. Plan: over the grid, Ctrl+wheel changes the thumbnail size; keep UI
+    zoom for Ctrl+wheel elsewhere (the list, the tree, chrome). Persist the
+    grid size with the List/Grid toggle.
 - **Recursive search** (Ctrl+F; user idea, 2026-09-10 — examine later). Today
   Ctrl+F focuses a *filter* that narrows the CURRENT folder's listing as you
   type; Windows Explorer's Ctrl+F box searches the folder AND its subfolders.
