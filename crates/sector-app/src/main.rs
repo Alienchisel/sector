@@ -3508,9 +3508,12 @@ impl SectorApp {
             // other columns would be pushed off the edge. Resize the others;
             // Name absorbs the difference.
             .column(Column::remainder().at_least(220.0).clip(true).resizable(false))
-            .column(Column::auto().at_least(90.0))
-            .column(Column::auto().at_least(90.0))
-            .column(Column::auto().at_least(90.0));
+            .column(Column::auto().at_least(90.0)) // Size
+            .column(Column::auto().at_least(90.0)) // Type
+            // Modified: the last column is non-resizable so egui_extras draws no
+            // resize handle past it (a handle with no column to its right reads
+            // as a bug). Size/Type stay resizable; Name (remainder) absorbs slack.
+            .column(Column::auto().at_least(90.0).resizable(false));
         if let Some(row) = scroll_target {
             table = table.scroll_to_row(row, None);
         }
