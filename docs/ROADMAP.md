@@ -292,6 +292,21 @@ Deliberately *not* scheduled — captured so they don't distract us:
   via `show_pane_list` with pane-relative widget ids. Remaining: a second
   `Pane`, an active index, Tab between panes, F5/F6 to the other pane, and
   the City following the *active* pane (D18 generalised).
+- **Tabs** (Ctrl+T new tab, Ctrl+W close, Ctrl+Tab / Ctrl+1..? switch; user
+  idea, 2026-09-11 — preferred over multiple OS windows). Each tab is a `Pane`
+  (the same struct the dual-pane work extracted), sharing the clipboard, undo
+  stack, background jobs and the folder tree; a tab strip above the list; the
+  active tab drives the City. This is the "several locations open at once" case
+  that Explorer now uses tabs (not windows) for, and it reuses the pane
+  architecture already in place. Note: Ctrl+1..9 currently jump to Quick access
+  — if tabs want those, rebind (Explorer uses Ctrl+1.. for tabs; Quick access
+  could move to Alt+1..).
+- **Multiple windows** (Ctrl+N; considered 2026-09-11 — lower priority). The
+  side-by-side and drag-between needs are better served by dual-pane + tabs
+  above. If literal Ctrl+N is wanted, the cheap path is spawning a second
+  SECTOR *process* (a real independent window, own state; only wrinkle is two
+  instances both persisting settings on close). True in-process multi-viewport
+  (egui 0.36 viewports) is more plumbing for little gain over tabs.
 - **FSN-style City** (SGI File System Navigator; user idea, 2026-09-05). A
   free perspective fly-through: folders as plinths connected to their
   children, files as blocks on them. Attaches to Step 3b (true-3D wgpu +
