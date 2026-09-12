@@ -292,7 +292,7 @@ Deliberately *not* scheduled — captured so they don't distract us:
   via `show_pane_list` with pane-relative widget ids. Remaining: a second
   `Pane`, an active index, Tab between panes, F5/F6 to the other pane, and
   the City following the *active* pane (D18 generalised).
-- **Tabs** (Ctrl+T new tab, Ctrl+W close, Ctrl+Tab / Ctrl+1..? switch; user
+- **Tabs** (Ctrl+T new tab, Ctrl+W close, Ctrl+Tab / Ctrl+Shift+Tab next/prev, Ctrl+1..9 by number; user
   idea, 2026-09-11 — preferred over multiple OS windows). Each tab is a `Pane`
   (the same struct the dual-pane work extracted), sharing the clipboard, undo
   stack, background jobs and the folder tree; a tab strip above the list; the
