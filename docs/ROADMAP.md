@@ -221,6 +221,13 @@ Deliberately *not* scheduled — captured so they don't distract us:
     zoom. Plan: over the grid, Ctrl+wheel changes the thumbnail size; keep UI
     zoom for Ctrl+wheel elsewhere (the list, the tree, chrome). Persist the
     grid size with the List/Grid toggle.
+- **Shift+Delete — permanent delete** (Windows parity; deferred 2026-09-11,
+  reconsider later). Currently omitted on purpose: Delete → Recycle Bin, which
+  Ctrl+Z can undo. A permanent delete is NOT undoable (undo restores from the
+  Recycle Bin), which is the main reason it's out. If added: route it through
+  the existing permanent-delete path + the red "won't go to the Recycle Bin"
+  confirmation (explicit click, no Enter) rather than Windows' raw instant
+  delete — parity for the muscle memory without the footgun.
 - **Recursive search** (Ctrl+F; user idea, 2026-09-10 — examine later). Today
   Ctrl+F focuses a *filter* that narrows the CURRENT folder's listing as you
   type; Windows Explorer's Ctrl+F box searches the folder AND its subfolders.
