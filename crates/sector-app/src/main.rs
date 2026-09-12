@@ -274,6 +274,26 @@ fn canonical_drive_case(p: PathBuf) -> PathBuf {
     }
 }
 
+/// Is this virtual-key currently down, per the OS? (Windows.) egui-winit
+/// intercepts Ctrl+C/X/V and never delivers the key event, so the clipboard
+/// shortcuts read the keys straight from the OS instead. Everything else still
+/// comes through egui normally.
+#[cfg(windows)]
+fn os_key_down(vk: i32) -> bool {
+    #[link(name = "user32")]
+    extern "system" {
+        fn GetAsyncKeyState(v: i32) -> i16;
+    }
+    (unsafe { GetAsyncKeyState(vk) } as u16 & 0x8000) != 0
+}
+#[cfg(not(windows))]
+fn os_key_down(_vk: i32) -> bool {
+    false
+}
+const VK_C: i32 = 0x43;
+const VK_X: i32 = 0x58;
+const VK_V: i32 = 0x56;
+
 /// The first non-network drive root (fallback C:\\), for opening somewhere safe
 /// when a saved location is on a now-hidden network drive.
 fn first_local_root() -> PathBuf {
@@ -830,6 +850,10 @@ struct SectorApp {
     drop_hover: usize,
     /// Fullscreen (F11) — tracked so the toggle knows which way to flip.
     fullscreen: bool,
+    /// Previous OS down-state of [C, X, V] and this frame's fresh-press edge,
+    /// for the clipboard shortcuts egui-winit swallows (see [`os_key_down`]).
+    clip_key_prev: [bool; 3],
+    clip_key_edge: [bool; 3],
     /// Whether the window had focus last frame — a false→true transition
     /// refreshes the current folder, so an external edit (e.g. a file you
     /// opened and changed) shows without a manual F5.
@@ -938,6 +962,8 @@ impl Default for SectorApp {
             thumb_failed: HashSet::new(),
             drop_hover: 0,
             fullscreen: false,
+            clip_key_prev: [false; 3],
+            clip_key_edge: [false; 3],
             menu_open_at_start: false,
             was_focused: true,
             sb_visible: true,
@@ -3114,7 +3140,7 @@ impl SectorApp {
                 self.go_up();
             }
             // Ctrl+Shift+C: copy the path(s) — the focused folder, or the selection.
-            if ui.input(|i| i.modifiers.ctrl && i.modifiers.shift && i.key_pressed(egui::Key::C)) {
+            if ui.input(|i| i.modifiers.ctrl && i.modifiers.shift) && self.clip_key_edge[0] {
                 let paths = if tree_focus { vec![self.pane.current_dir.clone()] } else { self.pane.selected_paths() };
                 if !paths.is_empty() {
                     let text: Vec<String> = paths.iter().map(|p| p.to_string_lossy().into_owned()).collect();
@@ -3195,13 +3221,13 @@ impl SectorApp {
             }
             // Ctrl+C copy, Ctrl+X cut, Ctrl+V paste (not Shift, to avoid clashing
             // with Ctrl+Shift+N).
-            if ui.input(|i| i.modifiers.ctrl && !i.modifiers.shift && i.key_pressed(egui::Key::C)) {
+            if ui.input(|i| i.modifiers.ctrl && !i.modifiers.shift) && self.clip_key_edge[0] {
                 if tree_focus { self.clip_current_dir(false) } else { self.clip_selected(false) }
             }
-            if ui.input(|i| i.modifiers.ctrl && !i.modifiers.shift && i.key_pressed(egui::Key::X)) {
+            if ui.input(|i| i.modifiers.ctrl && !i.modifiers.shift) && self.clip_key_edge[1] {
                 if tree_focus { self.clip_current_dir(true) } else { self.clip_selected(true) }
             }
-            if ui.input(|i| i.modifiers.ctrl && !i.modifiers.shift && i.key_pressed(egui::Key::V)) {
+            if ui.input(|i| i.modifiers.ctrl && !i.modifiers.shift) && self.clip_key_edge[2] {
                 self.start_paste();
             }
             // Ctrl+Z: undo the last rename / new folder / paste / delete.
@@ -5039,6 +5065,20 @@ impl eframe::App for SectorApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.menu_open_at_start = egui::Popup::is_any_open(&ctx);
+
+        // OS-level edge detect for Ctrl+C/X/V: egui-winit turns these into
+        // Copy/Cut/Paste events and drops the key, and for a FILE clipboard the
+        // Paste event isn't even emitted — so read the keys from the OS. Only
+        // count a fresh press while the window has focus (GetAsyncKeyState is
+        // global); the actual guards (not typing, etc.) are at the use sites.
+        {
+            let focused = ctx.input(|i| i.focused);
+            let down = [os_key_down(VK_C), os_key_down(VK_X), os_key_down(VK_V)];
+            for k in 0..3 {
+                self.clip_key_edge[k] = focused && down[k] && !self.clip_key_prev[k];
+                self.clip_key_prev[k] = down[k];
+            }
+        }
 
         // Ctrl+wheel (and touchpad pinch) zoom the UI, like Ctrl+= / Ctrl+- do.
         // egui already turns those gestures into a zoom delta (and keeps them
