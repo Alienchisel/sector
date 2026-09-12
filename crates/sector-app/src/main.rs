@@ -828,6 +828,8 @@ struct SectorApp {
     /// Files currently being dragged over the window (from Explorer or any
     /// app), for the drop overlay. 0 when nothing is hovering.
     drop_hover: usize,
+    /// Fullscreen (F11) — tracked so the toggle knows which way to flip.
+    fullscreen: bool,
     /// Whether the window had focus last frame — a false→true transition
     /// refreshes the current folder, so an external edit (e.g. a file you
     /// opened and changed) shows without a manual F5.
@@ -935,6 +937,7 @@ impl Default for SectorApp {
             thumb_pending: None,
             thumb_failed: HashSet::new(),
             drop_hover: 0,
+            fullscreen: false,
             menu_open_at_start: false,
             was_focused: true,
             sb_visible: true,
@@ -5377,6 +5380,11 @@ impl eframe::App for SectorApp {
             && ctx.memory(|m| m.focused()).is_none()
             && !self.menu_open_at_start
             && !egui::Popup::is_any_open(&ctx);
+        // F11 toggles fullscreen (Explorer parity).
+        if kb_free && ctx.input(|i| i.key_pressed(egui::Key::F11)) {
+            self.fullscreen = !self.fullscreen;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.fullscreen));
+        }
         // Alt+Shift+P toggles the Details pane (Explorer parity; Alt+Enter only
         // opens it, the ⚙-less way to hide it from the keyboard).
         if kb_free && ctx.input(|i| i.modifiers.alt && i.modifiers.shift && i.key_pressed(egui::Key::P)) {
