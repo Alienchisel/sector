@@ -604,6 +604,23 @@ fn main() -> eframe::Result<()> {
                 s.visuals.selection.bg_fill = Color32::from_rgb(0x2c, 0x5c, 0xa8);
                 s.visuals.selection.stroke.color = Color32::from_rgb(0xf2, 0xf6, 0xff);
             });
+            // Use Segoe UI (the native Windows UI font) for a crisper, native
+            // look; egui's bundled Ubuntu-Light stays as the fallback (and the
+            // emoji / monospace families are untouched). Falls back silently if
+            // Segoe isn't present.
+            #[cfg(windows)]
+            if let Ok(bytes) = std::fs::read("C:\\\\Windows\\\\Fonts\\\\segoeui.ttf") {
+                let mut fonts = egui::FontDefinitions::default();
+                fonts
+                    .font_data
+                    .insert("segoe".to_owned(), Arc::new(egui::FontData::from_owned(bytes)));
+                fonts
+                    .families
+                    .entry(egui::FontFamily::Proportional)
+                    .or_default()
+                    .insert(0, "segoe".to_owned());
+                cc.egui_ctx.set_fonts(fonts);
+            }
             if let Some(rs) = &cc.wgpu_render_state {
                 let info = rs.adapter.get_info();
                 eprintln!(
@@ -3425,13 +3442,6 @@ impl SectorApp {
             });
             return;
         }
-        if self.pane.entries.is_empty() {
-            ui.centered_and_justified(|ui| {
-                ui.weak("(empty folder)");
-            });
-            return;
-        }
-
         use egui_extras::{Column, TableBuilder};
 
         // Move entries out of self so the table closures don't fight the
@@ -3550,7 +3560,18 @@ impl SectorApp {
                 h.col(|ui| header_cell(ui, format!("Type{}", arrow(SortKey::Kind)), &mut new_sort, SortKey::Kind));
                 h.col(|ui| header_cell_r(ui, format!("Modified{}", arrow(SortKey::Modified)), &mut new_sort, SortKey::Modified));
             })
-            .body(|body| {
+            .body(|mut body| {
+                // Keep the column headers for an empty folder (Explorer does);
+                // a single hint row stands in for the listing.
+                if entries.is_empty() {
+                    body.row(22.0, |mut row| {
+                        row.col(|ui| {
+                            ui.add_space(4.0);
+                            ui.weak("(empty folder)");
+                        });
+                    });
+                    return;
+                }
                 body.rows(20.0, entries.len(), |mut row| {
                     let row_index = row.index();
                     let e = &entries[row_index];
