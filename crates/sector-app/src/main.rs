@@ -5091,7 +5091,9 @@ impl eframe::App for SectorApp {
                     self.thumb_pending = None;
                     self.thumbs.push((p, tex, dec.orig));
                     if self.thumbs.len() > THUMB_CACHE {
-                        self.thumbs.remove(0);
+                        // Evict the oldest; dropping its TextureHandle frees the
+                        // GPU texture (that's the point — hence the let _).
+                        let _ = self.thumbs.remove(0);
                     }
                 }
                 Ok(Err(e)) => {
